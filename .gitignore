@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temp files
+temp_scroll_frames/
+temp_screen_recording/
+*.lnk
+*.bak
+
+# Settings (may contain API keys)
+murioki_settings.json
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Exe (too large for git)
+*.exe
