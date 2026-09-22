@@ -531,8 +531,8 @@ class OcrResultDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("🔤 文字识别与翻译 (OCR & Translation)")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(820, 520)
-        self.setMinimumSize(680, 420)
+        self.resize(960, 580)
+        self.setMinimumSize(780, 480)
 
         self.current_worker = None
         self.detected_lang = "auto"
@@ -552,91 +552,99 @@ class OcrResultDialog(QDialog):
 
     def _setup_ui(self, initial_text):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(18, 16, 18, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(20, 18, 20, 18)
+        main_layout.setSpacing(10)
 
-        # 1. 顶部控制栏 (语言选择与状态)
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(10)
+        # ── 第 1 行：标题 + 状态徽章 ──
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
 
-        title_lbl = QLabel("🔤 识别与翻译")
+        title_lbl = QLabel("🔤 文字识别与翻译")
         title_lbl.setObjectName("dialogTitle")
 
         self.lbl_src_detected = QLabel("🌐 源语言: 自动检测")
         self.lbl_src_detected.setObjectName("badgeLabel")
 
-        self.lbl_char_count = QLabel(f"共 {len(initial_text.strip())} 字符")
+        self.lbl_char_count = QLabel(f"📝 {len(initial_text.strip())} 字符")
         self.lbl_char_count.setObjectName("badgeLabel")
-
-        top_bar.addWidget(title_lbl)
-        top_bar.addWidget(self.lbl_src_detected)
-        top_bar.addWidget(self.lbl_char_count)
-        top_bar.addStretch()
-
-        # 目标语言下拉选择
-        lbl_target = QLabel("目标语言:")
-        lbl_target.setObjectName("subTitle")
-        self.combo_target = QComboBox()
-        for code, label in SUPPORTED_LANGUAGES:
-            self.combo_target.addItem(label, code)
-        
-        # 选中初始目标语言
-        idx = self.combo_target.findData(self.initial_target)
-        if idx >= 0:
-            self.combo_target.setCurrentIndex(idx)
-        self.combo_target.currentIndexChanged.connect(lambda: self.trigger_translation())
-
-        # 翻译模式选择 (普通 / AI)
-        lbl_mode = QLabel("翻译模式:")
-        lbl_mode.setObjectName("subTitle")
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItem("🌐 普通翻译", "normal")
-        self.combo_mode.addItem("🤖 AI 翻译", "ai")
-        # 从设置文件恢复上次选择
-        _saved = load_settings()
-        if _saved.get("use_ai_translation", False):
-            self.combo_mode.setCurrentIndex(1)
-        self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
-
-        self.btn_translate = QPushButton("🔄 翻译")
-        self.btn_translate.setObjectName("toolBtn")
-        self.btn_translate.setCursor(Qt.PointingHandCursor)
-        self.btn_translate.clicked.connect(self.trigger_translation)
 
         self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("statusLabel")
 
-        top_bar.addWidget(lbl_target)
-        top_bar.addWidget(self.combo_target)
-        top_bar.addWidget(lbl_mode)
-        top_bar.addWidget(self.combo_mode)
-        top_bar.addWidget(self.btn_translate)
-        top_bar.addWidget(self.status_lbl)
-        main_layout.addLayout(top_bar)
+        row1.addWidget(title_lbl)
+        row1.addWidget(self.lbl_src_detected)
+        row1.addWidget(self.lbl_char_count)
+        row1.addStretch()
+        row1.addWidget(self.status_lbl)
+        main_layout.addLayout(row1)
 
-        # 1.5 识别模式选择栏 (OCR / AI 识别)
-        ocr_mode_bar = QHBoxLayout()
-        ocr_mode_bar.setSpacing(8)
-        lbl_ocr_mode = QLabel("识别模式:")
-        lbl_ocr_mode.setObjectName("subTitle")
+        # ── 第 2 行：设置栏（识别模式 | 翻译模式 | 目标语言 | 翻译按钮）──
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+
+        # 从设置文件恢复
+        _saved = load_settings()
+
+        # 识别模式
+        lbl_ocr_mode = QLabel("识别:")
+        lbl_ocr_mode.setObjectName("ctrlLabel")
         self.combo_ocr_mode = QComboBox()
-        self.combo_ocr_mode.addItem("📷 OCR 识别", "ocr")
+        self.combo_ocr_mode.addItem("📷 OCR 引擎", "ocr")
         self.combo_ocr_mode.addItem("🤖 AI 识别", "ai_ocr")
         if _saved.get("use_ai_ocr", False):
             self.combo_ocr_mode.setCurrentIndex(1)
         self.combo_ocr_mode.currentIndexChanged.connect(self._on_ocr_mode_changed)
 
-        self.lbl_ocr_mode_hint = QLabel("")
-        self.lbl_ocr_mode_hint.setObjectName("badgeLabel")
-        self._update_ocr_mode_hint()
+        # 分隔线
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.VLine)
+        sep1.setObjectName("sepLine")
 
-        ocr_mode_bar.addWidget(lbl_ocr_mode)
-        ocr_mode_bar.addWidget(self.combo_ocr_mode)
-        ocr_mode_bar.addWidget(self.lbl_ocr_mode_hint)
-        ocr_mode_bar.addStretch()
-        main_layout.addLayout(ocr_mode_bar)
+        # 翻译模式
+        lbl_mode = QLabel("翻译:")
+        lbl_mode.setObjectName("ctrlLabel")
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItem("🌐 普通翻译", "normal")
+        self.combo_mode.addItem("🤖 AI 翻译", "ai")
+        if _saved.get("use_ai_translation", False):
+            self.combo_mode.setCurrentIndex(1)
+        self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
 
-        # 2. 双栏对照卡片区
+        # 分隔线
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setObjectName("sepLine")
+
+        # 目标语言
+        lbl_target = QLabel("目标:")
+        lbl_target.setObjectName("ctrlLabel")
+        self.combo_target = QComboBox()
+        for code, label in SUPPORTED_LANGUAGES:
+            self.combo_target.addItem(label, code)
+        idx = self.combo_target.findData(self.initial_target)
+        if idx >= 0:
+            self.combo_target.setCurrentIndex(idx)
+        self.combo_target.currentIndexChanged.connect(lambda: self.trigger_translation())
+
+        # 翻译按钮
+        self.btn_translate = QPushButton("🔄 翻译")
+        self.btn_translate.setObjectName("toolBtn")
+        self.btn_translate.setCursor(Qt.PointingHandCursor)
+        self.btn_translate.clicked.connect(self.trigger_translation)
+
+        row2.addWidget(lbl_ocr_mode)
+        row2.addWidget(self.combo_ocr_mode)
+        row2.addWidget(sep1)
+        row2.addWidget(lbl_mode)
+        row2.addWidget(self.combo_mode)
+        row2.addWidget(sep2)
+        row2.addWidget(lbl_target)
+        row2.addWidget(self.combo_target)
+        row2.addStretch()
+        row2.addWidget(self.btn_translate)
+        main_layout.addLayout(row2)
+
+        # ── 第 3 行：双栏对照卡片区 ──
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(14)
 
@@ -644,11 +652,11 @@ class OcrResultDialog(QDialog):
         left_card = QFrame()
         left_card.setObjectName("cardFrame")
         left_layout = QVBoxLayout(left_card)
-        left_layout.setContentsMargins(12, 10, 12, 10)
+        left_layout.setContentsMargins(14, 12, 14, 12)
         left_layout.setSpacing(8)
 
         left_header = QHBoxLayout()
-        left_title = QLabel("原文 (可直接编辑)")
+        left_title = QLabel("📄 原文  (可直接编辑)")
         left_title.setObjectName("cardTitle")
         self.btn_copy_source = QPushButton("📋 复制原文")
         self.btn_copy_source.setObjectName("cardActionBtn")
@@ -669,11 +677,11 @@ class OcrResultDialog(QDialog):
         right_card = QFrame()
         right_card.setObjectName("cardFrame")
         right_layout = QVBoxLayout(right_card)
-        right_layout.setContentsMargins(12, 10, 12, 10)
+        right_layout.setContentsMargins(14, 12, 14, 12)
         right_layout.setSpacing(8)
 
         right_header = QHBoxLayout()
-        right_title = QLabel("译文")
+        right_title = QLabel("🌐 译文")
         right_title.setObjectName("cardTitle")
         self.btn_copy_target = QPushButton("📋 复制译文")
         self.btn_copy_target.setObjectName("cardActionBtn")
@@ -693,7 +701,7 @@ class OcrResultDialog(QDialog):
         cards_layout.addWidget(right_card, 1)
         main_layout.addLayout(cards_layout, 1)
 
-        # 3. 底部快捷操作栏
+        # ── 第 4 行：底部快捷操作栏 ──
         bottom_bar = QHBoxLayout()
         bottom_bar.setSpacing(10)
 
@@ -721,18 +729,21 @@ class OcrResultDialog(QDialog):
     def _apply_style(self):
         self.setStyleSheet("""
             QDialog {
-                background-color: #f8fafc;
-                font-family: "Segoe UI", "Leelawadee UI", "Microsoft YaHei UI", sans-serif;
+                background-color: #f6f8fa;
+                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+                font-size: 13px;
             }
             QLabel#dialogTitle {
-                font-size: 15px;
+                font-size: 16px;
                 font-weight: 700;
                 color: #0f172a;
+                padding: 2px 0;
             }
-            QLabel#subTitle {
-                font-size: 12px;
-                font-weight: 500;
-                color: #475569;
+            QLabel#ctrlLabel {
+                font-size: 13px;
+                font-weight: 600;
+                color: #334155;
+                padding: 0 2px;
             }
             QLabel#cardTitle {
                 font-size: 13px;
@@ -742,16 +753,21 @@ class OcrResultDialog(QDialog):
             QLabel#badgeLabel {
                 background-color: #e2e8f0;
                 color: #475569;
-                font-size: 11px;
-                font-weight: 500;
-                border-radius: 6px;
-                padding: 3px 8px;
-            }
-            QLabel#statusLabel {
                 font-size: 12px;
                 font-weight: 500;
+                border-radius: 8px;
+                padding: 4px 10px;
+            }
+            QLabel#statusLabel {
+                font-size: 13px;
+                font-weight: 600;
                 color: #0969da;
-                padding-left: 4px;
+                padding: 0 6px;
+            }
+            QFrame#sepLine {
+                color: #cbd5e1;
+                max-width: 1px;
+                margin: 2px 4px;
             }
             QFrame#cardFrame {
                 background-color: #ffffff;
@@ -764,50 +780,56 @@ class OcrResultDialog(QDialog):
                 border: 1px solid #e2e8f0;
                 border-radius: 6px;
                 padding: 10px;
-                font-family: "Cascadia Code", "Consolas", "Leelawadee UI", "Segoe UI", "Microsoft YaHei UI", monospace;
+                font-family: "Cascadia Code", "Consolas", "Microsoft YaHei UI", monospace;
                 font-size: 13px;
                 line-height: 1.6;
             }
             QTextEdit#editorText:focus {
-                border: 1px solid #0969da;
+                border: 1.5px solid #0969da;
             }
             QComboBox {
                 background-color: #ffffff;
                 color: #0f172a;
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 12px;
+                padding: 5px 10px;
+                font-size: 13px;
                 font-weight: 500;
-                min-width: 140px;
+                min-width: 120px;
             }
             QComboBox:hover {
                 border-color: #0969da;
             }
             QComboBox::drop-down {
                 border: none;
-                width: 20px;
+                width: 22px;
+            }
+            QComboBox QAbstractItemView {
+                font-size: 13px;
+                padding: 4px;
             }
             QPushButton#toolBtn {
-                background-color: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
+                background-color: #0969da;
+                color: #ffffff;
+                border: 1px solid #085cc0;
                 border-radius: 6px;
-                padding: 4px 12px;
-                font-size: 12px;
-                font-weight: 500;
+                padding: 6px 16px;
+                font-size: 13px;
+                font-weight: 600;
             }
             QPushButton#toolBtn:hover {
-                background-color: #f1f5f9;
-                border-color: #0969da;
-                color: #0969da;
+                background-color: #085cc0;
+            }
+            QPushButton#toolBtn:disabled {
+                background-color: #94a3b8;
+                border-color: #94a3b8;
             }
             QPushButton#cardActionBtn {
                 background: transparent;
                 color: #0969da;
                 border: 1px solid transparent;
                 border-radius: 4px;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 500;
                 padding: 3px 8px;
             }
@@ -820,7 +842,7 @@ class OcrResultDialog(QDialog):
                 color: #ffffff;
                 border: 1px solid #085cc0;
                 border-radius: 6px;
-                padding: 7px 18px;
+                padding: 8px 20px;
                 font-size: 13px;
                 font-weight: 600;
             }
@@ -835,7 +857,7 @@ class OcrResultDialog(QDialog):
                 color: #334155;
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
-                padding: 7px 16px;
+                padding: 8px 18px;
                 font-size: 13px;
                 font-weight: 500;
             }
@@ -848,7 +870,7 @@ class OcrResultDialog(QDialog):
 
     def _on_source_text_changed(self):
         text = self.source_edit.toPlainText().strip()
-        self.lbl_char_count.setText(f"共 {len(text)} 字符")
+        self.lbl_char_count.setText(f"📝 {len(text)} 字符")
         self.debounce_timer.start(800)
 
     def _on_mode_changed(self):
@@ -861,14 +883,6 @@ class OcrResultDialog(QDialog):
         """识别模式切换时保存设置"""
         use_ai_ocr = self.combo_ocr_mode.currentData() == "ai_ocr"
         save_settings({"use_ai_ocr": use_ai_ocr})
-        self._update_ocr_mode_hint()
-
-    def _update_ocr_mode_hint(self):
-        """更新识别模式提示标签"""
-        if self.combo_ocr_mode.currentData() == "ai_ocr":
-            self.lbl_ocr_mode_hint.setText("🤖 下次识别将使用 AI 视觉模型")
-        else:
-            self.lbl_ocr_mode_hint.setText("📷 使用本地 OCR 引擎识别")
 
     def trigger_translation(self):
         text = self.source_edit.toPlainText().strip()
