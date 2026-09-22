@@ -1,4 +1,4 @@
-# 🖼️ MuriokiCapture
+# 🖼️ Capture
 
 高效截图工具，集成 OCR 文字识别、多语言翻译与 AI 智能翻译功能。
 
