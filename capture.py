@@ -95,7 +95,7 @@ REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 # AI 翻译配置 (OpenRouter)
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "murioki_settings.json")
-OPENROUTER_MODEL = "inclusionai/ling-3.0-flash-vl:free"
+OPENROUTER_MODEL = "qwen/qwen3.8-27b:free"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 def load_settings():
