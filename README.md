@@ -50,7 +50,15 @@ pyinstaller MuriokiCapture.spec
 - **识别模式**: `📷 OCR 识别` / `🤖 AI 识别`
 - **翻译模式**: `🌐 普通翻译` / `🤖 AI 翻译`
 
-设置会自动保存，下次使用时自动恢复。
+### 模型自定义与高可用自动降级
+在 `murioki_settings.json` 中可自定义首选模型：
+```json
+{
+  "openrouter_api_key": "你的 OpenRouter 密钥",
+  "openrouter_model": "qwen/qwen3.8-27b:free"
+}
+```
+> 💡 当首选模型由于公共调用量大触发 **HTTP 429** 限流或临时故障时，程序会自动依次降级回退至 `inclusionai/ling-3.0-flash-vl:free`、`nex-agi/nex-n2.5-mini:free` 等备用免费多模态视觉模型，确保翻译与文字识别稳定可用。
 
 ## 📄 License
 

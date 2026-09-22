@@ -92,15 +92,26 @@ TEMP_FOLDER = os.path.join(BASE_DIR, "temp_scroll_frames")
 REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 
 # ==========================================
-# AI 翻译配置 (OpenRouter)
+# AI 翻译与多模态识别配置 (OpenRouter)
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "murioki_settings.json")
-OPENROUTER_MODEL = "qwen/qwen3.8-27b:free"
+# 默认首选模型与稳定长期支持的备用免费多模态视觉模型（按优先级自动降级重试）
+DEFAULT_OPENROUTER_MODEL = "qwen/qwen3.8-27b:free"
+FALLBACK_OPENROUTER_MODELS = [
+    "inclusionai/ling-3.0-flash-vl:free",
+    "nex-agi/nex-n2.5-mini:free",
+    "nex-agi/nex-n2.5-pro:free",
+]
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 def load_settings():
     """从本地 JSON 文件加载用户设置"""
-    defaults = {"use_ai_translation": False, "use_ai_ocr": False, "openrouter_api_key": ""}
+    defaults = {
+        "use_ai_translation": False,
+        "use_ai_ocr": False,
+        "openrouter_api_key": "",
+        "openrouter_model": DEFAULT_OPENROUTER_MODEL,
+    }
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -126,6 +137,15 @@ def get_openrouter_api_key():
     if key:
         return key
     return os.environ.get("OPENROUTER_API_KEY", "")
+
+def get_candidate_models():
+    """获取待尝试的模型列表（用户配置首选 + 自动备用降级池）"""
+    user_model = load_settings().get("openrouter_model", "").strip() or DEFAULT_OPENROUTER_MODEL
+    models = [user_model]
+    for fb in FALLBACK_OPENROUTER_MODELS:
+        if fb not in models:
+            models.append(fb)
+    return models
 RECORD_QUALITY_PRESETS = {
     'p60': {'scale': 1.0, 'fps': 60, 'name': '原画 60FPS (100%)'},
     'p30': {'scale': 1.0, 'fps': 30, 'name': '原画 30FPS (100%)'},
@@ -425,11 +445,15 @@ _AI_LANG_NAMES = {
     "th": "Thai (ภาษาไทย)",
 }
 
-def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=30):
-    """使用 OpenRouter AI 模型翻译单段文本"""
+def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25):
+    """使用 OpenRouter AI 模型翻译单段文本（带多模型自动回退容错）"""
     if not text or not text.strip():
         return "", source_lang
     text = text.strip()
+
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        raise RuntimeError("未检测到 API 密钥，请在设置或 murioki_settings.json 中配置 openrouter_api_key。")
 
     target_name = _AI_LANG_NAMES.get(target_lang, target_lang)
     if source_lang and source_lang != 'auto':
@@ -444,41 +468,57 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=30)
         f"Output ONLY the translated text, nothing else. No explanations, no notes."
     )
 
-    payload = json.dumps({
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0.3,
-    }).encode('utf-8')
+    models_to_try = get_candidate_models()
+    last_err = None
 
-    req = urllib.request.Request(
-        OPENROUTER_API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {get_openrouter_api_key()}",
-            "HTTP-Referer": "https://murioki-capture.local",
-            "X-Title": "Murioki Capture OCR Translator",
-        },
-        method="POST"
-    )
+    for idx, model_name in enumerate(models_to_try):
+        payload = json.dumps({
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            "temperature": 0.3,
+        }).encode('utf-8')
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            result = data['choices'][0]['message']['content'].strip()
-            # 尝试检测源语言
-            detected_src = source_lang if source_lang != 'auto' else 'auto'
-            return result, detected_src
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace') if e.fp else ''
-        logging.error("OpenRouter API HTTP 错误 %s: %s", e.code, body)
-        raise RuntimeError(f"AI 翻译请求失败 (HTTP {e.code})，请检查网络或 API 密钥。")
-    except Exception as e:
-        logging.error("OpenRouter API 请求异常: %s", e)
-        raise RuntimeError(f"AI 翻译请求失败: {e}")
+        req = urllib.request.Request(
+            OPENROUTER_API_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://murioki-capture.local",
+                "X-Title": "Murioki Capture OCR Translator",
+            },
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                choice = data['choices'][0]['message']
+                # 兼容不同模型的输出字段 (content / reasoning)
+                result = (choice.get('content') or choice.get('reasoning') or '').strip()
+                detected_src = source_lang if source_lang != 'auto' else 'auto'
+                if idx > 0:
+                    logging.info("首选模型受限，已自动切换备用模型 %s 翻译成功", model_name)
+                return result, detected_src
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='replace') if e.fp else ''
+            logging.warning("模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
+            last_err = f"HTTP {e.code}"
+            # 若是 429 限流或 5xx 错误，且还有备用模型，则继续尝试下一个模型
+            if e.code in [429, 500, 502, 503, 504] and idx < len(models_to_try) - 1:
+                continue
+            if idx == len(models_to_try) - 1:
+                raise RuntimeError(f"AI 翻译失败 (所有模型均受限，最后报错: {last_err})。")
+        except Exception as e:
+            logging.warning("模型 %s 调用异常: %s", model_name, e)
+            last_err = str(e)
+            if idx < len(models_to_try) - 1:
+                continue
+
+    raise RuntimeError(f"AI 翻译请求失败: {last_err}")
 
 def ai_translate_text(text, target_lang, source_lang='auto'):
     """AI 翻译：多段落/超长文本处理"""
@@ -981,63 +1021,84 @@ def _pixmap_to_base64(pixmap):
     return base64.b64encode(ba.getvalue()).decode('utf-8')
 
 def ai_ocr_recognize(pixmap, timeout=30):
-    """使用 AI 视觉模型识别图片中的文字"""
+    """使用 AI 视觉模型识别图片中的文字（带多模型自动回退容错）"""
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        raise RuntimeError("未检测到 API 密钥，请在设置或 murioki_settings.json 中配置 openrouter_api_key。")
+
     img_base64 = _pixmap_to_base64(pixmap)
 
-    payload = json.dumps({
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an advanced OCR system. Extract ALL text from the image exactly as it appears. "
-                    "Preserve the original line breaks and formatting. "
-                    "Output ONLY the extracted text, nothing else. No explanations, no descriptions of the image."
-                )
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_base64}"
+    models_to_try = get_candidate_models()
+    last_err = None
+
+    for idx, model_name in enumerate(models_to_try):
+        payload = json.dumps({
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an advanced OCR system. Extract ALL text from the image exactly as it appears. "
+                        "Preserve the original line breaks and formatting. "
+                        "Output ONLY the extracted text, nothing else. No explanations, no descriptions of the image."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this image."
                         }
-                    },
-                    {
-                        "type": "text",
-                        "text": "Extract all text from this image."
-                    }
-                ]
-            }
-        ],
-        "temperature": 0.1,
-    }).encode('utf-8')
+                    ]
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+        }).encode('utf-8')
 
-    req = urllib.request.Request(
-        OPENROUTER_API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {get_openrouter_api_key()}",
-            "HTTP-Referer": "https://murioki-capture.local",
-            "X-Title": "Murioki Capture AI OCR",
-        },
-        method="POST"
-    )
+        req = urllib.request.Request(
+            OPENROUTER_API_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://murioki-capture.local",
+                "X-Title": "Murioki Capture AI OCR",
+            },
+            method="POST"
+        )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            result = data['choices'][0]['message']['content'].strip()
-            return result
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace') if e.fp else ''
-        logging.error("AI OCR HTTP 错误 %s: %s", e.code, body)
-        raise RuntimeError(f"AI 识别请求失败 (HTTP {e.code})，请检查网络或 API 密钥。")
-    except Exception as e:
-        logging.error("AI OCR 请求异常: %s", e)
-        raise RuntimeError(f"AI 识别请求失败: {e}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                choice = data['choices'][0]['message']
+                result = (choice.get('content') or choice.get('reasoning') or '').strip()
+                if idx > 0:
+                    logging.info("首选模型受限，已自动切换备用模型 %s 识别成功", model_name)
+                return result
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='replace') if e.fp else ''
+            logging.warning("AI OCR 模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
+            last_err = f"HTTP {e.code}"
+            # 若是 429 限流或 5xx 错误，且还有备用模型，则继续尝试下一个备选模型
+            if e.code in [429, 500, 502, 503, 504] and idx < len(models_to_try) - 1:
+                continue
+            if idx == len(models_to_try) - 1:
+                raise RuntimeError(f"AI 识别失败 (所有模型均受限，最后报错: {last_err})。")
+        except Exception as e:
+            logging.warning("AI OCR 模型 %s 调用异常: %s", model_name, e)
+            last_err = str(e)
+            if idx < len(models_to_try) - 1:
+                continue
+
+    raise RuntimeError(f"AI 识别请求失败: {last_err}")
 
 # ==========================================
 # OCR 后台工作线程 (智能双引擎融合: RapidOCR + 深度预处理 Tesseract / AI 视觉识别)
