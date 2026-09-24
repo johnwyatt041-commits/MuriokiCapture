@@ -287,61 +287,177 @@ class _RECT(ctypes.Structure):
     ]
 
 _DWMWA_EXTENDED_FRAME_BOUNDS = 9
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+_user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+_user32.EnumWindows.restype = wintypes.BOOL
+_user32.EnumChildWindows.argtypes = [wintypes.HWND, _WNDENUMPROC, wintypes.LPARAM]
+_user32.EnumChildWindows.restype = wintypes.BOOL
+
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsWindowVisible.restype = wintypes.BOOL
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.IsIconic.restype = wintypes.BOOL
+_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+_user32.GetWindowRect.restype = wintypes.BOOL
+
+try:
+    _user32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+    _user32.OpenWindowStationW.restype = wintypes.HANDLE
+    _user32.SetProcessWindowStation.argtypes = [wintypes.HANDLE]
+    _user32.SetProcessWindowStation.restype = wintypes.BOOL
+    _user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _user32.OpenDesktopW.restype = wintypes.HANDLE
+    _user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+    _user32.SetThreadDesktop.restype = wintypes.BOOL
+except Exception:
+    pass
+
+def ensure_interactive_desktop():
+    try:
+        hw = _user32.OpenWindowStationW("WinSta0", False, 0x037F)
+        if hw:
+            _user32.SetProcessWindowStation(hw)
+            hd = _user32.OpenDesktopW("default", 0, False, 0x01FF)
+            if hd:
+                _user32.SetThreadDesktop(hd)
+    except Exception:
+        pass
+
+ensure_interactive_desktop()
+
+
+class WindowSnapper:
+    """
+    Windows 窗口与 UI 控件智能吸附检测引擎：
+    基于 Windows DWM 扩展框架边界与顶级窗口 Z 轴层级，毫秒级预缓存桌面所有可见窗口与子控件，
+    在鼠标悬停时提供微秒级（<0.01ms）无锁几何拾取与磁性高亮吸附。
+    """
+    def __init__(self, my_pid=None, exclude_hwnds=None):
+        self.my_pid = my_pid or os.getpid()
+        self.exclude_hwnds = set(exclude_hwnds or [])
+        self.cached_windows = []
+        try:
+            self.refresh_window_tree()
+        except Exception as e:
+            logging.warning("WindowSnapper 初始化窗口树失败: %s", e)
+
+    def refresh_window_tree(self):
+        ensure_interactive_desktop()
+        windows = []
+        my_pid = self.my_pid
+        desktop_hwnd = _user32.GetDesktopWindow()
+
+        def enum_win_cb(hwnd, lparam):
+            if hwnd == desktop_hwnd or hwnd in self.exclude_hwnds:
+                return True
+            if not _user32.IsWindowVisible(hwnd) or _user32.IsIconic(hwnd):
+                return True
+
+            pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == my_pid:
+                return True
+
+            r = _RECT()
+            hr = _dwmapi.DwmGetWindowAttribute(hwnd, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r))
+            if hr != 0:
+                _user32.GetWindowRect(hwnd, ctypes.byref(r))
+
+            w = r.right - r.left
+            h = r.bottom - r.top
+            if w <= 20 or h <= 20:
+                return True
+
+            length = _user32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if length > 0:
+                buff = ctypes.create_unicode_buffer(length + 1)
+                _user32.GetWindowTextW(hwnd, buff, length + 1)
+                title = buff.value.strip()
+
+            win_rect = QRect(r.left, r.top, w, h)
+
+            children = []
+            child_count = 0
+
+            def child_cb(ch, lp):
+                nonlocal child_count
+                if child_count >= 80:
+                    return False
+                if _user32.IsWindowVisible(ch):
+                    cr = _RECT()
+                    _user32.GetWindowRect(ch, ctypes.byref(cr))
+                    cw = cr.right - cr.left
+                    ch_h = cr.bottom - cr.top
+                    if 20 <= cw <= w and 16 <= ch_h <= h and (cw < w or ch_h < h):
+                        ch_rect = QRect(cr.left, cr.top, cw, ch_h)
+                        if win_rect.intersects(ch_rect):
+                            ch_title = ""
+                            ch_len = _user32.GetWindowTextLengthW(ch)
+                            if ch_len > 0:
+                                b = ctypes.create_unicode_buffer(ch_len + 1)
+                                _user32.GetWindowTextW(ch, b, ch_len + 1)
+                                ch_title = b.value.strip()
+                            children.append({'hwnd': ch, 'rect': ch_rect, 'title': ch_title})
+                            child_count += 1
+                return True
+
+            try:
+                _user32.EnumChildWindows(hwnd, _WNDENUMPROC(child_cb), 0)
+            except Exception:
+                pass
+
+            windows.append({
+                'hwnd': hwnd,
+                'rect': win_rect,
+                'title': title,
+                'children': children
+            })
+            return True
+
+        try:
+            _user32.EnumWindows(_WNDENUMPROC(enum_win_cb), 0)
+            self.cached_windows = windows
+        except Exception as e:
+            logging.warning("EnumWindows 刷新失败: %s", e)
+
+    def detect_at(self, screen_x, screen_y):
+        try:
+            for w in self.cached_windows:
+                if w['rect'].contains(screen_x, screen_y):
+                    best_child = None
+                    best_area = w['rect'].width() * w['rect'].height()
+                    for c in w['children']:
+                        if c['rect'].contains(screen_x, screen_y):
+                            area = c['rect'].width() * c['rect'].height()
+                            if area < best_area:
+                                best_area = area
+                                best_child = c
+                    if best_child:
+                        child_title = best_child['title'] or w['title']
+                        return best_child['rect'], child_title
+                    return w['rect'], w['title']
+        except Exception:
+            pass
+        return None, ""
+
+
+_global_window_snapper = None
+
+def get_window_snapper():
+    global _global_window_snapper
+    if _global_window_snapper is None:
+        _global_window_snapper = WindowSnapper()
+    return _global_window_snapper
 
 def detect_window_or_control_rect(screen_x, screen_y, ignored_hwnd=None):
-    """
-    智能吸附：根据物理屏幕坐标获取鼠标悬停的 Windows 窗口或控件精确几何矩形（排除阴影边距）
-    """
     try:
-        pt = wintypes.POINT(int(screen_x), int(screen_y))
-        hwnd = _user32.WindowFromPoint(pt)
-        if not hwnd:
-            return None, ""
-
-        if ignored_hwnd and hwnd == ignored_hwnd:
-            return None, ""
-
-        # 检查是否是自身全屏覆盖窗口
-        curr = hwnd
-        while curr:
-            if ignored_hwnd and curr == ignored_hwnd:
-                return None, ""
-            curr = _user32.GetParent(curr)
-
-        # 尝试寻找子控件 (CWP_SKIPINVISIBLE = 1, CWP_SKIPTRANSPARENT = 4)
-        child = _user32.ChildWindowFromPointEx(hwnd, pt, 0x0001 | 0x0004)
-        target_hwnd = child if (child and child != hwnd) else hwnd
-
-        # 优先使用 DwmGetWindowAttribute 获取没有透明阴影的真实可视窗口边界
-        rect = _RECT()
-        hr = _dwmapi.DwmGetWindowAttribute(target_hwnd, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
-        if hr != 0:
-            _user32.GetWindowRect(target_hwnd, ctypes.byref(rect))
-
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if w < 16 or h < 16:
-            # 若控件过小，回退到主窗口
-            hr = _dwmapi.DwmGetWindowAttribute(hwnd, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
-            if hr != 0:
-                _user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
-            target_hwnd = hwnd
-
-        if w < 16 or h < 16:
-            return None, ""
-
-        # 获取窗口标题
-        length = _user32.GetWindowTextLengthW(target_hwnd)
-        title = ""
-        if length > 0:
-            buff = ctypes.create_unicode_buffer(length + 1)
-            _user32.GetWindowTextW(target_hwnd, buff, length + 1)
-            title = buff.value.strip()
-
-        return QRect(rect.left, rect.top, w, h), title
-    except Exception as e:
+        snapper = get_window_snapper()
+        if ignored_hwnd:
+            snapper.exclude_hwnds.add(ignored_hwnd)
+        return snapper.detect_at(int(screen_x), int(screen_y))
+    except Exception:
         return None, ""
 
 # ==========================================
@@ -5104,6 +5220,7 @@ class ScreenshotTool(QWidget):
         self.selection_rect = QRect()
         self.hovered_window_rect = None
         self.hovered_window_title = ""
+        self.window_snapper = WindowSnapper(my_pid=os.getpid())
         self.press_pos = QPoint()
         self.current_step_num = 1
         self.current_tool = None
@@ -5354,6 +5471,14 @@ class ScreenshotTool(QWidget):
         self.color_picker_visible = not (ocr_intent or recording_intent)
         self.color_output_hex = False
         self.selection_rect = QRect()
+        self.hovered_window_rect = None
+        self.hovered_window_title = ""
+        if hasattr(self, 'window_snapper') and self.window_snapper:
+            try:
+                self.window_snapper.exclude_hwnds = {int(self.winId())}
+                self.window_snapper.refresh_window_tree()
+            except Exception as e:
+                logging.warning("刷新吸附窗口树异常: %s", e)
         self.crop_rect = None
         self.crop_mode = False
         self.crop_ratio = None
@@ -5880,13 +6005,24 @@ class ScreenshotTool(QWidget):
             elif event.key() == Qt.Key_Escape:
                 self.cancel_crop()
                 return
-        if self.state == "SELECTING" and self.color_picker_visible:
-            if event.key() == Qt.Key_C:
-                self.copy_color_value()
-                return
-            if event.key() == Qt.Key_Shift:
-                self.toggle_color_format()
-                return
+        if self.state == "SELECTING":
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if getattr(self, 'hovered_window_rect', None) and not self.hovered_window_rect.isNull():
+                    self.selection_rect = QRect(self.hovered_window_rect)
+                    self.hovered_window_rect = None
+                    self.state = "EDITING"
+                    self.drag_mode = None
+                    self.setFocus()
+                    self.show_toolbar()
+                    self.update()
+                    return
+            if self.color_picker_visible:
+                if event.key() == Qt.Key_C:
+                    self.copy_color_value()
+                    return
+                if event.key() == Qt.Key_Shift:
+                    self.toggle_color_format()
+                    return
         if event.modifiers() & Qt.ControlModifier:
             if event.key() == Qt.Key_C:
                 if self.state == "EDITING":
@@ -5935,13 +6071,16 @@ class ScreenshotTool(QWidget):
                     border_color = QColor(0, 174, 255)
                     painter.setPen(QPen(border_color, 2))
                     painter.setBrush(Qt.NoBrush)
-                    painter.drawRect(self.hovered_window_rect)
-                    draw_viewfinder_corners(painter, self.hovered_window_rect, border_color, length=14, width=3)
+                    draw_r = self.hovered_window_rect
+                    if draw_r.width() >= self.width() - 2 and draw_r.height() >= self.height() - 2:
+                        draw_r = draw_r.adjusted(1, 1, -2, -2)
+                    painter.drawRect(draw_r)
+                    draw_viewfinder_corners(painter, draw_r, border_color, length=14, width=3)
                     badge_text = f"{self.hovered_window_rect.width()} × {self.hovered_window_rect.height()}"
                     if getattr(self, 'hovered_window_title', None):
                         title_preview = self.hovered_window_title[:24] + "..." if len(self.hovered_window_title) > 24 else self.hovered_window_title
                         badge_text = f"{title_preview} | {badge_text}"
-                    draw_selection_badge(painter, self.hovered_window_rect, badge_text, border_color=border_color)
+                    draw_selection_badge(painter, draw_r, badge_text, border_color=border_color)
                 else:
                     painter.fillRect(self.rect(), mask_color)
             else:
@@ -6073,6 +6212,17 @@ class ScreenshotTool(QWidget):
             self.hide_app(keep_history=False)
             self.start_recording_session(screen_geo)
             return
+
+        if self.state == "SELECTING":
+            if getattr(self, 'hovered_window_rect', None) and not self.hovered_window_rect.isNull():
+                self.selection_rect = QRect(self.hovered_window_rect)
+                self.hovered_window_rect = None
+                self.state = "EDITING"
+                self.drag_mode = None
+                self.setFocus()
+                self.show_toolbar()
+                self.update()
+                return
 
         # 裁剪模式下双击裁剪框内应用裁剪
         if self.crop_mode and self.crop_rect and self.crop_rect.contains(pos):
@@ -6238,10 +6388,18 @@ class ScreenshotTool(QWidget):
                 self.color_pick_pos = pos
                 self.color_picker_visible = True
                 try:
-                    win_rect, win_title = detect_window_or_control_rect(pos.x(), pos.y())
+                    global_pos = event.globalPos()
+                    win_rect, win_title = self.window_snapper.detect_at(global_pos.x(), global_pos.y())
                     if win_rect and win_rect.isValid() and win_rect.width() > 10 and win_rect.height() > 10:
-                        self.hovered_window_rect = win_rect
-                        self.hovered_window_title = win_title
+                        offset = self.mapToGlobal(QPoint(0, 0))
+                        local_rect = win_rect.translated(-offset.x(), -offset.y())
+                        bounded = local_rect.intersected(self.rect())
+                        if bounded.isValid() and bounded.width() > 10 and bounded.height() > 10:
+                            self.hovered_window_rect = bounded
+                            self.hovered_window_title = win_title
+                        else:
+                            self.hovered_window_rect = None
+                            self.hovered_window_title = ""
                     else:
                         self.hovered_window_rect = None
                         self.hovered_window_title = ""
