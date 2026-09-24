@@ -19,6 +19,7 @@ dist/
 # Temp files
 temp_scroll_frames/
 temp_screen_recording/
+capture_history/
 *.lnk
 *.bak
 

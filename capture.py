@@ -45,22 +45,31 @@ import pytesseract
 import shutil
 import subprocess
 import logging # 引入日志模块
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
 
-# 初始化 RapidOCR 离线引擎（高精度中文/英文识别；必须在 PyQt5 之前导入以防 Windows DLL 冲突）
-RAPID_OCR_ENGINE = None
-try:
-    from rapidocr_onnxruntime import RapidOCR
-    RAPID_OCR_ENGINE = RapidOCR()
-except Exception as _ocr_pre_err:
-    pass
+# RapidOCR 离线引擎懒加载单例（高精度中文/英文识别，首次 OCR 时再按需加载，彻底杜绝冷启动卡顿）
+_RAPID_OCR_ENGINE = None
+_RAPID_OCR_TRIED = False
+
+def get_rapid_ocr_engine():
+    global _RAPID_OCR_ENGINE, _RAPID_OCR_TRIED
+    if not _RAPID_OCR_TRIED:
+        _RAPID_OCR_TRIED = True
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _RAPID_OCR_ENGINE = RapidOCR()
+            logging.info("RapidOCR 引擎按需懒加载成功")
+        except Exception as _ocr_pre_err:
+            logging.warning("RapidOCR 引擎加载失败: %s", _ocr_pre_err)
+    return _RAPID_OCR_ENGINE
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QHBoxLayout, QVBoxLayout,
                              QFileDialog, QLabel, QMessageBox, QDialog, QScrollArea,
                              QColorDialog, QFontDialog, QTextEdit, QMenu, QComboBox, QSpinBox,
                              QSystemTrayIcon, QAction, QFrame, QSlider, QProgressBar, QToolTip,
-                             QGraphicsDropShadowEffect)
-from PyQt5.QtCore import Qt, QRect, QPoint, QThread, pyqtSignal, QSharedMemory, QTimer, QAbstractNativeEventFilter, QObject, QUrl, QMimeData
+                             QGraphicsDropShadowEffect, QGroupBox, QGridLayout, QLineEdit, QCheckBox)
+from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QSharedMemory, QTimer, QAbstractNativeEventFilter, QObject, QUrl, QMimeData
 from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QBrush, QWheelEvent,
                          QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QRegion)
 
@@ -111,6 +120,14 @@ def load_settings():
         "use_ai_ocr": False,
         "openrouter_api_key": "",
         "openrouter_model": DEFAULT_OPENROUTER_MODEL,
+        "hotkey_snip": "F1",
+        "hotkey_ocr": "F2",
+        "hotkey_pin": "F3",
+        "hotkey_record": "F4",
+        "default_save_dir": os.path.join(os.path.expanduser("~"), "Pictures"),
+        "auto_save_enabled": False,
+        "save_format": "png",
+        "save_quality": 95,
     }
     try:
         if os.path.exists(SETTINGS_FILE):
@@ -233,14 +250,13 @@ def get_tesseract_languages():
 
 TESSERACT_LANGS = get_tesseract_languages()
 
-# 初始化日志配置
-LOG_FILE = os.path.join(BASE_DIR, "murioki_debug.log")
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# 初始化日志配置（采用 RotatingFileHandler 限制最大 1MB，日常仅记录 INFO/ERROR，彻底避免无限膨胀）
+LOG_FILE = os.path.join(BASE_DIR, "murioki_app.log")
+_log_handler = RotatingFileHandler(LOG_FILE, maxBytes=1*1024*1024, backupCount=1, encoding='utf-8')
+_log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_log_handler)
 logging.info("=== 截图工具启动 ===")
 
 def global_exception_handler(exctype, value, tb):
@@ -253,11 +269,80 @@ if not os.path.exists(TESSERACT_CMD):
 else:
     logging.info(f"Tesseract OCR 引擎就绪: {TESSERACT_CMD}, 语言包: {get_tesseract_languages()}")
 
-# 记录 RapidOCR 状态
-if RAPID_OCR_ENGINE is not None:
-    logging.info("RapidOCR 引擎初始化成功（高精度离线识别就绪）")
-else:
-    logging.warning("RapidOCR 未能初始化，将退回至增强版 Tesseract 引擎。")
+# ==========================================
+# WINDOW & CONTROL DETECTOR (Windows 窗口/控件智能吸附)
+# ==========================================
+import ctypes
+from ctypes import wintypes
+
+_user32 = ctypes.windll.user32
+_dwmapi = ctypes.windll.dwmapi
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+_DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+def detect_window_or_control_rect(screen_x, screen_y, ignored_hwnd=None):
+    """
+    智能吸附：根据物理屏幕坐标获取鼠标悬停的 Windows 窗口或控件精确几何矩形（排除阴影边距）
+    """
+    try:
+        pt = wintypes.POINT(int(screen_x), int(screen_y))
+        hwnd = _user32.WindowFromPoint(pt)
+        if not hwnd:
+            return None, ""
+
+        if ignored_hwnd and hwnd == ignored_hwnd:
+            return None, ""
+
+        # 检查是否是自身全屏覆盖窗口
+        curr = hwnd
+        while curr:
+            if ignored_hwnd and curr == ignored_hwnd:
+                return None, ""
+            curr = _user32.GetParent(curr)
+
+        # 尝试寻找子控件 (CWP_SKIPINVISIBLE = 1, CWP_SKIPTRANSPARENT = 4)
+        child = _user32.ChildWindowFromPointEx(hwnd, pt, 0x0001 | 0x0004)
+        target_hwnd = child if (child and child != hwnd) else hwnd
+
+        # 优先使用 DwmGetWindowAttribute 获取没有透明阴影的真实可视窗口边界
+        rect = _RECT()
+        hr = _dwmapi.DwmGetWindowAttribute(target_hwnd, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
+        if hr != 0:
+            _user32.GetWindowRect(target_hwnd, ctypes.byref(rect))
+
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w < 16 or h < 16:
+            # 若控件过小，回退到主窗口
+            hr = _dwmapi.DwmGetWindowAttribute(hwnd, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
+            if hr != 0:
+                _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            target_hwnd = hwnd
+
+        if w < 16 or h < 16:
+            return None, ""
+
+        # 获取窗口标题
+        length = _user32.GetWindowTextLengthW(target_hwnd)
+        title = ""
+        if length > 0:
+            buff = ctypes.create_unicode_buffer(length + 1)
+            _user32.GetWindowTextW(target_hwnd, buff, length + 1)
+            title = buff.value.strip()
+
+        return QRect(rect.left, rect.top, w, h), title
+    except Exception as e:
+        return None, ""
 
 # ==========================================
 # CUSTOM CURSORS
@@ -332,6 +417,7 @@ def draw_selection_badge(painter, rect, text, border_color=QColor(9, 105, 218), 
     painter.drawRoundedRect(badge_rect, 5, 5)
     painter.setPen(QPen(text_color))
     painter.drawText(badge_rect, Qt.AlignCenter, text)
+    painter.setBrush(Qt.NoBrush)
 
 # ==========================================
 # DEEP COPY HELPER FOR UNDO/REDO
@@ -445,11 +531,35 @@ _AI_LANG_NAMES = {
     "th": "Thai (ภาษาไทย)",
 }
 
-def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25):
-    """使用 OpenRouter AI 模型翻译单段文本（带多模型自动回退容错）"""
+def _clean_ai_output(choice_dict):
+    """
+    清洗大模型输出，严格剥离思考链（<think>...</think> 或 reasoning 泄露），仅提取最终正文。
+    """
+    content = choice_dict.get('content')
+    if content:
+        # 去除 <think>...</think> 标签及其内容
+        cleaned = re.sub(r'<think>[\s\S]*?</think>', '', str(content), flags=re.DOTALL).strip()
+        if cleaned:
+            return cleaned
+    
+    # 若 content 为空且模型将输出写在了 reasoning 字段
+    reasoning = choice_dict.get('reasoning')
+    if reasoning:
+        cleaned = re.sub(r'<think>[\s\S]*?</think>', '', str(reasoning), flags=re.DOTALL).strip()
+        # 若以常见思考词开头，尝试截取最后段落
+        lines = [line.strip() for line in cleaned.split('\n') if line.strip()]
+        if lines:
+            return lines[-1]
+    return ""
+
+def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25, is_cancelled_fn=None):
+    """使用 OpenRouter AI 模型翻译单段文本（带多模型自动回退容错与思考链清洗）"""
     if not text or not text.strip():
         return "", source_lang
     text = text.strip()
+
+    if is_cancelled_fn and is_cancelled_fn():
+        return "", source_lang
 
     api_key = get_openrouter_api_key()
     if not api_key:
@@ -465,13 +575,16 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25)
     system_prompt = (
         f"You are a professional translator.{src_hint} "
         f"Translate the following text into {target_name}. "
-        f"Output ONLY the translated text, nothing else. No explanations, no notes."
+        f"Output ONLY the translated text, nothing else. Do not output any thought process or notes."
     )
 
     models_to_try = get_candidate_models()
     last_err = None
 
     for idx, model_name in enumerate(models_to_try):
+        if is_cancelled_fn and is_cancelled_fn():
+            return "", source_lang
+
         payload = json.dumps({
             "model": model_name,
             "messages": [
@@ -497,8 +610,7 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 choice = data['choices'][0]['message']
-                # 兼容不同模型的输出字段 (content / reasoning)
-                result = (choice.get('content') or choice.get('reasoning') or '').strip()
+                result = _clean_ai_output(choice)
                 detected_src = source_lang if source_lang != 'auto' else 'auto'
                 if idx > 0:
                     logging.info("首选模型受限，已自动切换备用模型 %s 翻译成功", model_name)
@@ -507,7 +619,6 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25)
             body = e.read().decode('utf-8', errors='replace') if e.fp else ''
             logging.warning("模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
             last_err = f"HTTP {e.code}"
-            # 若是 429 限流或 5xx 错误，且还有备用模型，则继续尝试下一个模型
             if e.code in [429, 500, 502, 503, 504] and idx < len(models_to_try) - 1:
                 continue
             if idx == len(models_to_try) - 1:
@@ -520,23 +631,25 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25)
 
     raise RuntimeError(f"AI 翻译请求失败: {last_err}")
 
-def ai_translate_text(text, target_lang, source_lang='auto'):
+def ai_translate_text(text, target_lang, source_lang='auto', is_cancelled_fn=None):
     """AI 翻译：多段落/超长文本处理"""
     if not text or not text.strip():
         return "", source_lang
     text = text.strip()
     if len(text) <= 3000:
-        return ai_translate_single_chunk(text, target_lang, source_lang)
+        return ai_translate_single_chunk(text, target_lang, source_lang, is_cancelled_fn=is_cancelled_fn)
 
     # 超长文本分段翻译
     paragraphs = text.split('\n')
     results = []
     detected_final = source_lang
     for p in paragraphs:
+        if is_cancelled_fn and is_cancelled_fn():
+            return "", source_lang
         if not p.strip():
             results.append("")
             continue
-        res, det = ai_translate_single_chunk(p, target_lang, source_lang)
+        res, det = ai_translate_single_chunk(p, target_lang, source_lang, is_cancelled_fn=is_cancelled_fn)
         results.append(res)
         if detected_final == 'auto' and det != 'auto':
             detected_final = det
@@ -552,16 +665,27 @@ class TranslationWorker(QThread):
         self.target_lang = target_lang
         self.source_lang = source_lang
         self.use_ai = use_ai
+        self._is_cancelled = False
+
+    def cancel(self):
+        """协作式安全取消，取代有死锁崩溃风险的 QThread.terminate()"""
+        self._is_cancelled = True
 
     def run(self):
         try:
+            if self._is_cancelled:
+                return
+
             if self.use_ai:
-                res, det = ai_translate_text(self.text, self.target_lang, self.source_lang)
+                res, det = ai_translate_text(self.text, self.target_lang, self.source_lang, is_cancelled_fn=lambda: self._is_cancelled)
             else:
                 res, det = translate_text(self.text, self.target_lang, self.source_lang)
-            self.finished.emit(res, det)
+
+            if not self._is_cancelled:
+                self.finished.emit(res, det)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._is_cancelled:
+                self.error.emit(str(e))
 
 # ==========================================
 # OCR 结果展示与多语言智能翻译弹窗 (现代浅色双栏对照风格)
@@ -943,8 +1067,10 @@ class OcrResultDialog(QDialog):
 
         if self.current_worker and self.current_worker.isRunning():
             try:
-                self.current_worker.terminate()
-            except:
+                self.current_worker.cancel()
+                self.current_worker.finished.disconnect()
+                self.current_worker.error.disconnect()
+            except Exception:
                 pass
 
         self.current_worker = TranslationWorker(text, target_lang, use_ai=use_ai)
@@ -1007,26 +1133,24 @@ class OcrResultDialog(QDialog):
 # ==========================================
 # AI 文字识别 (OpenRouter VL 视觉模型)
 # ==========================================
-def _pixmap_to_base64(pixmap):
-    """将 QPixmap 转换为 base64 编码的 PNG 字符串"""
-    buffer = QImage(pixmap.toImage())
-    ba = io.BytesIO()
-    # 使用 PIL 保存以避免 QBuffer 兼容问题
-    img = buffer.convertToFormat(QImage.Format_RGB888)
+def _image_to_base64(image: QImage):
+    """将 QImage 转换为 base64 编码的 PNG 字符串（安全跨线程纯数据操作）"""
+    img = image.convertToFormat(QImage.Format_RGB888)
     w, h = img.width(), img.height()
     ptr = img.bits()
     ptr.setsize(img.byteCount())
     pil_img = Image.frombytes("RGB", (w, h), bytes(ptr), "raw", "RGB", img.bytesPerLine())
+    ba = io.BytesIO()
     pil_img.save(ba, format="PNG", optimize=True)
     return base64.b64encode(ba.getvalue()).decode('utf-8')
 
-def ai_ocr_recognize(pixmap, timeout=30):
-    """使用 AI 视觉模型识别图片中的文字（带多模型自动回退容错）"""
+def ai_ocr_recognize(image: QImage, timeout=30):
+    """使用 AI 视觉模型识别图片中的文字（带多模型自动回退容错与思考链剥离）"""
     api_key = get_openrouter_api_key()
     if not api_key:
         raise RuntimeError("未检测到 API 密钥，请在设置或 murioki_settings.json 中配置 openrouter_api_key。")
 
-    img_base64 = _pixmap_to_base64(pixmap)
+    img_base64 = _image_to_base64(image)
 
     models_to_try = get_candidate_models()
     last_err = None
@@ -1040,7 +1164,7 @@ def ai_ocr_recognize(pixmap, timeout=30):
                     "content": (
                         "You are an advanced OCR system. Extract ALL text from the image exactly as it appears. "
                         "Preserve the original line breaks and formatting. "
-                        "Output ONLY the extracted text, nothing else. No explanations, no descriptions of the image."
+                        "Output ONLY the extracted text, nothing else. Do not output any thought process, reasoning or descriptions."
                     )
                 },
                 {
@@ -1079,7 +1203,7 @@ def ai_ocr_recognize(pixmap, timeout=30):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 choice = data['choices'][0]['message']
-                result = (choice.get('content') or choice.get('reasoning') or '').strip()
+                result = _clean_ai_output(choice)
                 if idx > 0:
                     logging.info("首选模型受限，已自动切换备用模型 %s 识别成功", model_name)
                 return result
@@ -1101,30 +1225,31 @@ def ai_ocr_recognize(pixmap, timeout=30):
     raise RuntimeError(f"AI 识别请求失败: {last_err}")
 
 # ==========================================
-# OCR 后台工作线程 (智能双引擎融合: RapidOCR + 深度预处理 Tesseract / AI 视觉识别)
+# OCR 后台工作线程 (智能双引擎融合: 懒加载 RapidOCR + 深度预处理 Tesseract / AI 视觉识别)
 # ==========================================
 class OcrWorker(QThread):
     finished = pyqtSignal(str)
 
-    def __init__(self, pixmap, use_ai=False):
+    def __init__(self, image: QImage, use_ai=False):
         super().__init__()
-        self.pixmap = pixmap
+        # 严格使用主线程传入的 QImage 纯数据对象，彻底杜绝 QPixmap 跨线程调用崩溃
+        self.image = image
         self.use_ai = use_ai
 
     def run(self):
         try:
             # AI 识别模式
             if self.use_ai:
-                result = ai_ocr_recognize(self.pixmap)
+                result = ai_ocr_recognize(self.image)
                 self.finished.emit(result if result else "")
                 return
 
             # 传统 OCR 模式
-            image = self.pixmap.toImage().convertToFormat(QImage.Format_RGB888)
-            width, height = image.width(), image.height()
-            bpl = image.bytesPerLine()
-            ptr = image.bits()
-            ptr.setsize(image.byteCount())
+            img_rgb = self.image.convertToFormat(QImage.Format_RGB888)
+            width, height = img_rgb.width(), img_rgb.height()
+            bpl = img_rgb.bytesPerLine()
+            ptr = img_rgb.bits()
+            ptr.setsize(img_rgb.byteCount())
             raw = np.frombuffer(ptr, np.uint8).reshape((height, bpl))
             if bpl > width * 3:
                 arr = np.ascontiguousarray(raw[:, :width * 3].reshape((height, width, 3)))
@@ -1148,13 +1273,13 @@ class OcrWorker(QThread):
                 padding = 16
                 return cv2.copyMakeBorder(processed, padding, padding, padding, padding, cv2.BORDER_CONSTANT, value=edge_val)
 
-            # 1. 运行 RapidOCR 提取按行分块的识别结果与几何包围盒
+            # 1. 运行懒加载 RapidOCR 提取按行分块的识别结果与几何包围盒
             rapid_lines = []
-            if RAPID_OCR_ENGINE is not None:
+            rapid_engine = get_rapid_ocr_engine()
+            if rapid_engine is not None:
                 try:
-                    res, _ = RAPID_OCR_ENGINE(arr)
+                    res, _ = rapid_engine(arr)
                     if res:
-                        # res 结构为: [ [box, text, score], ... ]
                         rapid_lines = res
                 except Exception as ex_r:
                     logging.warning(f"RapidOCR 执行异常: {ex_r}")
@@ -1218,13 +1343,16 @@ def point_to_segment_dist(p, p1, p2):
 def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    painter.setBrush(Qt.NoBrush)
 
     for edit in edits:
         thickness = edit.get('thickness', 3)
         if edit['type'] == 'RECTANGLE':
+            painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(edit['color'], thickness))
             painter.drawRect(edit['rect'].translated(-offset))
         elif edit['type'] == 'LINE':
+            painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(edit['color'], thickness))
             p1 = edit['start'] - offset
             p2 = edit['end'] - offset
@@ -1240,6 +1368,7 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 painter.drawPolygon(p2, p3, p4)
                 painter.setBrush(Qt.NoBrush)
         elif edit['type'] == 'TEXT':
+            painter.setBrush(Qt.NoBrush)
             painter.setFont(edit['font'])
             painter.setPen(QPen(edit['color']))
             if 'rect' in edit:
@@ -1250,6 +1379,7 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 rect = QRect(edit['pos'].x() - offset.x(), edit['pos'].y() - offset.y(), 800, 800)
                 painter.drawText(rect, Qt.AlignLeft | Qt.AlignTop, edit['text'])
         elif edit['type'] == 'BLUR':
+            painter.setBrush(Qt.NoBrush)
             # 矩形固定正方形网格马赛克（彻底消除拉伸条纹变形）
             source_rect = edit['rect']
             if base_pixmap is not None:
@@ -1298,7 +1428,95 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                     painter.setClipPath(clip_path)
                     painter.drawPixmap(bbox.translated(-offset).topLeft(), mosaic)
                     painter.restore()
+        elif edit['type'] == 'ELLIPSE':
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(edit['color'], thickness))
+            painter.drawEllipse(edit['rect'].translated(-offset))
+        elif edit['type'] == 'PEN':
+            points = edit.get('points', [])
+            if len(points) >= 2:
+                pen_brush = QPen(edit['color'], thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(pen_brush)
+                path = QPainterPath()
+                path.moveTo(points[0] - offset)
+                for pt in points[1:]:
+                    path.lineTo(pt - offset)
+                painter.drawPath(path)
+        elif edit['type'] == 'HIGHLIGHTER':
+            points = edit.get('points', [])
+            if len(points) >= 2:
+                painter.save()
+                hl_color = QColor(edit['color'])
+                hl_color.setAlpha(115)  # 半透明荧光笔效果，透出底文
+                hl_pen = QPen(hl_color, max(12, thickness * 4), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(hl_pen)
+                path = QPainterPath()
+                path.moveTo(points[0] - offset)
+                for pt in points[1:]:
+                    path.lineTo(pt - offset)
+                painter.drawPath(path)
+                painter.restore()
+        elif edit['type'] == 'STEP':
+            step_pos = edit.get('pos') or edit.get('center')
+            if step_pos is None:
+                continue
+            pos = step_pos - offset
+            radius = edit.get('radius') or max(11, 8 + thickness * 2)
+            num_val = edit.get('num') if edit.get('num') is not None else edit.get('number', 1)
+            num_str = str(num_val)
+            painter.save()
+            painter.setBrush(QBrush(edit['color']))
+            painter.setPen(QPen(Qt.white, 1.5))
+            painter.drawEllipse(pos, radius, radius)
+            text_color = Qt.white if edit['color'].lightness() < 165 else Qt.black
+            painter.setPen(QPen(text_color))
+            f = QFont("Microsoft YaHei UI", max(8, int(radius * 0.95)), QFont.Bold)
+            painter.setFont(f)
+            text_rect = QRect(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
+            painter.drawText(text_rect, Qt.AlignCenter, num_str)
+            painter.restore()
 
+    painter.setBrush(Qt.NoBrush)
+
+
+def is_annotation_hit(edit, pos):
+    """精确检测鼠标点击位置是否命中某一标注元素，支持所有矢量与位图标注类型"""
+    try:
+        t = edit.get('type')
+        if t in ['RECTANGLE', 'BLUR', 'TEXT']:
+            return 'rect' in edit and edit['rect'].contains(pos)
+        elif t == 'ELLIPSE':
+            if 'rect' in edit:
+                r = edit['rect']
+                if r.contains(pos):
+                    cx = r.center().x()
+                    cy = r.center().y()
+                    rx = max(1.0, r.width() / 2.0)
+                    ry = max(1.0, r.height() / 2.0)
+                    val = ((pos.x() - cx) / rx) ** 2 + ((pos.y() - cy) / ry) ** 2
+                    return val <= 1.35
+            return False
+        elif t == 'LINE':
+            return point_to_segment_dist(pos, edit['start'], edit['end']) < 15
+        elif t in ['BLUR_STROKE', 'PEN', 'HIGHLIGHTER']:
+            thick = edit.get('thickness', 3)
+            radius = max(8, thick * (4 if t in ['BLUR_STROKE', 'HIGHLIGHTER'] else 2)) + 6
+            for pt in edit.get('points', []):
+                if math.hypot(pos.x() - pt.x(), pos.y() - pt.y()) <= radius:
+                    return True
+            return False
+        elif t == 'STEP':
+            step_pos = edit.get('pos') or edit.get('center')
+            if step_pos is not None:
+                thick = edit.get('thickness', 3)
+                radius = edit.get('radius') or (max(11, 8 + thick * 2) + 6)
+                return math.hypot(pos.x() - step_pos.x(), pos.y() - step_pos.y()) <= radius
+            return False
+    except Exception:
+        pass
+    return False
 
 
 def clear_scroll_temp_folder(folder_path):
@@ -2050,7 +2268,8 @@ class PinnedWindow(QWidget):
     def trigger_ocr(self):
         try:
             QToolTip.showText(QCursor.pos(), "🔤 正在识别贴图文字...", None, QRect(), 2500)
-            worker = OcrWorker(self.pixmap, use_ai=load_settings().get("use_ai_ocr", False))
+            ocr_img = self.pixmap.toImage()
+            worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
             def _on_done(text):
                 QToolTip.hideText()
                 if not text or not text.strip():
@@ -2145,22 +2364,10 @@ class EditableImageLabel(QLabel):
 
     def erase_annotation(self, pos):
         for i in range(len(self.edits)-1, -1, -1):
-            edit = self.edits[i]
-            if edit['type'] in ['RECTANGLE', 'BLUR', 'TEXT'] and 'rect' in edit and edit['rect'].contains(pos): 
+            if is_annotation_hit(self.edits[i], pos):
                 self.save_state()
                 self.edits.pop(i)
                 return True
-            elif edit['type'] == 'LINE' and point_to_segment_dist(pos, edit['start'], edit['end']) < 15: 
-                self.save_state()
-                self.edits.pop(i)
-                return True
-            elif edit['type'] == 'BLUR_STROKE':
-                radius = max(8, edit.get('thickness', 3) * 4) + 6
-                for pt in edit.get('points', []):
-                    if math.hypot(pos.x() - pt.x(), pos.y() - pt.y()) <= radius:
-                        self.save_state()
-                        self.edits.pop(i)
-                        return True
         return False
 
     def paintEvent(self, event):
@@ -2240,7 +2447,7 @@ class EditableImageLabel(QLabel):
 
     def wheelEvent(self, event: QWheelEvent):
         try:
-            if self.toolbar_ref.current_tool in ['LINE', 'RECTANGLE', 'BLUR'] and not self.crop_mode:
+            if self.toolbar_ref.current_tool in ['LINE', 'RECTANGLE', 'BLUR', 'ELLIPSE', 'PEN', 'HIGHLIGHTER', 'STEP'] and not self.crop_mode:
                 delta = event.angleDelta().y()
                 if delta > 0: self.toolbar_ref.current_thickness = min(20, getattr(self.toolbar_ref, 'current_thickness', 3) + 1)
                 else: self.toolbar_ref.current_thickness = max(1, getattr(self.toolbar_ref, 'current_thickness', 3) - 1)
@@ -2271,6 +2478,13 @@ class EditableImageLabel(QLabel):
 
     def mousePressEvent(self, event):
         try:
+            if event.button() == Qt.RightButton:
+                if self.toolbar_ref and self.toolbar_ref.current_tool:
+                    self.toolbar_ref.set_tool(None)
+                    return
+                elif self.crop_mode:
+                    self.exit_crop_mode()
+                    return
             if event.button() != Qt.LeftButton: return
             pos = event.pos()
 
@@ -2323,6 +2537,46 @@ class EditableImageLabel(QLabel):
                     'thickness': getattr(self.toolbar_ref, 'current_thickness', 3),
                     'temp': True
                 })
+            elif tool == 'STEP':
+                self.save_state()
+                step_num = getattr(self.toolbar_ref, 'current_step_num', 1)
+                thick = getattr(self.toolbar_ref, 'current_thickness', 3)
+                self.edits.append({
+                    'type': 'STEP',
+                    'pos': pos,
+                    'center': pos,
+                    'num': step_num,
+                    'number': step_num,
+                    'color': self.toolbar_ref.current_color,
+                    'thickness': thick,
+                    'radius': max(11, 8 + thick * 2),
+                    'temp': False
+                })
+                self.toolbar_ref.current_step_num = step_num + 1
+                self.update()
+            elif tool == 'ELLIPSE':
+                self.save_state()
+                self.is_drawing = True
+                self.drag_mode = None
+                self.edit_start = pos
+                self.edits.append({
+                    'type': 'ELLIPSE',
+                    'rect': QRect(pos, pos),
+                    'color': self.toolbar_ref.current_color,
+                    'thickness': getattr(self.toolbar_ref, 'current_thickness', 3),
+                    'temp': True
+                })
+            elif tool in ['PEN', 'HIGHLIGHTER']:
+                self.save_state()
+                self.is_drawing = True
+                self.drag_mode = None
+                self.edits.append({
+                    'type': tool,
+                    'points': [pos],
+                    'color': self.toolbar_ref.current_color,
+                    'thickness': getattr(self.toolbar_ref, 'current_thickness', 3),
+                    'temp': True
+                })
             elif tool in ['RECTANGLE', 'LINE']:
                 self.save_state()
                 self.is_drawing = True; self.drag_mode = None; self.edit_start = pos
@@ -2360,7 +2614,9 @@ class EditableImageLabel(QLabel):
             elif tool == 'BLUR':
                 r = getattr(self.toolbar_ref, 'current_thickness', 3) * 4
                 self.setCursor(create_brush_cursor(r))
-            elif tool in ['RECTANGLE', 'LINE', 'OCR']:
+            elif tool == 'STEP':
+                self.setCursor(Qt.PointingHandCursor)
+            elif tool in ['RECTANGLE', 'LINE', 'OCR', 'ELLIPSE', 'PEN', 'HIGHLIGHTER']:
                 self.setCursor(Qt.CrossCursor)
             else:
                 self.setCursor(Qt.ArrowCursor)
@@ -2377,8 +2633,15 @@ class EditableImageLabel(QLabel):
                 elif self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
                     self.text_rect = QRect(self.text_start, pos).normalized(); self.update()
                 elif self.edits and self.edits[-1].get('temp'):
-                    if self.edits[-1]['type'] == 'BLUR_STROKE':
+                    if self.edits[-1]['type'] in ['BLUR_STROKE', 'PEN', 'HIGHLIGHTER']:
                         self.edits[-1]['points'].append(pos)
+                        self.update()
+                    elif self.edits[-1]['type'] == 'ELLIPSE':
+                        rect = QRect(self.edit_start, pos).normalized()
+                        if event.modifiers() & Qt.ShiftModifier:
+                            side = max(rect.width(), rect.height())
+                            rect.setSize(QSize(side, side))
+                        self.edits[-1]['rect'] = rect
                         self.update()
                     else:
                         self.edits[-1]['rect'] = QRect(self.edit_start, pos).normalized(); self.edits[-1]['end'] = pos; self.update()
@@ -2679,6 +2942,7 @@ class ImageEditorDialog(QDialog):
 
         self.resize(min(1200, self.base_pixmap.width() + 40), min(800, self.base_pixmap.height() + 100))
         self.current_tool = None
+        self.current_step_num = 1
         self.current_thickness = 3 
         self.arrow_enabled = False
         self.current_color = QColor(255, 0, 0)
@@ -2731,38 +2995,65 @@ class ImageEditorDialog(QDialog):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
         self.btn_rect = QPushButton("Rect")
-        self.btn_crop = QPushButton("Crop")
+        self.btn_ellipse = QPushButton("Ellipse")
         self.btn_line = QPushButton("Line")
         self.btn_arrow = QPushButton("Arrow Off")
+        self.btn_pen = QPushButton("Pen")
+        self.btn_highlighter = QPushButton("Highlighter")
+        self.btn_step = QPushButton("Step")
         self.btn_text = QPushButton("Text")
         self.btn_blur = QPushButton("Blur")
         self.btn_erase = QPushButton("Erase")
         self.btn_color = QPushButton("Color")
+        self.btn_crop = QPushButton("Crop")
         self.btn_ocr = QPushButton("OCR")
+        self.btn_history = QPushButton("History")
+        self.btn_settings = QPushButton("Settings")
         self.btn_pin = QPushButton("Pin")
         self.btn_copy = QPushButton("Copy")
         self.btn_save = QPushButton("Save")
         self.btn_close = QPushButton("Close")
         
         self.btn_rect.clicked.connect(lambda: self.set_tool('RECTANGLE', self.btn_rect))
-        self.btn_crop.clicked.connect(lambda: self.set_tool('CROP', self.btn_crop))
+        self.btn_ellipse.clicked.connect(lambda: self.set_tool('ELLIPSE', self.btn_ellipse))
         self.btn_line.clicked.connect(lambda: self.set_tool('LINE', self.btn_line))
         self.btn_arrow.clicked.connect(self.toggle_arrow)
+        self.btn_pen.clicked.connect(lambda: self.set_tool('PEN', self.btn_pen))
+        self.btn_highlighter.clicked.connect(lambda: self.set_tool('HIGHLIGHTER', self.btn_highlighter))
+        self.btn_step.clicked.connect(lambda: self.set_tool('STEP', self.btn_step))
         self.btn_text.clicked.connect(lambda: self.set_tool('TEXT', self.btn_text))
         self.btn_blur.clicked.connect(lambda: self.set_tool('BLUR', self.btn_blur))
         self.btn_erase.clicked.connect(lambda: self.set_tool('ERASE', self.btn_erase))
         self.btn_color.clicked.connect(self.pick_drawing_color)
+        self.btn_crop.clicked.connect(lambda: self.set_tool('CROP', self.btn_crop))
         self.btn_ocr.clicked.connect(lambda: self.set_tool('OCR', self.btn_ocr))
+        self.btn_history.clicked.connect(self.open_history)
+        self.btn_settings.clicked.connect(self.open_settings)
         self.btn_pin.clicked.connect(self.pin_to_screen)
         self.btn_copy.clicked.connect(self.copy_to_clipboard)
         self.btn_save.clicked.connect(self.save_image)
         self.btn_close.clicked.connect(self.close)
 
-        for btn in [self.btn_rect, self.btn_crop, self.btn_line, self.btn_arrow, self.btn_text, self.btn_blur, self.btn_erase, self.btn_color, self.btn_ocr, self.btn_pin, self.btn_copy, self.btn_save, self.btn_close]:
+        all_btns = [
+            self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_arrow, self.btn_pen,
+            self.btn_highlighter, self.btn_step, self.btn_text, self.btn_blur, self.btn_erase,
+            self.btn_color, self.btn_crop, self.btn_ocr, self.btn_history, self.btn_settings,
+            self.btn_pin, self.btn_copy, self.btn_save, self.btn_close
+        ]
+        for btn in all_btns:
             btn.setCursor(Qt.PointingHandCursor)
             apply_button_style(btn, danger=(btn is self.btn_close))
             layout.addWidget(btn)
         parent_layout.addWidget(self.toolbar)
+
+    def open_history(self):
+        dlg = HistoryDialog(self, self.main_app_ref)
+        dlg.exec_()
+
+    def open_settings(self):
+        hotkey_mgr = getattr(self.main_app_ref, 'hotkey_listener', None)
+        dlg = SettingsDialog(self, hotkey_mgr)
+        dlg.exec_()
 
     def toggle_arrow(self):
         self.arrow_enabled = not self.arrow_enabled
@@ -2782,7 +3073,8 @@ class ImageEditorDialog(QDialog):
 
     def process_ocr(self, pixmap):
         self.btn_ocr.setText("OCR...")
-        self.ocr_worker = OcrWorker(pixmap, use_ai=load_settings().get("use_ai_ocr", False))
+        ocr_img = pixmap.toImage()
+        self.ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
         self.ocr_worker.finished.connect(self.show_ocr_result)
         self.ocr_worker.start()
 
@@ -2794,7 +3086,7 @@ class ImageEditorDialog(QDialog):
             dlg = OcrResultDialog(text, self)
             dlg.exec_()
 
-    def set_tool(self, tool_name, active_btn):
+    def set_tool(self, tool_name, active_btn=None):
         if getattr(self.img_label, 'inline_editor', None) and self.img_label.inline_editor.isVisible():
             self.img_label.commit_text_edit()
 
@@ -2806,16 +3098,23 @@ class ImageEditorDialog(QDialog):
         if self.btn_ocr.text() != "OCR":
             self.btn_ocr.setText("OCR")
 
+        tool_btns = [
+            self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_pen,
+            self.btn_highlighter, self.btn_step, self.btn_crop, self.btn_text,
+            self.btn_blur, self.btn_erase, self.btn_ocr
+        ]
+
         if tool_name is None or self.current_tool == tool_name:
             self.current_tool = None
-            for btn in [self.btn_rect, self.btn_crop, self.btn_line, self.btn_text, self.btn_blur, self.btn_erase, self.btn_ocr]:
+            for btn in tool_btns:
                 apply_button_style(btn)
             return
 
         self.current_tool = tool_name
-        for btn in [self.btn_rect, self.btn_crop, self.btn_line, self.btn_text, self.btn_blur, self.btn_erase, self.btn_ocr]:
+        for btn in tool_btns:
             apply_button_style(btn)
-        apply_button_style(active_btn, active=True)
+        if active_btn:
+            apply_button_style(active_btn, active=True)
 
         # 进入裁剪模式
         if tool_name == 'CROP':
@@ -2825,6 +3124,16 @@ class ImageEditorDialog(QDialog):
             if self.img_label.crop_mode:
                 self.img_label.exit_crop_mode()
             self.crop_toolbar.hide()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            if self.current_tool:
+                self.set_tool(None)
+                return
+            elif self.img_label.crop_mode:
+                self.cancel_crop()
+                return
+        super().keyPressEvent(event)
 
     def _show_crop_toolbar(self):
         """显示裁剪工具栏在窗口顶部居中"""
@@ -2864,6 +3173,8 @@ class ImageEditorDialog(QDialog):
             final_img = self.get_final_static_image()
             if final_img and not final_img.isNull():
                 QApplication.clipboard().setPixmap(final_img)
+                CaptureHistoryManager.get_instance().add_capture(final_img, title="编辑后复制")
+                check_and_auto_save_capture(final_img, prefix="edited")
                 print("Copied to clipboard!")
             self.accept()
         except Exception as e:
@@ -2876,6 +3187,8 @@ class ImageEditorDialog(QDialog):
             final_img = self.get_final_static_image()
             if self.main_app_ref and final_img and not final_img.isNull():
                 self.main_app_ref.create_pinned_window(final_img)
+                CaptureHistoryManager.get_instance().add_capture(final_img, title="编辑后贴图")
+                check_and_auto_save_capture(final_img, prefix="edited")
             self.accept()
         except Exception as e:
             logging.error("贴图失败: %s", e, exc_info=True)
@@ -2884,17 +3197,703 @@ class ImageEditorDialog(QDialog):
     def save_image(self):
         try:
             self.img_label.commit_text_edit()
-            options = QFileDialog.Options()
-            fileName, _ = QFileDialog.getSaveFileName(self, "Save Image", f"scroll_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png", "Images (*.png)", options=options)
-            if not fileName:
-                return
             final_img = self.get_final_static_image()
             if final_img and not final_img.isNull():
-                final_img.save(fileName)
-            self.accept()
+                ok = save_image_dialog(self, final_img, default_prefix="edited")
+                if ok:
+                    check_and_auto_save_capture(final_img, prefix="edited")
+                    self.accept()
         except Exception as e:
             logging.error("保存图片失败: %s", e, exc_info=True)
             QMessageBox.warning(self, "保存失败", f"保存图片时出错: {e}")
+
+
+# ==========================================
+# MULTI-FORMAT SAVE & AUTO-SAVE HELPERS
+# ==========================================
+def save_image_dialog(parent_widget, pixmap, default_prefix="screenshot"):
+    """
+    通用多格式保存对话框：支持 PNG/JPG/WebP，依据扩展名与画质参数正确编码保存
+    """
+    if pixmap is None or pixmap.isNull():
+        return False
+    try:
+        settings = load_settings()
+        save_dir = settings.get("default_save_dir", "")
+        if not save_dir or not os.path.exists(save_dir):
+            save_dir = os.path.join(os.path.expanduser("~"), "Pictures")
+            if not os.path.exists(save_dir):
+                save_dir = "."
+
+        fmt_pref = settings.get("save_format", "png").lower()
+        ext = ".jpg" if "jp" in fmt_pref else (".webp" if "webp" in fmt_pref else ".png")
+        default_filename = os.path.join(save_dir, f"{default_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}")
+
+        filter_str = "PNG 图像 (*.png);;JPEG 图像 (*.jpg *.jpeg);;WebP 图像 (*.webp);;所有文件 (*.*)"
+        selected_filter = "PNG 图像 (*.png)"
+        if "jp" in fmt_pref: selected_filter = "JPEG 图像 (*.jpg *.jpeg)"
+        elif "webp" in fmt_pref: selected_filter = "WebP 图像 (*.webp)"
+
+        fileName, chosen_filter = QFileDialog.getSaveFileName(parent_widget, "保存图像", default_filename, filter_str, selected_filter)
+        if not fileName:
+            return False
+
+        lower_name = fileName.lower()
+        quality = int(settings.get("save_quality", 95))
+        fmt = "PNG"
+        if lower_name.endswith(".jpg") or lower_name.endswith(".jpeg") or "JPEG" in chosen_filter:
+            fmt = "JPG"
+            if not (lower_name.endswith(".jpg") or lower_name.endswith(".jpeg")):
+                fileName += ".jpg"
+        elif lower_name.endswith(".webp") or "WebP" in chosen_filter:
+            fmt = "WEBP"
+            if not lower_name.endswith(".webp"):
+                fileName += ".webp"
+        else:
+            fmt = "PNG"
+            if not lower_name.endswith(".png"):
+                fileName += ".png"
+
+        ok = pixmap.save(fileName, fmt, quality)
+        if ok:
+            logging.info("图像保存成功: %s (%s, 质量=%d)", fileName, fmt, quality)
+            CaptureHistoryManager.get_instance().add_capture(pixmap, title="另存截图")
+            return True
+        else:
+            QMessageBox.warning(parent_widget, "保存失败", "保存图片时发生未知错误，未能写入文件。")
+            return False
+    except Exception as e:
+        logging.error("保存图像出错: %s", e, exc_info=True)
+        QMessageBox.warning(parent_widget, "保存失败", f"保存图片时出错: {e}")
+        return False
+
+def check_and_auto_save_capture(pixmap, prefix="capture"):
+    """若在设置中启用了自动保存，静默在后台存储一份到默认目录"""
+    if pixmap is None or pixmap.isNull():
+        return
+    try:
+        settings = load_settings()
+        if not settings.get("auto_save_enabled", False):
+            return
+        save_dir = settings.get("default_save_dir", "")
+        if not save_dir or not os.path.exists(save_dir):
+            save_dir = os.path.join(os.path.expanduser("~"), "Pictures")
+            os.makedirs(save_dir, exist_ok=True)
+
+        fmt_pref = settings.get("save_format", "png").lower()
+        ext = ".jpg" if "jp" in fmt_pref else (".webp" if "webp" in fmt_pref else ".png")
+        fmt = "JPG" if "jp" in fmt_pref else ("WEBP" if "webp" in fmt_pref else "PNG")
+        quality = int(settings.get("save_quality", 95))
+
+        fname = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:19]}{ext}"
+        fpath = os.path.join(save_dir, fname)
+        pixmap.save(fpath, fmt, quality)
+        logging.info("自动静默保存截图完成: %s", fpath)
+    except Exception as e:
+        logging.warning("自动保存失败: %s", e)
+
+def clean_orphan_temp_files():
+    """清理超过 24 小时的孤儿录屏和临时文件"""
+    try:
+        now = time.time()
+        for folder in [REC_TEMP_FOLDER, TEMP_FOLDER]:
+            if os.path.exists(folder):
+                for fname in os.listdir(folder):
+                    fpath = os.path.join(folder, fname)
+                    if os.path.isfile(fpath):
+                        if now - os.path.getmtime(fpath) > 86400:
+                            try:
+                                os.remove(fpath)
+                            except Exception:
+                                pass
+    except Exception as e:
+        logging.warning("清理临时文件失败: %s", e)
+
+# ==========================================
+# CAPTURE HISTORY PERSISTENCE & UI
+# ==========================================
+HISTORY_DIR = os.path.join(BASE_DIR, "capture_history")
+HISTORY_INDEX_FILE = os.path.join(HISTORY_DIR, "history_index.json")
+
+class CaptureHistoryManager:
+    _instance = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = CaptureHistoryManager()
+        return cls._instance
+
+    def __init__(self):
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        self.max_items = 100
+        self.items = []
+        self._load_index()
+
+    def _load_index(self):
+        try:
+            if os.path.exists(HISTORY_INDEX_FILE):
+                with open(HISTORY_INDEX_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.items = [it for it in data if os.path.exists(it.get('filepath', ''))]
+        except Exception as e:
+            logging.warning("读取截图历史索引失败: %s", e)
+            self.items = []
+
+    def _save_index(self):
+        try:
+            with open(HISTORY_INDEX_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.items, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.warning("保存截图历史索引失败: %s", e)
+
+    def add_capture(self, pixmap, title="截图"):
+        if pixmap is None or pixmap.isNull():
+            return None
+        try:
+            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+            filename = f"cap_{ts_str}.png"
+            filepath = os.path.join(HISTORY_DIR, filename)
+            pixmap.save(filepath, "PNG")
+
+            thumb_filename = f"thumb_{ts_str}.png"
+            thumb_path = os.path.join(HISTORY_DIR, thumb_filename)
+            thumb = pixmap.scaled(220, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            thumb.save(thumb_path, "PNG")
+
+            item = {
+                'id': ts_str,
+                'title': title,
+                'filepath': filepath,
+                'thumb_path': thumb_path,
+                'width': pixmap.width(),
+                'height': pixmap.height(),
+                'time_str': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'timestamp': time.time()
+            }
+            self.items.insert(0, item)
+
+            while len(self.items) > self.max_items:
+                old = self.items.pop()
+                try:
+                    if os.path.exists(old.get('filepath', '')):
+                        os.remove(old['filepath'])
+                    if os.path.exists(old.get('thumb_path', '')):
+                        os.remove(old['thumb_path'])
+                except Exception:
+                    pass
+
+            self._save_index()
+            return item
+        except Exception as e:
+            logging.error("保存截图历史失败: %s", e, exc_info=True)
+            return None
+
+    def delete_item(self, item_id):
+        item = next((it for it in self.items if it.get('id') == item_id), None)
+        if item:
+            self.items.remove(item)
+            try:
+                if os.path.exists(item.get('filepath', '')):
+                    os.remove(item['filepath'])
+                if os.path.exists(item.get('thumb_path', '')):
+                    os.remove(item['thumb_path'])
+            except Exception:
+                pass
+            self._save_index()
+
+    def clear_all(self):
+        for item in self.items:
+            try:
+                if os.path.exists(item.get('filepath', '')):
+                    os.remove(item['filepath'])
+                if os.path.exists(item.get('thumb_path', '')):
+                    os.remove(item['thumb_path'])
+            except Exception:
+                pass
+        self.items.clear()
+        self._save_index()
+
+
+class HistoryDialog(QDialog):
+    """现代卡片流式截图历史管理窗口，支持持久化、缩略图预览、重新编辑、贴图、复制、另存与清理"""
+    def __init__(self, parent=None, main_app_ref=None):
+        super().__init__(parent)
+        self.main_app_ref = main_app_ref
+        self.mgr = CaptureHistoryManager.get_instance()
+
+        self.setWindowTitle("📜 截图历史记录 (History)")
+        self.resize(880, 620)
+        self.setMinimumSize(600, 450)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("""
+            QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+            QLabel { color: #24292f; }
+            QFrame#card {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+            }
+            QFrame#card:hover {
+                border: 1px solid #0969da;
+                background: #f0f7ff;
+            }
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #d0d7de;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 13px;
+            }
+            QLineEdit:focus {
+                border-color: #0969da;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        # 顶部工具栏
+        top_bar = QHBoxLayout()
+        self.title_lbl = QLabel(f"<b>截图历史记录</b> <span style='color:#656d76;'>（共 {len(self.mgr.items)} 条）</span>")
+        self.title_lbl.setStyleSheet("font-size: 16px;")
+        top_bar.addWidget(self.title_lbl)
+
+        top_bar.addStretch()
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 搜索时间或尺寸...")
+        self.search_input.setFixedWidth(200)
+        self.search_input.textChanged.connect(self.populate_cards)
+        top_bar.addWidget(self.search_input)
+
+        self.btn_clear = QPushButton("🧹 清空全部")
+        self.btn_clear.setCursor(Qt.PointingHandCursor)
+        apply_button_style(self.btn_clear, danger=True)
+        self.btn_clear.clicked.connect(self.on_clear_all)
+        top_bar.addWidget(self.btn_clear)
+
+        self.btn_close = QPushButton("✕ 关闭")
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        apply_button_style(self.btn_close)
+        self.btn_close.clicked.connect(self.close)
+        top_bar.addWidget(self.btn_close)
+
+        layout.addLayout(top_bar)
+
+        # 中部滚动区域
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("QScrollArea { border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff; }")
+
+        self.cards_container = QWidget()
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(12, 12, 12, 12)
+        self.cards_layout.setSpacing(10)
+        self.cards_layout.addStretch()
+        self.scroll_area.setWidget(self.cards_container)
+
+        layout.addWidget(self.scroll_area, 1)
+
+        self.populate_cards()
+
+    def populate_cards(self):
+        while self.cards_layout.count() > 1:
+            child = self.cards_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        filter_txt = self.search_input.text().strip().lower()
+        matched_items = []
+        for item in self.mgr.items:
+            if not filter_txt:
+                matched_items.append(item)
+            else:
+                desc = f"{item.get('time_str', '')} {item.get('width', 0)}x{item.get('height', 0)} {item.get('title', '')}".lower()
+                if filter_txt in desc:
+                    matched_items.append(item)
+
+        self.title_lbl.setText(f"<b>截图历史记录</b> <span style='color:#656d76;'>（共 {len(matched_items)} 条）</span>")
+
+        if not matched_items:
+            empty_lbl = QLabel("暂无截图历史记录\n使用 F1 截图后，将自动在这里保存与展示历史。")
+            empty_lbl.setAlignment(Qt.AlignCenter)
+            empty_lbl.setStyleSheet("color: #8c959f; font-size: 14px; padding: 60px;")
+            self.cards_layout.insertWidget(0, empty_lbl)
+            return
+
+        for item in matched_items:
+            card = self._create_item_card(item)
+            self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+
+    def _create_item_card(self, item):
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setSpacing(16)
+
+        thumb_lbl = QLabel()
+        thumb_lbl.setFixedSize(140, 95)
+        thumb_lbl.setAlignment(Qt.AlignCenter)
+        thumb_lbl.setStyleSheet("background: #0d1117; border-radius: 6px; border: 1px solid #d0d7de;")
+        tpath = item.get('thumb_path', '')
+        if os.path.exists(tpath):
+            pix = QPixmap(tpath)
+            if not pix.isNull():
+                scaled = pix.scaled(136, 91, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb_lbl.setPixmap(scaled)
+        card_layout.addWidget(thumb_lbl)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(4)
+        lbl_time = QLabel(f"<b>🕒 时间:</b> {item.get('time_str', '')}")
+        lbl_time.setStyleSheet("font-size: 13px; font-weight: 600; color: #1f2328;")
+        lbl_res = QLabel(f"<b>📐 尺寸:</b> {item.get('width', 0)} × {item.get('height', 0)} 像素")
+        lbl_res.setStyleSheet("font-size: 12px; color: #57606a;")
+        lbl_path = QLabel(f"<b>📁 存储:</b> {os.path.basename(item.get('filepath', ''))}")
+        lbl_path.setStyleSheet("font-size: 11px; color: #8c959f;")
+
+        info_col.addWidget(lbl_time)
+        info_col.addWidget(lbl_res)
+        info_col.addWidget(lbl_path)
+        info_col.addStretch()
+        card_layout.addLayout(info_col, 1)
+
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(6)
+
+        btn_row1 = QHBoxLayout()
+        btn_row1.setSpacing(6)
+
+        btn_copy = QPushButton("📋 复制")
+        btn_copy.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_copy)
+        btn_copy.clicked.connect(lambda _, it=item: self._copy_item(it))
+        btn_row1.addWidget(btn_copy)
+
+        btn_edit = QPushButton("✏ 编辑")
+        btn_edit.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_edit)
+        btn_edit.clicked.connect(lambda _, it=item: self._edit_item(it))
+        btn_row1.addWidget(btn_edit)
+
+        btn_pin = QPushButton("📌 贴图")
+        btn_pin.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_pin)
+        btn_pin.clicked.connect(lambda _, it=item: self._pin_item(it))
+        btn_row1.addWidget(btn_pin)
+
+        btn_col.addLayout(btn_row1)
+
+        btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(6)
+
+        btn_save = QPushButton("💾 另存...")
+        btn_save.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_save)
+        btn_save.clicked.connect(lambda _, it=item: self._save_item(it))
+        btn_row2.addWidget(btn_save)
+
+        btn_del = QPushButton("🗑 删除")
+        btn_del.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_del, danger=True)
+        btn_del.clicked.connect(lambda _, it=item: self._delete_item(it))
+        btn_row2.addWidget(btn_del)
+
+        btn_col.addLayout(btn_row2)
+        card_layout.addLayout(btn_col)
+
+        return card
+
+    def _copy_item(self, item):
+        fpath = item.get('filepath', '')
+        if os.path.exists(fpath):
+            pix = QPixmap(fpath)
+            if not pix.isNull():
+                QApplication.clipboard().setPixmap(pix)
+                QToolTip.showText(QCursor.pos(), "✅ 已复制到剪贴板！", None, QRect(), 2000)
+
+    def _edit_item(self, item):
+        fpath = item.get('filepath', '')
+        if os.path.exists(fpath):
+            pix = QPixmap(fpath)
+            if not pix.isNull():
+                self.close()
+                editor = ImageEditorDialog(pix, self.main_app_ref)
+                editor.exec_()
+
+    def _pin_item(self, item):
+        fpath = item.get('filepath', '')
+        if os.path.exists(fpath):
+            pix = QPixmap(fpath)
+            if not pix.isNull() and self.main_app_ref:
+                self.close()
+                self.main_app_ref.create_pinned_window(pix)
+
+    def _save_item(self, item):
+        fpath = item.get('filepath', '')
+        if os.path.exists(fpath):
+            pix = QPixmap(fpath)
+            if not pix.isNull():
+                save_image_dialog(self, pix, default_prefix="history")
+
+    def _delete_item(self, item):
+        self.mgr.delete_item(item.get('id'))
+        self.populate_cards()
+
+    def on_clear_all(self):
+        ret = QMessageBox.question(self, "确认清空", "确定要清空所有截图历史记录和本地文件吗？", QMessageBox.Yes | QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            self.mgr.clear_all()
+            self.populate_cards()
+
+
+class SettingsDialog(QDialog):
+    """系统偏好设置面板：快捷键自定义、默认保存目录与画质、OpenRouter AI 模型配置"""
+    def __init__(self, parent=None, hotkey_mgr=None):
+        super().__init__(parent)
+        self.hotkey_mgr = hotkey_mgr
+        self.setWindowTitle("⚙ 系统设置 - Murioki Capture")
+        self.resize(580, 560)
+        self.setMinimumSize(520, 500)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("""
+            QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+            QLabel { color: #24292f; font-size: 13px; }
+            QGroupBox {
+                font-size: 13px;
+                font-weight: 600;
+                color: #0969da;
+                border: 1px solid #d0d7de;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 16px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 4px;
+            }
+            QLineEdit, QComboBox {
+                background: #ffffff;
+                border: 1px solid #d0d7de;
+                border-radius: 6px;
+                padding: 5px 10px;
+                font-size: 12px;
+                color: #24292f;
+            }
+            QLineEdit:focus, QComboBox:focus { border-color: #0969da; }
+            QCheckBox { font-size: 13px; color: #24292f; spacing: 8px; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        # 1. 全局快捷键分组
+        hk_group = QGroupBox("⌨ 全局快捷键自定义")
+        hk_layout = QGridLayout(hk_group)
+        hk_layout.setContentsMargins(14, 14, 14, 14)
+        hk_layout.setSpacing(10)
+
+        hk_layout.addWidget(QLabel("截屏快捷键:"), 0, 0)
+        self.input_hk_snip = QLineEdit()
+        self.input_hk_snip.setPlaceholderText("例如: F1 或 Ctrl+Alt+A")
+        hk_layout.addWidget(self.input_hk_snip, 0, 1)
+
+        hk_layout.addWidget(QLabel("识图/翻译:"), 1, 0)
+        self.input_hk_ocr = QLineEdit()
+        self.input_hk_ocr.setPlaceholderText("例如: F2")
+        hk_layout.addWidget(self.input_hk_ocr, 1, 1)
+
+        hk_layout.addWidget(QLabel("贴图置顶:"), 2, 0)
+        self.input_hk_pin = QLineEdit()
+        self.input_hk_pin.setPlaceholderText("例如: F3")
+        hk_layout.addWidget(self.input_hk_pin, 2, 1)
+
+        hk_layout.addWidget(QLabel("屏幕录制:"), 3, 0)
+        self.input_hk_rec = QLineEdit()
+        self.input_hk_rec.setPlaceholderText("例如: F4")
+        hk_layout.addWidget(self.input_hk_rec, 3, 1)
+
+        btn_reset_hk = QPushButton("恢复默认快捷键 (F1~F4)")
+        btn_reset_hk.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_reset_hk)
+        btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
+        hk_layout.addWidget(btn_reset_hk, 4, 1, Qt.AlignRight)
+
+        layout.addWidget(hk_group)
+
+        # 2. 保存与文件输出分组
+        save_group = QGroupBox("💾 保存与输出偏好")
+        save_layout = QGridLayout(save_group)
+        save_layout.setContentsMargins(14, 14, 14, 14)
+        save_layout.setSpacing(10)
+
+        save_layout.addWidget(QLabel("默认保存目录:"), 0, 0)
+        dir_box = QHBoxLayout()
+        self.input_save_dir = QLineEdit()
+        dir_box.addWidget(self.input_save_dir, 1)
+        btn_browse_dir = QPushButton("浏览...")
+        btn_browse_dir.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_browse_dir)
+        btn_browse_dir.clicked.connect(self._browse_save_dir)
+        dir_box.addWidget(btn_browse_dir)
+        save_layout.addLayout(dir_box, 0, 1)
+
+        self.cb_auto_save = QCheckBox("截图/复制时自动在后台静默保存一份副本到该目录")
+        save_layout.addWidget(self.cb_auto_save, 1, 0, 1, 2)
+
+        save_layout.addWidget(QLabel("默认存储格式:"), 2, 0)
+        self.combo_format = QComboBox()
+        self.combo_format.addItems(["PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)"])
+        save_layout.addWidget(self.combo_format, 2, 1)
+
+        save_layout.addWidget(QLabel("压缩画质 (JPEG/WebP):"), 3, 0)
+        qual_box = QHBoxLayout()
+        self.slider_quality = QSlider(Qt.Horizontal)
+        self.slider_quality.setRange(70, 100)
+        self.slider_quality.setValue(95)
+        self.lbl_qual_val = QLabel("95%")
+        self.lbl_qual_val.setFixedWidth(40)
+        self.slider_quality.valueChanged.connect(lambda v: self.lbl_qual_val.setText(f"{v}%"))
+        qual_box.addWidget(self.slider_quality, 1)
+        qual_box.addWidget(self.lbl_qual_val)
+        save_layout.addLayout(qual_box, 3, 1)
+
+        layout.addWidget(save_group)
+
+        # 3. AI 识别与翻译分组
+        ai_group = QGroupBox("🤖 AI 大模型服务 (OpenRouter)")
+        ai_layout = QGridLayout(ai_group)
+        ai_layout.setContentsMargins(14, 14, 14, 14)
+        ai_layout.setSpacing(10)
+
+        ai_layout.addWidget(QLabel("API Key:"), 0, 0)
+        key_box = QHBoxLayout()
+        self.input_api_key = QLineEdit()
+        self.input_api_key.setEchoMode(QLineEdit.Password)
+        self.input_api_key.setPlaceholderText("sk-or-v1-...")
+        key_box.addWidget(self.input_api_key, 1)
+        btn_toggle_key = QPushButton("👁")
+        btn_toggle_key.setFixedWidth(30)
+        btn_toggle_key.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_toggle_key)
+        def _toggle_key():
+            if self.input_api_key.echoMode() == QLineEdit.Password:
+                self.input_api_key.setEchoMode(QLineEdit.Normal)
+            else:
+                self.input_api_key.setEchoMode(QLineEdit.Password)
+        btn_toggle_key.clicked.connect(_toggle_key)
+        key_box.addWidget(btn_toggle_key)
+        ai_layout.addLayout(key_box, 0, 1)
+
+        ai_layout.addWidget(QLabel("首选模型:"), 1, 0)
+        self.combo_model = QComboBox()
+        self.combo_model.setEditable(True)
+        model_options = [
+            "qwen/qwen-2.5-vl-72b-instruct:free",
+            "google/gemini-2.0-flash-exp:free",
+            "google/gemini-2.0-flash-thinking-exp:free",
+            "meta-llama/llama-3.2-11b-vision-instruct:free",
+            "openrouter/auto"
+        ]
+        self.combo_model.addItems(model_options)
+        ai_layout.addWidget(self.combo_model, 1, 1)
+
+        chk_box = QHBoxLayout()
+        self.cb_ai_trans = QCheckBox("启用 AI 智能翻译")
+        self.cb_ai_ocr = QCheckBox("启用 AI 多模态文字识别")
+        chk_box.addWidget(self.cb_ai_trans)
+        chk_box.addWidget(self.cb_ai_ocr)
+        ai_layout.addLayout(chk_box, 2, 0, 1, 2)
+
+        layout.addWidget(ai_group)
+
+        # 底部按钮栏
+        btn_bar = QHBoxLayout()
+        btn_bar.setSpacing(10)
+        btn_bar.addStretch()
+
+        btn_save = QPushButton("💾 保存并应用")
+        btn_save.setFixedHeight(34)
+        btn_save.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_save, active=True)
+        btn_save.clicked.connect(self.save_and_apply)
+        btn_bar.addWidget(btn_save)
+
+        btn_cancel = QPushButton("✕ 取消")
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_cancel)
+        btn_cancel.clicked.connect(self.close)
+        btn_bar.addWidget(btn_cancel)
+
+        layout.addLayout(btn_bar)
+
+        self._load_current_values()
+
+    def _load_current_values(self):
+        s = load_settings()
+        self.input_hk_snip.setText(s.get("hotkey_snip", "F1"))
+        self.input_hk_ocr.setText(s.get("hotkey_ocr", "F2"))
+        self.input_hk_pin.setText(s.get("hotkey_pin", "F3"))
+        self.input_hk_rec.setText(s.get("hotkey_record", "F4"))
+
+        self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
+        self.cb_auto_save.setChecked(s.get("auto_save_enabled", False))
+
+        fmt = s.get("save_format", "png").lower()
+        if "jp" in fmt: self.combo_format.setCurrentIndex(1)
+        elif "webp" in fmt: self.combo_format.setCurrentIndex(2)
+        else: self.combo_format.setCurrentIndex(0)
+
+        qual = int(s.get("save_quality", 95))
+        self.slider_quality.setValue(qual)
+        self.lbl_qual_val.setText(f"{qual}%")
+
+        self.input_api_key.setText(s.get("openrouter_api_key", ""))
+        self.combo_model.setCurrentText(s.get("openrouter_model", DEFAULT_OPENROUTER_MODEL))
+        self.cb_ai_trans.setChecked(s.get("use_ai_translation", False))
+        self.cb_ai_ocr.setChecked(s.get("use_ai_ocr", False))
+
+    def _reset_default_hotkeys(self):
+        self.input_hk_snip.setText("F1")
+        self.input_hk_ocr.setText("F2")
+        self.input_hk_pin.setText("F3")
+        self.input_hk_rec.setText("F4")
+
+    def _browse_save_dir(self):
+        chosen = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.input_save_dir.text())
+        if chosen:
+            self.input_save_dir.setText(chosen)
+
+    def save_and_apply(self):
+        fmt_idx = self.combo_format.currentIndex()
+        fmt_str = "png" if fmt_idx == 0 else ("jpg" if fmt_idx == 1 else "webp")
+
+        new_settings = {
+            "hotkey_snip": self.input_hk_snip.text().strip() or "F1",
+            "hotkey_ocr": self.input_hk_ocr.text().strip() or "F2",
+            "hotkey_pin": self.input_hk_pin.text().strip() or "F3",
+            "hotkey_record": self.input_hk_rec.text().strip() or "F4",
+            "default_save_dir": self.input_save_dir.text().strip(),
+            "auto_save_enabled": self.cb_auto_save.isChecked(),
+            "save_format": fmt_str,
+            "save_quality": self.slider_quality.value(),
+            "openrouter_api_key": self.input_api_key.text().strip(),
+            "openrouter_model": self.combo_model.currentText().strip() or DEFAULT_OPENROUTER_MODEL,
+            "use_ai_translation": self.cb_ai_trans.isChecked(),
+            "use_ai_ocr": self.cb_ai_ocr.isChecked(),
+        }
+        save_settings(new_settings)
+        if self.hotkey_mgr:
+            self.hotkey_mgr.reload_hotkeys()
+        QMessageBox.information(self, "设置已保存", "偏好设置已成功保存并立即生效！")
+        self.accept()
 
 # ==========================================
 # SCROLL CAPTURE SYSTEM
@@ -2914,20 +3913,21 @@ class CaptureFrame(QWidget):
 
 
 class ScrollCaptureThread(QThread):
-    capture_finished = pyqtSignal(int)
+    # 发射在内存中捕获的所有 BGR 图像帧列表（彻底杜绝磁盘 I/O 磨损与卡顿）
+    capture_finished = pyqtSignal(list)
 
     def __init__(self, rect):
         super().__init__()
         self.rect = rect
         self.is_recording = True
         self.frame_count = 0
-        os.makedirs(TEMP_FOLDER, exist_ok=True)
+        self.captured_frames = []
 
-    def capture_frame(self, sct, monitor):
+    def grab_frame_bgr(self, sct, monitor):
         img = sct.grab(monitor)
-        frame_path = os.path.join(TEMP_FOLDER, f"frame_{self.frame_count}.png")
-        mss.tools.to_png(img.rgb, img.size, level=1, output=frame_path)
-        self.frame_count += 1
+        raw = np.array(img)
+        # mss 返回的是 BGRA 格式，转换为 BGR 供 cv2 拼接
+        return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
 
     def run(self):
         try:
@@ -2939,21 +3939,46 @@ class ScrollCaptureThread(QThread):
                     "width": max(1, self.rect.width() - (border * 2)),
                     "height": max(1, self.rect.height() - (border * 2))
                 }
-                self.capture_frame(sct, monitor)
+                first_frame = self.grab_frame_bgr(sct, monitor)
+                self.captured_frames.append(first_frame)
+                self.frame_count += 1
+
                 center = self.rect.center()
+                identical_count = 0
+
                 while self.is_recording and self.frame_count < SCROLL_MAX_FRAMES:
                     QCursor.setPos(QPoint(center.x(), center.y()))
                     send_mouse_wheel(SCROLL_WHEEL_DELTA)
                     time.sleep(SCROLL_SETTLE_DELAY)
                     if not self.is_recording:
                         break
-                    self.capture_frame(sct, monitor)
+
+                    new_frame = self.grab_frame_bgr(sct, monitor)
+                    
+                    # 智能到底检测：比对相邻两帧画面差异
+                    if len(self.captured_frames) > 0:
+                        prev_frame = self.captured_frames[-1]
+                        if prev_frame.shape == new_frame.shape:
+                            # 提取底部 35% 区域对比差异
+                            h = prev_frame.shape[0]
+                            sample_h = max(10, int(h * 0.35))
+                            diff = np.mean(np.abs(new_frame[-sample_h:, :].astype(np.float32) - prev_frame[-sample_h:, :].astype(np.float32)))
+                            if diff < 1.2:
+                                identical_count += 1
+                                if identical_count >= 3:
+                                    logging.info("滚动截图检测到连续 3 次滚动无画面位移，判定到达页面底部，自动停止")
+                                    break
+                            else:
+                                identical_count = 0
+
+                    self.captured_frames.append(new_frame)
+                    self.frame_count += 1
                     time.sleep(SCROLL_CAPTURE_INTERVAL)
         except Exception as e:
             logging.error("滚动截图线程发生错误: %s", e, exc_info=True)
         finally:
             self.is_recording = False
-            self.capture_finished.emit(self.frame_count)
+            self.capture_finished.emit(self.captured_frames)
 
     def stop(self):
         self.is_recording = False
@@ -2961,10 +3986,10 @@ class ScrollCaptureThread(QThread):
 # ==========================================
 # SCREEN RECORDING SYSTEM (F4)
 # ==========================================
-def convert_video_to_gif(video_path, gif_path, max_fps=15):
+def convert_video_to_gif(video_path, gif_path, max_fps=15, scale=1.0):
     """
     使用 OpenCV 解码帧并结合 Pillow 将视频高效转换为高质量自适应调色板 GIF。
-    无需安装 ffmpeg，内存占用低，耗时极短。
+    无需安装 ffmpeg，内存占用低，耗时极短。支持自定义帧率与缩放尺寸。
     """
     if not os.path.exists(video_path):
         return False
@@ -2973,7 +3998,7 @@ def convert_video_to_gif(video_path, gif_path, max_fps=15):
         return False
 
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    step = max(1, int(round(video_fps / max_fps)))
+    step = max(1, int(round(video_fps / max(1, max_fps))))
     target_fps = video_fps / step
     duration_ms = int(1000.0 / target_fps)
 
@@ -2984,6 +4009,12 @@ def convert_video_to_gif(video_path, gif_path, max_fps=15):
         if not ret:
             break
         if idx % step == 0:
+            if scale < 0.99:
+                nw = max(16, int(frame.shape[1] * scale))
+                nh = max(16, int(frame.shape[0] * scale))
+                if nw % 2 != 0: nw -= 1
+                if nh % 2 != 0: nh -= 1
+                frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
             p_img = pil_img.convert('P', palette=Image.ADAPTIVE, colors=128)
@@ -3070,6 +4101,9 @@ class ScreenRecorderThread(QThread):
             self.frame_count = 0
             last_emitted_sec = -1
             next_frame_time = time.time()
+            record_start_time = time.time()
+            total_paused_time = 0.0
+            pause_start_time = 0.0
 
             monitor = {
                 "top": self.rect.y(),
@@ -3082,9 +4116,13 @@ class ScreenRecorderThread(QThread):
                 while self.is_running:
                     now = time.time()
                     if self.is_paused:
+                        if pause_start_time == 0.0:
+                            pause_start_time = now
                         time.sleep(0.04)
-                        next_frame_time = time.time()
                         continue
+                    elif pause_start_time > 0.0:
+                        total_paused_time += (now - pause_start_time)
+                        pause_start_time = 0.0
 
                     if now < next_frame_time:
                         sleep_dur = next_frame_time - now
@@ -3099,10 +4137,16 @@ class ScreenRecorderThread(QThread):
                     if scale != 1.0 or frame_bgr.shape[1] != out_w or frame_bgr.shape[0] != out_h:
                         frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
-                    writer.write(frame_bgr)
-                    self.frame_count += 1
-                    next_frame_time += frame_interval
+                    # 墙钟时间校准：若机器负载高导致轻微掉帧，自动平滑补偿帧，杜绝回放快进失真
+                    effective_elapsed = (time.time() - record_start_time) - total_paused_time
+                    expected_frames = max(1, int(effective_elapsed * self.fps))
+                    frames_behind = expected_frames - self.frame_count
+                    write_times = max(1, min(frames_behind, 4))
+                    for _ in range(write_times):
+                        writer.write(frame_bgr)
+                        self.frame_count += 1
 
+                    next_frame_time += frame_interval
                     if time.time() - next_frame_time > frame_interval * 2:
                         next_frame_time = time.time()
 
@@ -3530,7 +4574,25 @@ class RecordingExportDialog(QDialog):
 
         main_layout.addLayout(ctrl_layout)
 
-        # 4. 底部操作按钮栏 (保存MP4、保存GIF、复制GIF、关闭)
+        # 4. GIF 导出参数面板
+        gif_opt_layout = QHBoxLayout()
+        gif_opt_layout.setSpacing(10)
+        gif_opt_layout.addWidget(QLabel("<b>GIF 导出选项:</b>"))
+        gif_opt_layout.addWidget(QLabel("帧率:"))
+        self.combo_gif_fps = QComboBox()
+        self.combo_gif_fps.addItems(["5 FPS", "10 FPS", "15 FPS", "20 FPS"])
+        self.combo_gif_fps.setCurrentIndex(1)
+        gif_opt_layout.addWidget(self.combo_gif_fps)
+
+        gif_opt_layout.addWidget(QLabel("尺寸:"))
+        self.combo_gif_scale = QComboBox()
+        self.combo_gif_scale.addItems(["原尺寸 (100%)", "高清 (75%)", "适中 (50%)", "紧凑 (33%)"])
+        self.combo_gif_scale.setCurrentIndex(1)
+        gif_opt_layout.addWidget(self.combo_gif_scale)
+        gif_opt_layout.addStretch()
+        main_layout.addLayout(gif_opt_layout)
+
+        # 5. 底部操作按钮栏 (保存MP4、保存GIF、复制GIF、关闭)
         btn_bar = QHBoxLayout()
         btn_bar.setSpacing(10)
 
@@ -3692,13 +4754,21 @@ class RecordingExportDialog(QDialog):
                 QMessageBox.critical(self, "导出失败", f"保存 MP4 视频失败: {e}")
 
     def _ensure_gif_generated(self):
-        if self.temp_gif_path and os.path.exists(self.temp_gif_path):
+        fps_map = {"5 FPS": 5, "10 FPS": 10, "15 FPS": 15, "20 FPS": 20}
+        scale_map = {"原尺寸 (100%)": 1.0, "高清 (75%)": 0.75, "适中 (50%)": 0.5, "紧凑 (33%)": 0.33}
+        chosen_fps = fps_map.get(self.combo_gif_fps.currentText(), 10)
+        chosen_scale = scale_map.get(self.combo_gif_scale.currentText(), 0.75)
+
+        gif_name = f"{os.path.splitext(os.path.basename(self.video_path))[0]}_{chosen_fps}fps_{int(chosen_scale*100)}.gif"
+        target_path = os.path.join(REC_TEMP_FOLDER, gif_name)
+        if os.path.exists(target_path):
+            self.temp_gif_path = target_path
             return self.temp_gif_path
-        gif_name = os.path.splitext(os.path.basename(self.video_path))[0] + ".gif"
-        self.temp_gif_path = os.path.join(REC_TEMP_FOLDER, gif_name)
+
+        self.temp_gif_path = target_path
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ok = convert_video_to_gif(self.video_path, self.temp_gif_path, max_fps=15)
+            ok = convert_video_to_gif(self.video_path, self.temp_gif_path, max_fps=chosen_fps, scale=chosen_scale)
             if not ok:
                 return None
             return self.temp_gif_path
@@ -3742,13 +4812,46 @@ class RecordingExportDialog(QDialog):
             if hasattr(self, 'cap') and self.cap and self.cap.isOpened():
                 self.cap.release()
                 self.cap = None
+            if hasattr(self, 'temp_gif_path') and self.temp_gif_path and os.path.exists(self.temp_gif_path):
+                try:
+                    os.remove(self.temp_gif_path)
+                except Exception:
+                    pass
         except Exception as e:
             logging.error("RecordingExportDialog closeEvent 异常: %s", e)
         super().closeEvent(event)
 
-# ==========================================
-# MAIN SCREENSHOT TOOL (NORMAL CAPTURE)
-# ==========================================
+def parse_hotkey_to_native(hotkey_str):
+    """解析如 'F1', 'Ctrl+Alt+A', 'Shift+F2' 等快捷键字符串为 Windows 原生 MOD 掩码与 VK 键码"""
+    if not hotkey_str:
+        return 0, 0
+    parts = [p.strip().lower() for p in hotkey_str.split('+')]
+    mod = 0x4000  # MOD_NOREPEAT
+    vk = 0
+    for p in parts:
+        if p in ['ctrl', 'control']:
+            mod |= 0x0002
+        elif p == 'alt':
+            mod |= 0x0001
+        elif p == 'shift':
+            mod |= 0x0004
+        elif p in ['win', 'windows']:
+            mod |= 0x0008
+        elif p.startswith('f') and p[1:].isdigit():
+            f_num = int(p[1:])
+            if 1 <= f_num <= 24:
+                vk = 0x70 + (f_num - 1)
+        elif len(p) == 1 and p.isalnum():
+            vk = ord(p.upper())
+        elif p == 'space':
+            vk = 0x20
+        elif p == 'esc':
+            vk = 0x1B
+        elif p in ['printscreen', 'prtscr']:
+            vk = 0x2C
+    return mod, vk
+
+
 class GlobalHotkeyManager(QObject):
     """
     基于 Windows 原生 RegisterHotKey 的全局快捷键管理器。
@@ -3801,56 +4904,44 @@ class GlobalHotkeyManager(QObject):
         app.installNativeEventFilter(self._filter)
         self._register_static_hotkeys()
 
+    def _register_one_hotkey(self, hotkey_id, hotkey_str, trigger_callback):
+        if not hotkey_str:
+            return
+        mod, vk = parse_hotkey_to_native(hotkey_str)
+        if vk != 0 and self._user32.RegisterHotKey(None, hotkey_id, mod, vk):
+            self._registered_native_ids.add(hotkey_id)
+            logging.info("Windows 原生热键 %s 注册成功 (ID=%d)", hotkey_str, hotkey_id)
+        else:
+            logging.info("Windows 原生热键 %s 未生效，采用 keyboard 库监听...", hotkey_str)
+            try:
+                keyboard.add_hotkey(hotkey_str.lower(), trigger_callback, suppress=True)
+            except Exception as e:
+                logging.warning("keyboard 热键 %s 注册失败: %s", hotkey_str, e)
+
     def _register_static_hotkeys(self):
-        MOD_NOREPEAT = 0x4000
-        VK_F1 = 0x70
-        VK_F2 = 0x71
-        VK_F3 = 0x72
-        VK_F4 = 0x73
+        settings = load_settings()
+        hk_snip = settings.get("hotkey_snip", "F1")
+        hk_ocr = settings.get("hotkey_ocr", "F2")
+        hk_pin = settings.get("hotkey_pin", "F3")
+        hk_rec = settings.get("hotkey_record", "F4")
 
-        # 注册 F1
-        if self._user32.RegisterHotKey(None, self.HOTKEY_F1_ID, MOD_NOREPEAT, VK_F1):
-            self._registered_native_ids.add(self.HOTKEY_F1_ID)
-            logging.info("Windows 原生热键 F1 注册成功 (ID=%d)", self.HOTKEY_F1_ID)
-        else:
-            logging.warning("Windows 原生 F1 注册失败，尝试使用 keyboard 兜底...")
-            try:
-                keyboard.add_hotkey('f1', self.trigger_snip, suppress=True)
-            except Exception as e:
-                logging.error("keyboard F1 兜底注册失败: %s", e)
+        self._register_one_hotkey(self.HOTKEY_F1_ID, hk_snip, self.trigger_snip)
+        self._register_one_hotkey(self.HOTKEY_F2_ID, hk_ocr, self.trigger_ocr)
+        self._register_one_hotkey(self.HOTKEY_F3_ID, hk_pin, self.trigger_pin)
+        self._register_one_hotkey(self.HOTKEY_F4_ID, hk_rec, self.trigger_record)
 
-        # 注册 F2 (文字识别与翻译)
-        if self._user32.RegisterHotKey(None, self.HOTKEY_F2_ID, MOD_NOREPEAT, VK_F2):
-            self._registered_native_ids.add(self.HOTKEY_F2_ID)
-            logging.info("Windows 原生热键 F2 (识图翻译) 注册成功 (ID=%d)", self.HOTKEY_F2_ID)
-        else:
-            logging.warning("Windows 原生 F2 注册失败，尝试使用 keyboard 兜底...")
+    def reload_hotkeys(self):
+        for hid in list(self._registered_native_ids):
             try:
-                keyboard.add_hotkey('f2', self.trigger_ocr, suppress=True)
-            except Exception as e:
-                logging.error("keyboard F2 兜底注册失败: %s", e)
-
-        # 注册 F3
-        if self._user32.RegisterHotKey(None, self.HOTKEY_F3_ID, MOD_NOREPEAT, VK_F3):
-            self._registered_native_ids.add(self.HOTKEY_F3_ID)
-            logging.info("Windows 原生热键 F3 注册成功 (ID=%d)", self.HOTKEY_F3_ID)
-        else:
-            logging.warning("Windows 原生 F3 注册失败，尝试使用 keyboard 兜底...")
-            try:
-                keyboard.add_hotkey('f3', self.trigger_pin, suppress=True)
-            except Exception as e:
-                logging.error("keyboard F3 兜底注册失败: %s", e)
-
-        # 注册 F4 (屏幕录制)
-        if self._user32.RegisterHotKey(None, self.HOTKEY_F4_ID, MOD_NOREPEAT, VK_F4):
-            self._registered_native_ids.add(self.HOTKEY_F4_ID)
-            logging.info("Windows 原生热键 F4 (录屏) 注册成功 (ID=%d)", self.HOTKEY_F4_ID)
-        else:
-            logging.warning("Windows 原生 F4 注册失败，尝试使用 keyboard 兜底...")
-            try:
-                keyboard.add_hotkey('f4', self.trigger_record, suppress=True)
-            except Exception as e:
-                logging.error("keyboard F4 兜底注册失败: %s", e)
+                self._user32.UnregisterHotKey(None, hid)
+            except Exception:
+                pass
+        self._registered_native_ids.clear()
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        self._register_static_hotkeys()
 
     def register_space_hotkey(self):
         """滚动截图期间动态启用 Space 与 Esc 热键"""
@@ -4011,6 +5102,10 @@ class ScreenshotTool(QWidget):
 
         self.state = "IDLE"
         self.selection_rect = QRect()
+        self.hovered_window_rect = None
+        self.hovered_window_title = ""
+        self.press_pos = QPoint()
+        self.current_step_num = 1
         self.current_tool = None
         self._cached_selection_pixmap = None
         self._cached_selection_key = None
@@ -4085,23 +5180,10 @@ class ScreenshotTool(QWidget):
 
     def erase_annotation(self, pos):
         for i in range(len(self.edits)-1, -1, -1):
-            edit = self.edits[i]
-            if edit['type'] in ['RECTANGLE', 'BLUR', 'TEXT'] and edit['rect'].contains(pos): 
+            if is_annotation_hit(self.edits[i], pos):
                 self.save_state()
                 self.edits.pop(i)
                 return True
-            elif edit['type'] == 'LINE' and point_to_segment_dist(pos, edit['start'], edit['end']) < 15: 
-                self.save_state()
-                self.edits.pop(i)
-                return True
-            elif edit['type'] == 'BLUR_STROKE':
-                pts = edit.get('points', [])
-                r = edit.get('thickness', 3) * 4 + 10
-                for p in pts:
-                    if (p - pos).manhattanLength() < r:
-                        self.save_state()
-                        self.edits.pop(i)
-                        return True
         return False
 
     def setup_toolbar(self):
@@ -4115,8 +5197,12 @@ class ScreenshotTool(QWidget):
 
         # 标注组
         self.btn_rect = QPushButton("⬜ 矩形")
+        self.btn_ellipse = QPushButton("⭕ 椭圆")
         self.btn_line = QPushButton("📏 直线")
         self.btn_arrow = QPushButton("↗ 箭头: 关")
+        self.btn_pen = QPushButton("✏ 涂鸦")
+        self.btn_highlighter = QPushButton("🖍 荧光")
+        self.btn_step = QPushButton("① 步骤")
         self.btn_text = QPushButton("T 文字")
         self.btn_blur = QPushButton("💧 模糊")
         self.btn_erase = QPushButton("🧹 橡皮")
@@ -4127,6 +5213,8 @@ class ScreenshotTool(QWidget):
         self.btn_ocr = QPushButton("🔤 识别")
         self.btn_scroll = QPushButton("📜 滚动")
         self.btn_record = QPushButton("🎥 录屏")
+        self.btn_history = QPushButton("📜 历史")
+        self.btn_settings = QPushButton("⚙ 设置")
 
         # 操作组
         self.btn_pin = QPushButton("📌 贴图")
@@ -4135,8 +5223,12 @@ class ScreenshotTool(QWidget):
         self.btn_cancel = QPushButton("✕ 关闭")
 
         self.btn_rect.setToolTip("绘制矩形框 (滚轮调整粗细)")
+        self.btn_ellipse.setToolTip("绘制椭圆/圆形 (按住 Shift 绘制正圆，滚轮调整粗细)")
         self.btn_line.setToolTip("绘制直线 (滚轮调整粗细)")
         self.btn_arrow.setToolTip("切换末端箭头")
+        self.btn_pen.setToolTip("自由画笔涂鸦 (滚轮调整粗细)")
+        self.btn_highlighter.setToolTip("荧光笔半透明高亮 (滚轮调整粗细)")
+        self.btn_step.setToolTip("序号步骤标记 ①②③ (点击依次递增)")
         self.btn_text.setToolTip("点击添加文字 (支持极小字/任意字号)")
         self.btn_blur.setToolTip("涂抹马赛克模糊 (滚轮调整画笔粗细)")
         self.btn_erase.setToolTip("点击标注元素擦除")
@@ -4145,14 +5237,20 @@ class ScreenshotTool(QWidget):
         self.btn_ocr.setToolTip("文字识别与多语言翻译 (快捷键 F2)")
         self.btn_scroll.setToolTip("滚动长截图 (Space 启停)")
         self.btn_record.setToolTip("屏幕录制 (F4) - 录制选区或全屏，导出MP4/GIF")
+        self.btn_history.setToolTip("查看与管理历史截图")
+        self.btn_settings.setToolTip("全局设置与自定义快捷键")
         self.btn_pin.setToolTip("贴图到桌面置顶 (F3)")
         self.btn_copy.setToolTip("复制截图到剪贴板 (Ctrl+C)")
         self.btn_save.setToolTip("保存图片到文件")
         self.btn_cancel.setToolTip("退出截图 (ESC)")
 
         self.btn_rect.clicked.connect(lambda: self.set_tool('RECTANGLE', self.btn_rect))
+        self.btn_ellipse.clicked.connect(lambda: self.set_tool('ELLIPSE', self.btn_ellipse))
         self.btn_line.clicked.connect(lambda: self.set_tool('LINE', self.btn_line))
         self.btn_arrow.clicked.connect(self.toggle_arrow)
+        self.btn_pen.clicked.connect(lambda: self.set_tool('PEN', self.btn_pen))
+        self.btn_highlighter.clicked.connect(lambda: self.set_tool('HIGHLIGHTER', self.btn_highlighter))
+        self.btn_step.clicked.connect(lambda: self.set_tool('STEP', self.btn_step))
         self.btn_text.clicked.connect(lambda: self.set_tool('TEXT', self.btn_text))
         self.btn_blur.clicked.connect(lambda: self.set_tool('BLUR', self.btn_blur))
         self.btn_erase.clicked.connect(lambda: self.set_tool('ERASE', self.btn_erase))
@@ -4162,6 +5260,8 @@ class ScreenshotTool(QWidget):
         self.btn_ocr.clicked.connect(lambda: self.set_tool('OCR', self.btn_ocr))
         self.btn_scroll.clicked.connect(lambda: self.set_tool('SCROLL', self.btn_scroll))
         self.btn_record.clicked.connect(self.activate_recording)
+        self.btn_history.clicked.connect(self.show_history_dialog)
+        self.btn_settings.clicked.connect(self.show_settings_dialog)
         
         self.btn_pin.clicked.connect(self.pin_image)
         self.btn_copy.clicked.connect(self.copy_image)
@@ -4175,14 +5275,14 @@ class ScreenshotTool(QWidget):
             sep.setStyleSheet("color: #d0d7de; margin: 4px 2px;")
             layout.addWidget(sep)
 
-        for btn in [self.btn_rect, self.btn_line, self.btn_arrow, self.btn_text, self.btn_blur, self.btn_erase, self.btn_color]:
+        for btn in [self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_arrow, self.btn_pen, self.btn_highlighter, self.btn_step, self.btn_text, self.btn_blur, self.btn_erase, self.btn_color]:
             btn.setCursor(Qt.PointingHandCursor)
             apply_button_style(btn)
             layout.addWidget(btn)
 
         add_vsep()
 
-        for btn in [self.btn_crop, self.btn_ocr, self.btn_scroll, self.btn_record]:
+        for btn in [self.btn_crop, self.btn_ocr, self.btn_scroll, self.btn_record, self.btn_history, self.btn_settings]:
             btn.setCursor(Qt.PointingHandCursor)
             apply_button_style(btn)
             layout.addWidget(btn)
@@ -4241,6 +5341,7 @@ class ScreenshotTool(QWidget):
         logging.info("activate_capture() 被调用，开始进入截图模式 (清理耗时 %.0fms)" % ((t1 - t0) * 1000))
         self.state = "SELECTING"
         self.current_tool = None
+        self.current_step_num = 1
         self.drag_mode = None
         self.edits = []
         self.undo_stack.clear()
@@ -4360,8 +5461,8 @@ class ScreenshotTool(QWidget):
                     sub_pixmap = full.copy(rect)
 
             QToolTip.showText(QCursor.pos(), "🔤 正在识别并翻译文字...", None, QRect(), 3000)
-
-            self._quick_ocr_worker = OcrWorker(sub_pixmap, use_ai=load_settings().get("use_ai_ocr", False))
+            ocr_img = sub_pixmap.toImage() if sub_pixmap else QImage()
+            self._quick_ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
             self._quick_ocr_worker.finished.connect(self._on_quick_ocr_finished)
             self._quick_ocr_worker.start()
         except Exception as e:
@@ -4528,7 +5629,11 @@ class ScreenshotTool(QWidget):
             self.recording_toolbar = None
 
     def reset_button_styles(self):
-        buttons = [self.btn_rect, self.btn_crop, self.btn_line, self.btn_text, self.btn_blur, self.btn_erase, self.btn_scroll, self.btn_ocr]
+        buttons = [
+            self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_pen,
+            self.btn_highlighter, self.btn_step, self.btn_text, self.btn_blur,
+            self.btn_erase, self.btn_crop, self.btn_scroll, self.btn_ocr
+        ]
         if hasattr(self, 'btn_record'):
             buttons.append(self.btn_record)
         for btn in buttons:
@@ -4556,7 +5661,9 @@ class ScreenshotTool(QWidget):
         elif self.current_tool == 'BLUR':
             r = self.current_thickness * 4
             self.setCursor(create_brush_cursor(r))
-        elif self.current_tool in ['RECTANGLE', 'LINE', 'OCR']:
+        elif self.current_tool == 'STEP':
+            self.setCursor(Qt.PointingHandCursor)
+        elif self.current_tool in ['RECTANGLE', 'ELLIPSE', 'LINE', 'PEN', 'HIGHLIGHTER', 'OCR']:
             self.setCursor(Qt.CrossCursor)
         elif self.current_tool is None:
             if pos is not None and self.state == "EDITING":
@@ -4721,7 +5828,7 @@ class ScreenshotTool(QWidget):
                          f"坐标: {pos.x()}, {pos.y()}\n{value_label}: {self.format_color_value(color)}\nC 复制颜色值\nShift 切换 RGB/HEX")
 
     def wheelEvent(self, event):
-        if self.state == "EDITING" and self.current_tool in ['LINE', 'RECTANGLE', 'BLUR'] and not self.crop_mode:
+        if self.state == "EDITING" and self.current_tool in ['LINE', 'RECTANGLE', 'BLUR', 'ELLIPSE', 'PEN', 'HIGHLIGHTER', 'STEP'] and not self.crop_mode:
             delta = event.angleDelta().y()
             if delta > 0:
                 self.current_thickness = min(20, self.current_thickness + 1)
@@ -4794,127 +5901,160 @@ class ScreenshotTool(QWidget):
                 if self.state == "EDITING":
                     self.redo()
         elif event.key() == Qt.Key_Escape: 
+            if self.current_tool is not None:
+                self.set_tool(None)
+                self.show_toolbar()
+                return
+            elif self.crop_mode:
+                self.cancel_crop()
+                self.show_toolbar()
+                return
             self.hide_app(keep_history=False)
 
     def paintEvent(self, event):
         if not hasattr(self, 'original_screen') or self.original_screen is None: return 
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
 
-        # 1. 绘制底层屏幕原始画面
-        painter.drawPixmap(0, 0, self.original_screen)
+            # 1. 绘制底层屏幕原始画面
+            painter.drawPixmap(0, 0, self.original_screen)
 
-        is_ocr = getattr(self, 'ocr_intent', False)
-        is_rec = getattr(self, 'recording_intent', False)
+            is_ocr = getattr(self, 'ocr_intent', False)
+            is_rec = getattr(self, 'recording_intent', False)
 
-        # 2. 经典深色遮罩系统（未选区域覆盖深色遮罩，选区内部 100% 原始通透清晰）
-        mask_color = QColor(0, 0, 0, 120)
-        if self.selection_rect.isNull():
-            # 未开始拖选时，全屏覆盖深色遮罩，提示用户已进入取景状态
-            painter.fillRect(self.rect(), mask_color)
-        else:
-            # 拖选后，仅在选区外部绘制深色遮罩；选区内部完全通透，原屏文字和图像一览无余
-            outer_region = QRegion(self.rect()).subtracted(QRegion(self.selection_rect))
-            for r in outer_region.rects():
-                painter.fillRect(r, mask_color)
+            # 2. 经典深色遮罩系统（未选区域覆盖深色遮罩，选区内部 100% 原始通透清晰）
+            mask_color = QColor(0, 0, 0, 120)
+            if self.selection_rect.isNull():
+                # 未开始拖选时，检查是否有窗口/控件吸附高亮
+                if getattr(self, 'hovered_window_rect', None) and not self.hovered_window_rect.isNull():
+                    outer_region = QRegion(self.rect()).subtracted(QRegion(self.hovered_window_rect))
+                    for r in outer_region.rects():
+                        painter.fillRect(r, mask_color)
 
-        # 3. 顶部指引胶囊条
-        if is_ocr and self.state == "SELECTING":
-            banner_rect = QRect(self.width() // 2 - 270, 20, 540, 38)
-            painter.setPen(QPen(QColor(9, 105, 218), 1.5))
-            painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
-            painter.drawRoundedRect(banner_rect, 9, 9)
-            painter.setPen(QPen(QColor(36, 41, 47)))
-            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-            painter.drawText(banner_rect, Qt.AlignCenter, "🔤 识图翻译：拖选识别区域 | 双击或回车全屏识别 | ESC 取消")
-
-        elif is_rec and self.state == "SELECTING":
-            banner_rect = QRect(self.width() // 2 - 270, 20, 540, 38)
-            painter.setPen(QPen(QColor(239, 68, 68), 1.5))
-            painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
-            painter.drawRoundedRect(banner_rect, 9, 9)
-            painter.setPen(QPen(QColor(36, 41, 47)))
-            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-            painter.drawText(banner_rect, Qt.AlignCenter, "🎥 屏幕录制：拖选录制区域 | 双击或回车全屏录制 | ESC 取消")
-
-        # 4. 选区渲染：选区内部 100% 原屏通透（零遮罩、零底色），配高精边框与取景器角标
-        if not self.selection_rect.isNull():
-            if is_ocr:
-                border_color = QColor(9, 105, 218)
-                badge_text = f"🔤 识别区域: {self.selection_rect.width()} × {self.selection_rect.height()}"
-            elif is_rec:
-                border_color = QColor(239, 68, 68)
-                fps_label = "60FPS" if "60" in getattr(self, 'recording_quality_key', '') else "30FPS"
-                badge_text = f"🎥 录屏选区: {self.selection_rect.width()} × {self.selection_rect.height()} ({fps_label})"
+                    border_color = QColor(0, 174, 255)
+                    painter.setPen(QPen(border_color, 2))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRect(self.hovered_window_rect)
+                    draw_viewfinder_corners(painter, self.hovered_window_rect, border_color, length=14, width=3)
+                    badge_text = f"{self.hovered_window_rect.width()} × {self.hovered_window_rect.height()}"
+                    if getattr(self, 'hovered_window_title', None):
+                        title_preview = self.hovered_window_title[:24] + "..." if len(self.hovered_window_title) > 24 else self.hovered_window_title
+                        badge_text = f"{title_preview} | {badge_text}"
+                    draw_selection_badge(painter, self.hovered_window_rect, badge_text, border_color=border_color)
+                else:
+                    painter.fillRect(self.rect(), mask_color)
             else:
-                border_color = QColor(0, 174, 255)
-                badge_text = f"{self.selection_rect.width()} × {self.selection_rect.height()}"
+                # 拖选后，仅在选区外部绘制深色遮罩；选区内部完全通透，原屏文字和图像一览无余
+                outer_region = QRegion(self.rect()).subtracted(QRegion(self.selection_rect))
+                for r in outer_region.rects():
+                    painter.fillRect(r, mask_color)
 
-            # 边框线（选区内部绝对不加遮罩，完全透明高亮）
-            painter.setPen(QPen(border_color, 2))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(self.selection_rect)
+            # 3. 顶部指引胶囊条
+            if is_ocr and self.state == "SELECTING":
+                banner_rect = QRect(self.width() // 2 - 270, 20, 540, 38)
+                painter.setPen(QPen(QColor(9, 105, 218), 1.5))
+                painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
+                painter.drawRoundedRect(banner_rect, 9, 9)
+                painter.setPen(QPen(QColor(36, 41, 47)))
+                painter.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+                painter.drawText(banner_rect, Qt.AlignCenter, "🔤 识图翻译：拖选识别区域 | 双击或回车全屏识别 | ESC 取消")
+                painter.setBrush(Qt.NoBrush)
 
-            # 四角相机取景器角标
-            draw_viewfinder_corners(painter, self.selection_rect, border_color, length=14, width=3)
+            elif is_rec and self.state == "SELECTING":
+                banner_rect = QRect(self.width() // 2 - 270, 20, 540, 38)
+                painter.setPen(QPen(QColor(239, 68, 68), 1.5))
+                painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
+                painter.drawRoundedRect(banner_rect, 9, 9)
+                painter.setPen(QPen(QColor(36, 41, 47)))
+                painter.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+                painter.drawText(banner_rect, Qt.AlignCenter, "🎥 屏幕录制：拖选录制区域 | 双击或回车全屏录制 | ESC 取消")
+                painter.setBrush(Qt.NoBrush)
 
-            # 悬浮尺寸徽标
-            draw_selection_badge(painter, self.selection_rect, badge_text, border_color=border_color)
+            # 4. 选区渲染：选区内部 100% 原屏通透（零遮罩、零底色），配高精边框与取景器角标
+            if not self.selection_rect.isNull():
+                if is_ocr:
+                    border_color = QColor(9, 105, 218)
+                    badge_text = f"🔤 识别区域: {self.selection_rect.width()} × {self.selection_rect.height()}"
+                elif is_rec:
+                    border_color = QColor(239, 68, 68)
+                    fps_label = "60FPS" if "60" in getattr(self, 'recording_quality_key', '') else "30FPS"
+                    badge_text = f"🎥 录屏选区: {self.selection_rect.width()} × {self.selection_rect.height()} ({fps_label})"
+                else:
+                    border_color = QColor(0, 174, 255)
+                    badge_text = f"{self.selection_rect.width()} × {self.selection_rect.height()}"
 
-            # 编辑状态下的标注图元绘制
-            if self.state == "EDITING":
-                painter.setClipRect(self.selection_rect)
-                draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
+                # 边框线（选区内部绝对不加遮罩，完全透明高亮）
+                painter.setPen(QPen(border_color, 2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(self.selection_rect)
 
-                if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw':
-                    painter.setPen(QPen(Qt.black, 1, Qt.DashLine))
-                    painter.drawRect(self.text_rect)
-                    painter.setPen(QPen(Qt.white, 1, Qt.DashLine))
-                    painter.drawRect(self.text_rect.adjusted(1, 1, -1, -1))
+                # 四角相机取景器角标
+                draw_viewfinder_corners(painter, self.selection_rect, border_color, length=14, width=3)
 
-                painter.setClipping(False)
+                # 悬浮尺寸徽标
+                draw_selection_badge(painter, self.selection_rect, badge_text, border_color=border_color)
 
-                if self.crop_mode and getattr(self, 'crop_rect', None):
-                    crop_outer = QRegion(self.selection_rect).subtracted(QRegion(self.crop_rect))
-                    for r in crop_outer.rects():
-                        painter.fillRect(r, QColor(0, 0, 0, 150))
-
-                    painter.setClipRect(self.crop_rect)
+                # 编辑状态下的标注图元绘制
+                if self.state == "EDITING":
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setClipRect(self.selection_rect)
                     draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
+
+                    if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw':
+                        painter.setPen(QPen(Qt.black, 1, Qt.DashLine))
+                        painter.drawRect(self.text_rect)
+                        painter.setPen(QPen(Qt.white, 1, Qt.DashLine))
+                        painter.drawRect(self.text_rect.adjusted(1, 1, -1, -1))
+
                     painter.setClipping(False)
 
-                    # 三分线
-                    painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
-                    for i in range(1, 3):
-                        x = self.crop_rect.left() + self.crop_rect.width() * i // 3
-                        painter.drawLine(x, self.crop_rect.top(), x, self.crop_rect.bottom())
-                        y = self.crop_rect.top() + self.crop_rect.height() * i // 3
-                        painter.drawLine(self.crop_rect.left(), y, self.crop_rect.right(), y)
+                    if self.crop_mode and getattr(self, 'crop_rect', None):
+                        crop_outer = QRegion(self.selection_rect).subtracted(QRegion(self.crop_rect))
+                        for r in crop_outer.rects():
+                            painter.fillRect(r, QColor(0, 0, 0, 150))
 
-                    # 裁剪框边线与 8 个手柄
-                    painter.setPen(QPen(QColor(0, 174, 255), 2))
-                    painter.setBrush(Qt.NoBrush)
-                    painter.drawRect(self.crop_rect)
+                        painter.setClipRect(self.crop_rect)
+                        draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
+                        painter.setClipping(False)
 
-                    handle = CROP_HANDLE_SIZE
-                    painter.setBrush(QBrush(QColor(0, 174, 255)))
-                    painter.setPen(QPen(Qt.white, 1))
-                    corners = [self.crop_rect.topLeft(), self.crop_rect.topRight(),
-                               self.crop_rect.bottomLeft(), self.crop_rect.bottomRight()]
-                    edges = [QPoint(self.crop_rect.center().x(), self.crop_rect.top()),
-                             QPoint(self.crop_rect.center().x(), self.crop_rect.bottom()),
-                             QPoint(self.crop_rect.left(), self.crop_rect.center().y()),
-                             QPoint(self.crop_rect.right(), self.crop_rect.center().y())]
-                    for pt in corners + edges:
-                        painter.drawRect(pt.x() - handle // 2, pt.y() - handle // 2, handle, handle)
-                    painter.setBrush(Qt.NoBrush)
+                        # 三分线
+                        painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+                        for i in range(1, 3):
+                            x = self.crop_rect.left() + self.crop_rect.width() * i // 3
+                            painter.drawLine(x, self.crop_rect.top(), x, self.crop_rect.bottom())
+                            y = self.crop_rect.top() + self.crop_rect.height() * i // 3
+                            painter.drawLine(self.crop_rect.left(), y, self.crop_rect.right(), y)
 
-                if self.current_tool == 'OCR' and getattr(self, 'ocr_rect', None):
-                    painter.setPen(QPen(Qt.green, 2, Qt.DashLine))
-                    painter.setBrush(Qt.NoBrush)
-                    painter.drawRect(self.ocr_rect)
+                        # 裁剪框边线与 8 个手柄
+                        painter.setPen(QPen(QColor(0, 174, 255), 2))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRect(self.crop_rect)
 
-        self.draw_color_picker(painter)
+                        handle = CROP_HANDLE_SIZE
+                        painter.setBrush(QBrush(QColor(0, 174, 255)))
+                        painter.setPen(QPen(Qt.white, 1))
+                        corners = [self.crop_rect.topLeft(), self.crop_rect.topRight(),
+                                   self.crop_rect.bottomLeft(), self.crop_rect.bottomRight()]
+                        edges = [QPoint(self.crop_rect.center().x(), self.crop_rect.top()),
+                                 QPoint(self.crop_rect.center().x(), self.crop_rect.bottom()),
+                                 QPoint(self.crop_rect.left(), self.crop_rect.center().y()),
+                                 QPoint(self.crop_rect.right(), self.crop_rect.center().y())]
+                        for pt in corners + edges:
+                            painter.drawRect(pt.x() - handle // 2, pt.y() - handle // 2, handle, handle)
+                        painter.setBrush(Qt.NoBrush)
+
+                    if self.current_tool == 'OCR' and getattr(self, 'ocr_rect', None):
+                        painter.setPen(QPen(Qt.green, 2, Qt.DashLine))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRect(self.ocr_rect)
+
+            self.draw_color_picker(painter)
+        except Exception as e:
+            logging.error("ScreenshotTool paintEvent 绘制异常: %s", e, exc_info=True)
+        finally:
+            if painter.isActive():
+                painter.end()
 
     def mouseDoubleClickEvent(self, event):
         if event.button() != Qt.LeftButton: return
@@ -4950,6 +6090,21 @@ class ScreenshotTool(QWidget):
                     break
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            if self.current_tool is not None:
+                self.set_tool(None)
+                self.show_toolbar()
+                return
+            elif self.crop_mode:
+                self.cancel_crop()
+                self.show_toolbar()
+                return
+            elif getattr(self, 'ocr_intent', False) or getattr(self, 'recording_intent', False):
+                self.hide_app(keep_history=False)
+                return
+            elif self.state in ["EDITING", "SELECTING"]:
+                self.hide_app(keep_history=False)
+                return
         if event.button() != Qt.LeftButton: return
         pos = event.pos()
 
@@ -4957,6 +6112,7 @@ class ScreenshotTool(QWidget):
             self.color_picker_visible = False
             self.color_timer.stop()
             self.begin_point = pos
+            self.press_pos = pos
             self.selection_rect = QRect()
             self.toolbar.hide()
             
@@ -5003,6 +6159,53 @@ class ScreenshotTool(QWidget):
                     self.text_rect = QRect(pos, pos)
                     # 单击即可直接在点击位置激活输入框，无需强制拖拽大框
                     self.inline_editor.start_editing(pos)
+            elif self.current_tool == 'STEP':
+                self.save_state()
+                step_val = getattr(self, 'current_step_num', 1)
+                thick = getattr(self, 'current_thickness', 3)
+                self.edits.append({
+                    'type': 'STEP',
+                    'pos': pos,
+                    'center': pos,
+                    'num': step_val,
+                    'number': step_val,
+                    'color': self.current_color,
+                    'thickness': thick,
+                    'radius': max(11, 8 + thick * 2),
+                    'temp': False
+                })
+                self.current_step_num = step_val + 1
+                self.update()
+                self.show_toolbar()
+                return
+            elif self.current_tool == 'ELLIPSE':
+                self.save_state()
+                self.edit_start = pos
+                self.edits.append({
+                    'type': 'ELLIPSE',
+                    'rect': QRect(pos, pos),
+                    'color': self.current_color,
+                    'thickness': self.current_thickness,
+                    'temp': True
+                })
+            elif self.current_tool == 'PEN':
+                self.save_state()
+                self.edits.append({
+                    'type': 'PEN',
+                    'points': [pos],
+                    'color': self.current_color,
+                    'thickness': self.current_thickness,
+                    'temp': True
+                })
+            elif self.current_tool == 'HIGHLIGHTER':
+                self.save_state()
+                self.edits.append({
+                    'type': 'HIGHLIGHTER',
+                    'points': [pos],
+                    'color': self.current_color,
+                    'thickness': max(12, self.current_thickness * 3),
+                    'temp': True
+                })
             elif self.current_tool == 'BLUR':
                 self.save_state()
                 self.edits.append({
@@ -5022,17 +6225,29 @@ class ScreenshotTool(QWidget):
                 if self.drag_mode == 'move': self.drag_offset = pos - self.selection_rect.topLeft()
                 elif self.drag_mode is None:
                     if self.geometry().width() == QApplication.primaryScreen().geometry().width():
-                        self.state = "SELECTING"; self.begin_point = pos; self.selection_rect = QRect(); self.edits.clear(); self.undo_stack.clear(); self.redo_stack.clear(); self.toolbar.hide(); self.update()
+                        self.state = "SELECTING"; self.begin_point = pos; self.selection_rect = QRect(); self.current_step_num = 1; self.edits.clear(); self.undo_stack.clear(); self.redo_stack.clear(); self.toolbar.hide(); self.update()
 
     def mouseMoveEvent(self, event):
         pos = event.pos()
         if self.state == "SELECTING":
             if event.buttons() == Qt.LeftButton:
                 self.selection_rect = QRect(self.begin_point, pos).normalized()
+                self.hovered_window_rect = None
                 self.update() 
             else:
                 self.color_pick_pos = pos
                 self.color_picker_visible = True
+                try:
+                    win_rect, win_title = detect_window_or_control_rect(pos.x(), pos.y())
+                    if win_rect and win_rect.isValid() and win_rect.width() > 10 and win_rect.height() > 10:
+                        self.hovered_window_rect = win_rect
+                        self.hovered_window_title = win_title
+                    else:
+                        self.hovered_window_rect = None
+                        self.hovered_window_title = ""
+                except Exception:
+                    self.hovered_window_rect = None
+                    self.hovered_window_title = ""
                 self.update()
         elif self.state == "EDITING":
             # 裁剪模式优先处理
@@ -5069,8 +6284,15 @@ class ScreenshotTool(QWidget):
             elif self.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
                 self.text_rect = QRect(self.text_start, pos).normalized()
                 self.update()
-            elif self.current_tool == 'BLUR' and len(self.edits) > 0 and self.edits[-1].get('temp'):
+            elif self.current_tool in ['BLUR', 'PEN', 'HIGHLIGHTER'] and len(self.edits) > 0 and self.edits[-1].get('temp'):
                 self.edits[-1]['points'].append(pos)
+                self.update()
+            elif self.current_tool == 'ELLIPSE' and len(self.edits) > 0 and self.edits[-1].get('temp'):
+                r = QRect(self.edit_start, pos).normalized()
+                if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+                    side = min(r.width(), r.height())
+                    r = QRect(r.topLeft(), QSize(side, side))
+                self.edits[-1]['rect'] = r
                 self.update()
             elif self.current_tool in ['RECTANGLE', 'LINE'] and len(self.edits) > 0 and self.edits[-1].get('temp'):
                 self.edits[-1]['rect'] = QRect(self.edit_start, pos).normalized()
@@ -5091,11 +6313,22 @@ class ScreenshotTool(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.state == "SELECTING":
-                if self.selection_rect.width() < 3 or self.selection_rect.height() < 3:
+                click_dist = (event.pos() - getattr(self, 'press_pos', event.pos())).manhattanLength()
+                if (self.selection_rect.isNull() or self.selection_rect.width() < 6 or self.selection_rect.height() < 6) and click_dist < 6:
+                    if getattr(self, 'hovered_window_rect', None) and not self.hovered_window_rect.isNull():
+                        self.selection_rect = QRect(self.hovered_window_rect)
+                        self.hovered_window_rect = None
+                    else:
+                        self.selection_rect = QRect()
+                        self.drag_mode = None
+                        self.update()
+                        return
+                elif self.selection_rect.width() < 3 or self.selection_rect.height() < 3:
                     self.selection_rect = QRect()
                     self.drag_mode = None
                     self.update()
                     return
+
                 if getattr(self, 'ocr_intent', False):
                     self.ocr_intent = False
                     rect = QRect(self.selection_rect)
@@ -5130,7 +6363,8 @@ class ScreenshotTool(QWidget):
                         if self.ocr_rect.width() > 10 and self.ocr_rect.height() > 10:
                             sub_pixmap = self.original_screen.copy(self.ocr_rect)
                             self.btn_ocr.setText("🔤 识别中...")
-                            self.ocr_worker = OcrWorker(sub_pixmap, use_ai=load_settings().get("use_ai_ocr", False))
+                            ocr_img = sub_pixmap.toImage()
+                            self.ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
                             self.ocr_worker.finished.connect(self.show_ocr_result)
                             self.ocr_worker.start()
 
@@ -5143,12 +6377,14 @@ class ScreenshotTool(QWidget):
 
                     self.drag_mode = None
                     self.setFocus()
-                    if self.current_tool not in ['RECTANGLE', 'LINE', 'BLUR']:
+                    if self.current_tool not in ['RECTANGLE', 'LINE', 'BLUR', 'ELLIPSE', 'PEN', 'HIGHLIGHTER', 'STEP']:
                         self.show_toolbar()
 
-                elif self.current_tool in ['RECTANGLE', 'LINE', 'BLUR']:
+                elif self.current_tool in ['RECTANGLE', 'LINE', 'BLUR', 'ELLIPSE', 'PEN', 'HIGHLIGHTER', 'STEP']:
                     if len(self.edits) > 0 and self.edits[-1].get('temp'):
                         self.edits[-1]['temp'] = False
+                    self.show_toolbar()
+                else:
                     self.show_toolbar()
 
     def show_ocr_result(self, text):
@@ -5171,6 +6407,7 @@ class ScreenshotTool(QWidget):
         toolbar_x = max(0, min(self.selection_rect.left(), screen_rect.width() - self.toolbar.width()))
         self.toolbar.move(toolbar_x, toolbar_y)
         self.toolbar.show()
+        self.toolbar.raise_()
 
     def enter_crop_mode(self):
         """进入裁剪模式，在选区内显示默认裁剪框与控制栏"""
@@ -5453,6 +6690,11 @@ class ScreenshotTool(QWidget):
         pixmap = self.get_final_static_image()
         pos = self.selection_rect.topLeft()
         self.create_pinned_window(pixmap, initial_pos=pos, zoom_factor=1.0)
+        try:
+            CaptureHistoryManager.get_instance().add_capture(pixmap, "pin")
+            check_and_auto_save_capture(pixmap, prefix="pinned")
+        except Exception as e:
+            logging.error("保存历史或自动存盘失败: %s", e)
         self.hide_app(keep_history=False)
 
     def hotkey_pin(self):
@@ -5527,20 +6769,41 @@ class ScreenshotTool(QWidget):
         pos = self.selection_rect.topLeft()
         QApplication.clipboard().setPixmap(pixmap)
         self.add_to_capture_history(pixmap, pos=pos, is_pinned=False)
+        try:
+            CaptureHistoryManager.get_instance().add_capture(pixmap, "copy")
+            check_and_auto_save_capture(pixmap, prefix="capture")
+        except Exception as e:
+            logging.error("保存历史或自动存盘失败: %s", e)
         print("Copied to clipboard!")
         self.hide_app(keep_history=False)
 
     def save_image(self):
         self.commit_text_edit()
-        fileName, _ = QFileDialog.getSaveFileName(self, "Save Image", f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png", "Images (*.png)")
-        if not fileName:
-            # 用户取消保存，保留截图不退出
-            return
         pixmap = self.get_final_static_image()
         pos = self.selection_rect.topLeft()
-        pixmap.save(fileName)
+        ok = save_image_dialog(self, pixmap, default_prefix="screenshot")
+        if not ok:
+            return
         self.add_to_capture_history(pixmap, pos=pos, is_pinned=False)
         self.hide_app(keep_history=False)
+
+    def show_history_dialog(self):
+        try:
+            dlg = HistoryDialog(self)
+            dlg.exec_()
+        except Exception as e:
+            logging.error("打开历史窗口失败: %s", e, exc_info=True)
+            QMessageBox.warning(self, "截图历史", f"无法打开截图历史:\n{e}")
+
+    def show_settings_dialog(self):
+        try:
+            dlg = SettingsDialog(self, hotkey_mgr=getattr(self, 'hotkey_listener', None))
+            if dlg.exec_() == QDialog.Accepted:
+                if hasattr(self, 'hotkey_listener') and self.hotkey_listener:
+                    self.hotkey_listener.reload_hotkeys()
+        except Exception as e:
+            logging.error("打开设置窗口失败: %s", e, exc_info=True)
+            QMessageBox.warning(self, "系统设置", f"无法打开设置窗口:\n{e}")
 
     def start_scroll(self):
         scroll_rect = QRect(self.selection_rect)
@@ -5561,16 +6824,23 @@ class ScreenshotTool(QWidget):
         if self.hotkey_listener is not None:
             self.hotkey_listener.register_space_hotkey()
 
-        hint = QLabel("Space: start/stop  |  ESC: cancel", self)
-        hint.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.WindowTransparentForInput)
+        # 提示条设为无父级的全局 ToolTip 置顶窗口，彻底解决因父窗口 hide_app 导致跟随隐藏的严重 Bug
+        if hasattr(self, '_scroll_hint') and self._scroll_hint:
+            try:
+                self._scroll_hint.close()
+            except: pass
+
+        hint = QLabel("Space: 开始/停止滚动  |  ESC: 取消")
+        hint.setWindowFlags(Qt.ToolTip | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         hint.setAttribute(Qt.WA_ShowWithoutActivating)
-        hint.setStyleSheet("background: rgba(20,20,20,200); color: #00AEFF; padding: 6px 14px; border-radius: 5px; font-size: 13px;")
+        hint.setStyleSheet("background: rgba(20,20,20,225); color: #00AEFF; padding: 7px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; border: 1px solid rgba(0,174,255,100);")
         hint.adjustSize()
         hint_x = scroll_rect.left() + max(0, (scroll_rect.width() - hint.width()) // 2)
         hint_y = max(0, scroll_rect.top() - hint.height() - 8)
         hint.move(hint_x, hint_y)
         hint.show()
-        QTimer.singleShot(4000, hint.close)
+        self._scroll_hint = hint
+        QTimer.singleShot(4000, lambda: hint.close() if hint else None)
 
     def start_auto_scroll_capture(self):
         if self.scroll_thread or self.active_scroll_rect is None or not self.scroll_waiting:
@@ -5599,15 +6869,17 @@ class ScreenshotTool(QWidget):
         if self.border_frame:
             self.border_frame.close()
             self.border_frame = None
+        if hasattr(self, '_scroll_hint') and self._scroll_hint:
+            self._scroll_hint.close()
+            self._scroll_hint = None
         self.active_scroll_rect = None
         self.scroll_thread = None
         self.scroll_waiting = False
-        clear_scroll_temp_folder(TEMP_FOLDER)
 
     def stop_trigger(self):
         if self.scroll_thread and self.scroll_thread.is_recording:
             self.scroll_thread.stop()
-            # ESC 取消：不拼接，直接清理（提示文字写的是 "ESC: cancel"）
+            # ESC 取消：不拼接
             self._scroll_cancelled = True
         elif self.scroll_waiting:
             self.cancel_scroll_capture()
@@ -5618,36 +6890,34 @@ class ScreenshotTool(QWidget):
             if self.border_frame:
                 self.border_frame.close()
                 self.border_frame = None
+            if hasattr(self, '_scroll_hint') and self._scroll_hint:
+                self._scroll_hint.close()
+                self._scroll_hint = None
             if self.hotkey_listener is not None:
                 self.hotkey_listener.unregister_space_hotkey()
 
-    def on_scroll_finished(self, count):
+    def on_scroll_finished(self, frames):
         if self.hotkey_listener is not None:
             self.hotkey_listener.unregister_space_hotkey()
         if self.border_frame: self.border_frame.close(); self.border_frame = None
+        if hasattr(self, '_scroll_hint') and self._scroll_hint:
+            self._scroll_hint.close()
+            self._scroll_hint = None
         if self.scroll_thread:
             self.scroll_thread.deleteLater()
             self.scroll_thread = None
         self.active_scroll_rect = None
         self.scroll_waiting = False
 
-        # ESC 取消时不拼接，直接清理临时文件
+        # ESC 取消时不拼接
         if getattr(self, '_scroll_cancelled', False):
             self._scroll_cancelled = False
-            clear_scroll_temp_folder(TEMP_FOLDER)
             return
 
-        self.stitch_frames(TEMP_FOLDER)
+        self.stitch_frames(frames)
 
-    def stitch_frames(self, folder_path):
+    def stitch_frames(self, frames):
         try:
-            files = get_scroll_frame_files(folder_path)
-            frames = []
-            for file_name in files:
-                frame = cv2.imread(os.path.join(folder_path, file_name))
-                if frame is not None:
-                    frames.append(frame)
-
             if not frames:
                 QMessageBox.information(self, "Scroll Capture", "No scroll frames were captured.")
                 return
@@ -5657,20 +6927,15 @@ class ScreenshotTool(QWidget):
                 QMessageBox.information(self, "Scroll Capture", "The captured frames could not be stitched.")
                 return
 
-            logging.info("滚动截图拼接完成: %s", stats)
+            logging.info("滚动截图全内存拼接完成: %s", stats)
             preview = ImageEditorDialog(base_img, self)
             preview.exec_()
         except Exception as e:
             logging.error("滚动截图拼接失败: %s", e, exc_info=True)
             QMessageBox.warning(self, "Scroll Capture Error", f"Could not stitch the scroll capture:\n{e}")
-        finally:
-            clear_scroll_temp_folder(folder_path)
 
 def check_for_snipaste():
-    try:
-        for proc in psutil.process_iter(['name']):
-            if proc.info['name'] and 'snipaste' in proc.info['name'].lower(): return True
-    except: pass
+    # 彻底移除同步全进程阻塞扫描，消除冷启动卡顿
     return False
 
 # ==========================================
@@ -5711,6 +6976,13 @@ class AppTrayIcon(QSystemTrayIcon):
         pin_action = QAction("📌 贴图置顶 (F3)", menu)
         pin_action.triggered.connect(self.main_app.hotkey_pin)
         menu.addAction(pin_action)
+        menu.addSeparator()
+        history_action = QAction("📜 截图历史 (History)", menu)
+        history_action.triggered.connect(self.main_app.show_history_dialog)
+        menu.addAction(history_action)
+        settings_action = QAction("⚙ 系统设置 (Settings)", menu)
+        settings_action.triggered.connect(self.main_app.show_settings_dialog)
+        menu.addAction(settings_action)
         menu.addSeparator() 
         quit_action = QAction("❌ 退出程序", menu)
         quit_action.triggered.connect(self.quit_app)
@@ -5723,6 +6995,10 @@ class AppTrayIcon(QSystemTrayIcon):
         if reason == QSystemTrayIcon.DoubleClick: self.main_app.activate_capture()
 
     def quit_app(self):
+        try:
+            clean_orphan_temp_files()
+        except Exception:
+            pass
         if hasattr(self.main_app, '_cleanup_recording_ui'):
             self.main_app._cleanup_recording_ui()
         if hasattr(self.main_app, 'recording_thread') and self.main_app.recording_thread:
@@ -5782,6 +7058,11 @@ if __name__ == '__main__':
             msg.setIcon(QMessageBox.Warning)
             msg.setText("Conflict Detected. Please close Snipaste.")
             msg.exec_()
+
+        try:
+            clean_orphan_temp_files()
+        except Exception:
+            pass
 
         hotkey_mgr = GlobalHotkeyManager()
         hotkey_mgr.install(app)
