@@ -104,14 +104,94 @@ REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 # AI 翻译与多模态识别配置 (OpenRouter)
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "murioki_settings.json")
-# 默认首选模型与稳定长期支持的备用免费多模态视觉模型（按优先级自动降级重试）
-DEFAULT_OPENROUTER_MODEL = "qwen/qwen3.8-27b:free"
-FALLBACK_OPENROUTER_MODELS = [
+
+# 已经失效或移除的旧模型（自动从配置迁移到新模型，防止 404）
+DEPRECATED_OPENROUTER_MODELS = {
+    "qwen/qwen-2.5-vl-72b-instruct:free",
     "inclusionai/ling-3.0-flash-vl:free",
     "nex-agi/nex-n2.5-mini:free",
     "nex-agi/nex-n2.5-pro:free",
+    "google/gemini-2.0-flash-exp:free",
+    "google/gemini-2.0-flash-thinking-exp:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+}
+
+# 默认首选模型与稳定支持的备用免费多模态视觉模型（按优先级自动降级重试）
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+FALLBACK_OPENROUTER_MODELS = [
+    "stealth/space-bunny-alpha",
+    "google/gemma-4-26b-a4b-it:free",
+    "google/gemma-4-31b-it:free",
+    "qwen/qwen3.8-27b:free",
+    "openrouter/free",
 ]
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_LIVE_MODELS_CACHE = {
+    "timestamp": 0,
+    "vision": [],
+    "text": []
+}
+
+def fetch_live_openrouter_free_models(vision_only=False, max_age_seconds=3600):
+    """
+    动态从 OpenRouter API 获取当前处于活跃可用状态的免费模型列表。
+    带本地缓存，防止高频网络请求。
+    当静态预设模型失效或 OpenRouter 模型变动时，可实现全自动自我修复与发现。
+    """
+    global _LIVE_MODELS_CACHE
+    now = time.time()
+    if now - _LIVE_MODELS_CACHE["timestamp"] < max_age_seconds:
+        cached = _LIVE_MODELS_CACHE["vision"] if vision_only else _LIVE_MODELS_CACHE["text"]
+        if cached:
+            return list(cached)
+
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"User-Agent": "MuriokiCapture/1.1 (Windows NT)"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8')).get('data', [])
+
+        free_vision = []
+        free_text = []
+        for m in data:
+            mid = m.get('id', '')
+            if mid in DEPRECATED_OPENROUTER_MODELS:
+                continue
+            pricing = m.get('pricing', {})
+            is_free = (str(pricing.get('prompt', '')) == '0' and str(pricing.get('completion', '')) == '0') or ':free' in mid
+            if not is_free:
+                continue
+
+            arch = m.get('architecture', {})
+            modality = str(arch.get('modality', '')).lower()
+            inputs = [str(x).lower() for x in (arch.get('input_modalities', []) or [])]
+
+            has_image = ('image' in inputs) or ('image' in modality)
+            if has_image:
+                free_vision.append(mid)
+            free_text.append(mid)
+
+        priority_keywords = ["nemotron", "bunny", "gemma", "qwen", "free"]
+        def _sort_key(name):
+            lower = name.lower()
+            for rank, kw in enumerate(priority_keywords):
+                if kw in lower:
+                    return rank
+            return 99
+
+        free_vision.sort(key=_sort_key)
+        free_text.sort(key=_sort_key)
+
+        _LIVE_MODELS_CACHE["timestamp"] = now
+        _LIVE_MODELS_CACHE["vision"] = free_vision
+        _LIVE_MODELS_CACHE["text"] = free_text
+        return list(free_vision if vision_only else free_text)
+    except Exception as e:
+        logging.warning("获取 OpenRouter 实时模型列表失败: %s", e)
+        return []
 
 def load_settings():
     """从本地 JSON 文件加载用户设置"""
@@ -155,13 +235,30 @@ def get_openrouter_api_key():
         return key
     return os.environ.get("OPENROUTER_API_KEY", "")
 
-def get_candidate_models():
-    """获取待尝试的模型列表（用户配置首选 + 自动备用降级池）"""
-    user_model = load_settings().get("openrouter_model", "").strip() or DEFAULT_OPENROUTER_MODEL
+def get_candidate_models(vision_only=False):
+    """获取待尝试的模型列表（用户配置首选 + 自动备用降级池 + 动态发现补充池）"""
+    settings = load_settings()
+    user_model = settings.get("openrouter_model", "").strip()
+
+    # 自动替换已废弃的旧模型
+    if not user_model or user_model in DEPRECATED_OPENROUTER_MODELS:
+        user_model = DEFAULT_OPENROUTER_MODEL
+        settings["openrouter_model"] = user_model
+        save_settings(settings)
+
     models = [user_model]
+
+    # 添加预设备用池
     for fb in FALLBACK_OPENROUTER_MODELS:
-        if fb not in models:
+        if fb not in models and fb not in DEPRECATED_OPENROUTER_MODELS:
             models.append(fb)
+
+    # 尝试补充实时动态探测到的活跃免费模型
+    live_models = fetch_live_openrouter_free_models(vision_only=vision_only, max_age_seconds=1800)
+    for lm in live_models:
+        if lm not in models and lm not in DEPRECATED_OPENROUTER_MODELS:
+            models.append(lm)
+
     return models
 RECORD_QUALITY_PRESETS = {
     'p60': {'scale': 1.0, 'fps': 60, 'name': '原画 60FPS (100%)'},
@@ -694,7 +791,7 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25,
         f"Output ONLY the translated text, nothing else. Do not output any thought process or notes."
     )
 
-    models_to_try = get_candidate_models()
+    models_to_try = get_candidate_models(vision_only=False)
     last_err = None
 
     for idx, model_name in enumerate(models_to_try):
@@ -728,19 +825,25 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25,
                 choice = data['choices'][0]['message']
                 result = _clean_ai_output(choice)
                 detected_src = source_lang if source_lang != 'auto' else 'auto'
-                if idx > 0:
-                    logging.info("首选模型受限，已自动切换备用模型 %s 翻译成功", model_name)
-                return result, detected_src
+                if result:
+                    if idx > 0:
+                        logging.info("首选模型受限，已自动切换备用模型 %s 翻译成功", model_name)
+                    return result, detected_src
+                last_err = f"模型 {model_name} 返回空结果"
+                if idx < len(models_to_try) - 1:
+                    continue
         except urllib.error.HTTPError as e:
             body = e.read().decode('utf-8', errors='replace') if e.fp else ''
-            logging.warning("模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
+            logging.warning("AI 翻译模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
             last_err = f"HTTP {e.code}"
-            if e.code in [429, 500, 502, 503, 504] and idx < len(models_to_try) - 1:
+            if e.code == 401:
+                raise RuntimeError("OpenRouter API 密钥无效或未授权 (HTTP 401)，请在设置中检查您的 API Key。")
+            if idx < len(models_to_try) - 1:
                 continue
             if idx == len(models_to_try) - 1:
                 raise RuntimeError(f"AI 翻译失败 (所有模型均受限，最后报错: {last_err})。")
         except Exception as e:
-            logging.warning("模型 %s 调用异常: %s", model_name, e)
+            logging.warning("AI 翻译模型 %s 调用异常: %s", model_name, e)
             last_err = str(e)
             if idx < len(models_to_try) - 1:
                 continue
@@ -1268,7 +1371,7 @@ def ai_ocr_recognize(image: QImage, timeout=30):
 
     img_base64 = _image_to_base64(image)
 
-    models_to_try = get_candidate_models()
+    models_to_try = get_candidate_models(vision_only=True)
     last_err = None
 
     for idx, model_name in enumerate(models_to_try):
@@ -1320,15 +1423,20 @@ def ai_ocr_recognize(image: QImage, timeout=30):
                 data = json.loads(resp.read().decode('utf-8'))
                 choice = data['choices'][0]['message']
                 result = _clean_ai_output(choice)
-                if idx > 0:
-                    logging.info("首选模型受限，已自动切换备用模型 %s 识别成功", model_name)
-                return result
+                if result:
+                    if idx > 0:
+                        logging.info("首选模型受限，已自动切换备用模型 %s 识别成功", model_name)
+                    return result
+                last_err = f"模型 {model_name} 返回空结果"
+                if idx < len(models_to_try) - 1:
+                    continue
         except urllib.error.HTTPError as e:
             body = e.read().decode('utf-8', errors='replace') if e.fp else ''
             logging.warning("AI OCR 模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
             last_err = f"HTTP {e.code}"
-            # 若是 429 限流或 5xx 错误，且还有备用模型，则继续尝试下一个备选模型
-            if e.code in [429, 500, 502, 503, 504] and idx < len(models_to_try) - 1:
+            if e.code == 401:
+                raise RuntimeError("OpenRouter API 密钥无效或未授权 (HTTP 401)，请在设置中检查您的 API Key。")
+            if idx < len(models_to_try) - 1:
                 continue
             if idx == len(models_to_try) - 1:
                 raise RuntimeError(f"AI 识别失败 (所有模型均受限，最后报错: {last_err})。")
@@ -3911,10 +4019,12 @@ class SettingsDialog(QDialog):
         self.combo_model = QComboBox()
         self.combo_model.setEditable(True)
         model_options = [
-            "qwen/qwen-2.5-vl-72b-instruct:free",
-            "google/gemini-2.0-flash-exp:free",
-            "google/gemini-2.0-flash-thinking-exp:free",
-            "meta-llama/llama-3.2-11b-vision-instruct:free",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "stealth/space-bunny-alpha",
+            "google/gemma-4-26b-a4b-it:free",
+            "google/gemma-4-31b-it:free",
+            "qwen/qwen3.8-27b:free",
+            "openrouter/free",
             "openrouter/auto"
         ]
         self.combo_model.addItems(model_options)
@@ -3972,7 +4082,10 @@ class SettingsDialog(QDialog):
         self.lbl_qual_val.setText(f"{qual}%")
 
         self.input_api_key.setText(s.get("openrouter_api_key", ""))
-        self.combo_model.setCurrentText(s.get("openrouter_model", DEFAULT_OPENROUTER_MODEL))
+        saved_model = s.get("openrouter_model", DEFAULT_OPENROUTER_MODEL).strip()
+        if not saved_model or saved_model in DEPRECATED_OPENROUTER_MODELS:
+            saved_model = DEFAULT_OPENROUTER_MODEL
+        self.combo_model.setCurrentText(saved_model)
         self.cb_ai_trans.setChecked(s.get("use_ai_translation", False))
         self.cb_ai_ocr.setChecked(s.get("use_ai_ocr", False))
 
