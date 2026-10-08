@@ -3773,8 +3773,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.hotkey_mgr = hotkey_mgr
         self.setWindowTitle("⚙ 系统设置 - Murioki Capture")
-        self.resize(600, 680)
-        self.setMinimumSize(540, 620)
+        self.resize(580, 600)
+        self.setMinimumSize(460, 380)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("""
             QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
@@ -3785,8 +3785,9 @@ class SettingsDialog(QDialog):
                 color: #0969da;
                 border: 1px solid #d0d7de;
                 border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 16px;
+                margin-top: 14px;
+                padding-top: 18px;
+                padding-bottom: 10px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -3797,63 +3798,96 @@ class SettingsDialog(QDialog):
                 background: #ffffff;
                 border: 1px solid #d0d7de;
                 border-radius: 6px;
-                padding: 5px 10px;
-                font-size: 12px;
+                padding: 0px 10px;
+                font-size: 13px;
                 color: #24292f;
+                min-height: 32px;
+                max-height: 32px;
             }
             QLineEdit:focus, QComboBox:focus { border-color: #0969da; }
             QCheckBox { font-size: 13px; color: #24292f; spacing: 8px; }
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: #f6f8fa;
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #c0c4cc;
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover { background: #909399; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
         """)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(16, 14, 16, 14)
+        main_layout.setSpacing(10)
+
+        # 滚动区域包裹所有设置卡片，防止小屏幕/缩放窗口时控件被挤压变形
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+
+        content_widget = QWidget()
+        content_widget.setObjectName("settingsContent")
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(4, 4, 10, 4)
+        content_layout.setSpacing(14)
 
         # 1. 全局快捷键分组
         hk_group = QGroupBox("⌨ 全局快捷键自定义")
         hk_layout = QGridLayout(hk_group)
-        hk_layout.setContentsMargins(14, 14, 14, 14)
+        hk_layout.setContentsMargins(14, 16, 14, 14)
         hk_layout.setSpacing(10)
 
         hk_layout.addWidget(QLabel("截屏快捷键:"), 0, 0)
         self.input_hk_snip = QLineEdit()
+        self.input_hk_snip.setFixedHeight(32)
         self.input_hk_snip.setPlaceholderText("例如: F1 或 Ctrl+Alt+A")
         hk_layout.addWidget(self.input_hk_snip, 0, 1)
 
         hk_layout.addWidget(QLabel("识图/翻译:"), 1, 0)
         self.input_hk_ocr = QLineEdit()
+        self.input_hk_ocr.setFixedHeight(32)
         self.input_hk_ocr.setPlaceholderText("例如: F2")
         hk_layout.addWidget(self.input_hk_ocr, 1, 1)
 
         hk_layout.addWidget(QLabel("贴图置顶:"), 2, 0)
         self.input_hk_pin = QLineEdit()
+        self.input_hk_pin.setFixedHeight(32)
         self.input_hk_pin.setPlaceholderText("例如: F3")
         hk_layout.addWidget(self.input_hk_pin, 2, 1)
 
         hk_layout.addWidget(QLabel("屏幕录制:"), 3, 0)
         self.input_hk_rec = QLineEdit()
+        self.input_hk_rec.setFixedHeight(32)
         self.input_hk_rec.setPlaceholderText("例如: F4")
         hk_layout.addWidget(self.input_hk_rec, 3, 1)
 
         btn_reset_hk = QPushButton("恢复默认快捷键 (F1~F4)")
+        btn_reset_hk.setFixedHeight(30)
         btn_reset_hk.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_reset_hk)
         btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
         hk_layout.addWidget(btn_reset_hk, 4, 1, Qt.AlignRight)
 
-        layout.addWidget(hk_group)
+        content_layout.addWidget(hk_group)
 
         # 2. 保存与文件输出分组
         save_group = QGroupBox("💾 保存与输出偏好")
         save_layout = QGridLayout(save_group)
-        save_layout.setContentsMargins(14, 14, 14, 14)
+        save_layout.setContentsMargins(14, 16, 14, 14)
         save_layout.setSpacing(10)
 
         save_layout.addWidget(QLabel("默认保存目录:"), 0, 0)
         dir_box = QHBoxLayout()
         self.input_save_dir = QLineEdit()
+        self.input_save_dir.setFixedHeight(32)
         dir_box.addWidget(self.input_save_dir, 1)
         btn_browse_dir = QPushButton("浏览...")
+        btn_browse_dir.setFixedHeight(32)
         btn_browse_dir.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_browse_dir)
         btn_browse_dir.clicked.connect(self._browse_save_dir)
@@ -3865,6 +3899,7 @@ class SettingsDialog(QDialog):
 
         save_layout.addWidget(QLabel("默认存储格式:"), 2, 0)
         self.combo_format = QComboBox()
+        self.combo_format.setFixedHeight(32)
         self.combo_format.addItems(["PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)"])
         save_layout.addWidget(self.combo_format, 2, 1)
 
@@ -3880,12 +3915,12 @@ class SettingsDialog(QDialog):
         qual_box.addWidget(self.lbl_qual_val)
         save_layout.addLayout(qual_box, 3, 1)
 
-        layout.addWidget(save_group)
+        content_layout.addWidget(save_group)
 
         # 3. AI 识别与翻译分组 (智谱 GLM-OCR & 火山方舟豆包翻译)
         ai_group = QGroupBox("🤖 AI 大模型服务 (智谱 GLM-OCR & 火山方舟豆包)")
         ai_layout = QGridLayout(ai_group)
-        ai_layout.setContentsMargins(14, 14, 14, 14)
+        ai_layout.setContentsMargins(14, 16, 14, 14)
         ai_layout.setSpacing(10)
 
         # 3.1 智谱 GLM-OCR 识图配置
@@ -3896,11 +3931,12 @@ class SettingsDialog(QDialog):
         ai_layout.addWidget(QLabel("识图 Token:"), 1, 0)
         key_box_ocr = QHBoxLayout()
         self.input_zhipu_key = QLineEdit()
+        self.input_zhipu_key.setFixedHeight(32)
         self.input_zhipu_key.setEchoMode(QLineEdit.Password)
         self.input_zhipu_key.setPlaceholderText("输入智谱 AI API Key (bigmodel.cn)...")
         key_box_ocr.addWidget(self.input_zhipu_key, 1)
         btn_toggle_zhipu = QPushButton("👁")
-        btn_toggle_zhipu.setFixedWidth(30)
+        btn_toggle_zhipu.setFixedSize(32, 32)
         btn_toggle_zhipu.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_toggle_zhipu)
         def _toggle_zhipu():
@@ -3914,6 +3950,7 @@ class SettingsDialog(QDialog):
 
         ai_layout.addWidget(QLabel("识图模型:"), 2, 0)
         self.input_ocr_model = QLineEdit()
+        self.input_ocr_model.setFixedHeight(32)
         self.input_ocr_model.setPlaceholderText("默认 glm-ocr")
         ai_layout.addWidget(self.input_ocr_model, 2, 1)
 
@@ -3932,11 +3969,12 @@ class SettingsDialog(QDialog):
         ai_layout.addWidget(QLabel("翻译 Token:"), 5, 0)
         key_box_trans = QHBoxLayout()
         self.input_volc_key = QLineEdit()
+        self.input_volc_key.setFixedHeight(32)
         self.input_volc_key.setEchoMode(QLineEdit.Password)
         self.input_volc_key.setPlaceholderText("输入火山方舟 API Key (ARK_API_KEY)...")
         key_box_trans.addWidget(self.input_volc_key, 1)
         btn_toggle_volc = QPushButton("👁")
-        btn_toggle_volc.setFixedWidth(30)
+        btn_toggle_volc.setFixedSize(32, 32)
         btn_toggle_volc.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_toggle_volc)
         def _toggle_volc():
@@ -3950,31 +3988,39 @@ class SettingsDialog(QDialog):
 
         ai_layout.addWidget(QLabel("翻译接入点:"), 6, 0)
         self.input_volc_model = QLineEdit()
+        self.input_volc_model.setFixedHeight(32)
         self.input_volc_model.setPlaceholderText("例如: ep-20260629102203-cfllm")
         ai_layout.addWidget(self.input_volc_model, 6, 1)
 
-        layout.addWidget(ai_group)
+        content_layout.addWidget(ai_group)
+        content_layout.addStretch(1)
+
+        scroll_area.setWidget(content_widget)
+        main_layout.addWidget(scroll_area, 1)
 
         # 底部按钮栏
         btn_bar = QHBoxLayout()
+        btn_bar.setContentsMargins(4, 6, 4, 0)
         btn_bar.setSpacing(10)
         btn_bar.addStretch()
 
         btn_save = QPushButton("💾 保存并应用")
-        btn_save.setFixedHeight(34)
+        btn_save.setFixedHeight(36)
+        btn_save.setMinimumWidth(110)
         btn_save.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_save, active=True)
         btn_save.clicked.connect(self.save_and_apply)
         btn_bar.addWidget(btn_save)
 
         btn_cancel = QPushButton("✕ 取消")
-        btn_cancel.setFixedHeight(34)
+        btn_cancel.setFixedHeight(36)
+        btn_cancel.setMinimumWidth(80)
         btn_cancel.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_cancel)
         btn_cancel.clicked.connect(self.close)
         btn_bar.addWidget(btn_cancel)
 
-        layout.addLayout(btn_bar)
+        main_layout.addLayout(btn_bar)
 
         self._load_current_values()
 
