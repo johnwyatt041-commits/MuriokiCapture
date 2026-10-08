@@ -101,105 +101,27 @@ TEMP_FOLDER = os.path.join(BASE_DIR, "temp_scroll_frames")
 REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 
 # ==========================================
-# AI 翻译与多模态识别配置 (OpenRouter)
+# AI 翻译与多模态识别配置 (智谱 GLM-OCR & 火山方舟豆包翻译)
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "murioki_settings.json")
 
-# 已经失效或移除的旧模型（自动从配置迁移到新模型，防止 404）
-DEPRECATED_OPENROUTER_MODELS = {
-    "qwen/qwen-2.5-vl-72b-instruct:free",
-    "inclusionai/ling-3.0-flash-vl:free",
-    "nex-agi/nex-n2.5-mini:free",
-    "nex-agi/nex-n2.5-pro:free",
-    "google/gemini-2.0-flash-exp:free",
-    "google/gemini-2.0-flash-thinking-exp:free",
-    "meta-llama/llama-3.2-11b-vision-instruct:free",
-}
+# 智谱 AI 专业文档/文字识别 (GLM-OCR) 配置
+DEFAULT_ZHIPU_OCR_MODEL = "glm-ocr"
+ZHIPU_OCR_API_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
 
-# 默认首选模型与稳定支持的备用免费多模态视觉模型（按优先级自动降级重试）
-DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-FALLBACK_OPENROUTER_MODELS = [
-    "stealth/space-bunny-alpha",
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-4-31b-it:free",
-    "qwen/qwen3.8-27b:free",
-    "openrouter/free",
-]
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-_LIVE_MODELS_CACHE = {
-    "timestamp": 0,
-    "vision": [],
-    "text": []
-}
-
-def fetch_live_openrouter_free_models(vision_only=False, max_age_seconds=3600):
-    """
-    动态从 OpenRouter API 获取当前处于活跃可用状态的免费模型列表。
-    带本地缓存，防止高频网络请求。
-    当静态预设模型失效或 OpenRouter 模型变动时，可实现全自动自我修复与发现。
-    """
-    global _LIVE_MODELS_CACHE
-    now = time.time()
-    if now - _LIVE_MODELS_CACHE["timestamp"] < max_age_seconds:
-        cached = _LIVE_MODELS_CACHE["vision"] if vision_only else _LIVE_MODELS_CACHE["text"]
-        if cached:
-            return list(cached)
-
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"User-Agent": "MuriokiCapture/1.1 (Windows NT)"}
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode('utf-8')).get('data', [])
-
-        free_vision = []
-        free_text = []
-        for m in data:
-            mid = m.get('id', '')
-            if mid in DEPRECATED_OPENROUTER_MODELS:
-                continue
-            pricing = m.get('pricing', {})
-            is_free = (str(pricing.get('prompt', '')) == '0' and str(pricing.get('completion', '')) == '0') or ':free' in mid
-            if not is_free:
-                continue
-
-            arch = m.get('architecture', {})
-            modality = str(arch.get('modality', '')).lower()
-            inputs = [str(x).lower() for x in (arch.get('input_modalities', []) or [])]
-
-            has_image = ('image' in inputs) or ('image' in modality)
-            if has_image:
-                free_vision.append(mid)
-            free_text.append(mid)
-
-        priority_keywords = ["nemotron", "bunny", "gemma", "qwen", "free"]
-        def _sort_key(name):
-            lower = name.lower()
-            for rank, kw in enumerate(priority_keywords):
-                if kw in lower:
-                    return rank
-            return 99
-
-        free_vision.sort(key=_sort_key)
-        free_text.sort(key=_sort_key)
-
-        _LIVE_MODELS_CACHE["timestamp"] = now
-        _LIVE_MODELS_CACHE["vision"] = free_vision
-        _LIVE_MODELS_CACHE["text"] = free_text
-        return list(free_vision if vision_only else free_text)
-    except Exception as e:
-        logging.warning("获取 OpenRouter 实时模型列表失败: %s", e)
-        return []
+# 火山引擎方舟 (Doubao 翻译) 配置
+DEFAULT_VOLC_TRANS_MODEL = "ep-20260629102203-cfllm"
+VOLC_ARK_API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
 def load_settings():
     """从本地 JSON 文件加载用户设置"""
     defaults = {
         "use_ai_translation": False,
         "use_ai_ocr": False,
-        "openrouter_api_key": "",
-        "openrouter_model": DEFAULT_OPENROUTER_MODEL,
+        "zhipu_api_key": "",
+        "glm_ocr_model": DEFAULT_ZHIPU_OCR_MODEL,
+        "volc_api_key": "",
+        "volc_model": DEFAULT_VOLC_TRANS_MODEL,
         "hotkey_snip": "F1",
         "hotkey_ocr": "F2",
         "hotkey_pin": "F3",
@@ -228,38 +150,19 @@ def save_settings(settings_dict):
     except Exception as e:
         logging.warning("保存设置文件失败: %s", e)
 
-def get_openrouter_api_key():
-    """获取 OpenRouter API 密钥（优先从设置文件，其次环境变量）"""
-    key = load_settings().get("openrouter_api_key", "")
+def get_zhipu_api_key():
+    """获取智谱 AI (GLM-OCR) API 密钥"""
+    key = load_settings().get("zhipu_api_key", "").strip()
     if key:
         return key
-    return os.environ.get("OPENROUTER_API_KEY", "")
+    return os.environ.get("ZHIPU_API_KEY", "").strip()
 
-def get_candidate_models(vision_only=False):
-    """获取待尝试的模型列表（用户配置首选 + 自动备用降级池 + 动态发现补充池）"""
-    settings = load_settings()
-    user_model = settings.get("openrouter_model", "").strip()
-
-    # 自动替换已废弃的旧模型
-    if not user_model or user_model in DEPRECATED_OPENROUTER_MODELS:
-        user_model = DEFAULT_OPENROUTER_MODEL
-        settings["openrouter_model"] = user_model
-        save_settings(settings)
-
-    models = [user_model]
-
-    # 添加预设备用池
-    for fb in FALLBACK_OPENROUTER_MODELS:
-        if fb not in models and fb not in DEPRECATED_OPENROUTER_MODELS:
-            models.append(fb)
-
-    # 尝试补充实时动态探测到的活跃免费模型
-    live_models = fetch_live_openrouter_free_models(vision_only=vision_only, max_age_seconds=1800)
-    for lm in live_models:
-        if lm not in models and lm not in DEPRECATED_OPENROUTER_MODELS:
-            models.append(lm)
-
-    return models
+def get_volc_api_key():
+    """获取火山方舟 (Ark) API 密钥"""
+    key = load_settings().get("volc_api_key", "").strip()
+    if key:
+        return key
+    return os.environ.get("ARK_API_KEY", os.environ.get("VOLC_API_KEY", "")).strip()
 RECORD_QUALITY_PRESETS = {
     'p60': {'scale': 1.0, 'fps': 60, 'name': '原画 60FPS (100%)'},
     'p30': {'scale': 1.0, 'fps': 30, 'name': '原画 30FPS (100%)'},
@@ -735,7 +638,7 @@ def translate_text(text, target_lang, source_lang='auto'):
     return "\n".join(results), detected_final
 
 # ==========================================
-# AI 翻译 (OpenRouter API)
+# AI 翻译 (火山引擎方舟豆包大模型 API)
 # ==========================================
 _AI_LANG_NAMES = {
     "zh-CN": "简体中文 (Simplified Chinese)",
@@ -766,7 +669,7 @@ def _clean_ai_output(choice_dict):
     return ""
 
 def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25, is_cancelled_fn=None):
-    """使用 OpenRouter AI 模型翻译单段文本（带多模型自动回退容错与思考链清洗）"""
+    """使用火山引擎方舟豆包大模型进行极速高质量文本翻译（关闭思考以实现极低延迟与高吞吐）"""
     if not text or not text.strip():
         return "", source_lang
     text = text.strip()
@@ -774,9 +677,11 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25,
     if is_cancelled_fn and is_cancelled_fn():
         return "", source_lang
 
-    api_key = get_openrouter_api_key()
+    api_key = get_volc_api_key()
     if not api_key:
-        raise RuntimeError("未检测到 API 密钥，请在设置或 murioki_settings.json 中配置 openrouter_api_key。")
+        raise RuntimeError("未检测到火山方舟 API 密钥，请在系统设置中配置 翻译 Token (ARK_API_KEY)。")
+
+    model_ep = load_settings().get("volc_model", "").strip() or DEFAULT_VOLC_TRANS_MODEL
 
     target_name = _AI_LANG_NAMES.get(target_lang, target_lang)
     if source_lang and source_lang != 'auto':
@@ -786,35 +691,42 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25,
         src_hint = " Auto-detect the source language."
 
     system_prompt = (
-        f"You are a professional translator.{src_hint} "
+        f"You are a professional, accurate translator.{src_hint} "
         f"Translate the following text into {target_name}. "
-        f"Output ONLY the translated text, nothing else. Do not output any thought process or notes."
+        f"Output ONLY the translated text without explanations, greetings, or notes."
     )
 
-    models_to_try = get_candidate_models(vision_only=False)
-    last_err = None
+    base_payload = {
+        "model": model_ep,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "thinking": {
+            "type": "disabled"
+        }
+    }
 
-    for idx, model_name in enumerate(models_to_try):
+    auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
+
+    # 优先带 thinking: disabled 请求以获得极速响应；若当前接入点不支持 thinking 参数则自动降级重试标准格式
+    for try_mode in ["no_thinking", "fallback_standard"]:
         if is_cancelled_fn and is_cancelled_fn():
             return "", source_lang
 
-        payload = json.dumps({
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            "temperature": 0.3,
-        }).encode('utf-8')
+        payload_dict = dict(base_payload)
+        if try_mode == "fallback_standard":
+            payload_dict.pop("thinking", None)
 
+        payload_bytes = json.dumps(payload_dict).encode('utf-8')
         req = urllib.request.Request(
-            OPENROUTER_API_URL,
-            data=payload,
+            VOLC_ARK_API_URL,
+            data=payload_bytes,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer": "https://murioki-capture.local",
-                "X-Title": "Murioki Capture OCR Translator",
+                "Authorization": auth_header,
             },
             method="POST"
         )
@@ -825,30 +737,25 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25,
                 choice = data['choices'][0]['message']
                 result = _clean_ai_output(choice)
                 detected_src = source_lang if source_lang != 'auto' else 'auto'
-                if result:
-                    if idx > 0:
-                        logging.info("首选模型受限，已自动切换备用模型 %s 翻译成功", model_name)
-                    return result, detected_src
-                last_err = f"模型 {model_name} 返回空结果"
-                if idx < len(models_to_try) - 1:
-                    continue
+                return result, detected_src
         except urllib.error.HTTPError as e:
             body = e.read().decode('utf-8', errors='replace') if e.fp else ''
-            logging.warning("AI 翻译模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
-            last_err = f"HTTP {e.code}"
+            logging.warning("火山方舟翻译请求失败 (HTTP %s): %s", e.code, body[:180])
             if e.code == 401:
-                raise RuntimeError("OpenRouter API 密钥无效或未授权 (HTTP 401)，请在设置中检查您的 API Key。")
-            if idx < len(models_to_try) - 1:
+                raise RuntimeError("火山方舟 API 密钥无效或未授权 (HTTP 401)，请在系统设置中检查您的翻译 Token。")
+            if e.code == 400 and try_mode == "no_thinking" and "thinking" in body.lower():
                 continue
-            if idx == len(models_to_try) - 1:
-                raise RuntimeError(f"AI 翻译失败 (所有模型均受限，最后报错: {last_err})。")
+            try:
+                err_json = json.loads(body)
+                msg = err_json.get("error", {}).get("message") or err_json.get("message") or f"HTTP {e.code}"
+                raise RuntimeError(f"火山方舟翻译失败: {msg}")
+            except Exception:
+                raise RuntimeError(f"火山方舟翻译失败 (HTTP {e.code})。")
         except Exception as e:
-            logging.warning("AI 翻译模型 %s 调用异常: %s", model_name, e)
-            last_err = str(e)
-            if idx < len(models_to_try) - 1:
-                continue
+            logging.warning("火山方舟翻译调用异常: %s", e)
+            raise RuntimeError(f"火山方舟翻译请求失败: {e}")
 
-    raise RuntimeError(f"AI 翻译请求失败: {last_err}")
+    return "", source_lang
 
 def ai_translate_text(text, target_lang, source_lang='auto', is_cancelled_fn=None):
     """AI 翻译：多段落/超长文本处理"""
@@ -1350,7 +1257,7 @@ class OcrResultDialog(QDialog):
         QTimer.singleShot(1500, lambda: self.btn_copy_both.setText("📑 复制双语对照"))
 
 # ==========================================
-# AI 文字识别 (OpenRouter VL 视觉模型)
+# AI 文字识别 (智谱 AI GLM-OCR 专业多模态模型)
 # ==========================================
 def _image_to_base64(image: QImage):
     """将 QImage 转换为 base64 编码的 PNG 字符串（安全跨线程纯数据操作）"""
@@ -1364,89 +1271,74 @@ def _image_to_base64(image: QImage):
     return base64.b64encode(ba.getvalue()).decode('utf-8')
 
 def ai_ocr_recognize(image: QImage, timeout=30):
-    """使用 AI 视觉模型识别图片中的文字（带多模型自动回退容错与思考链剥离）"""
-    api_key = get_openrouter_api_key()
+    """使用智谱 AI GLM-OCR 专业多模态/文档识别模型解析文字"""
+    api_key = get_zhipu_api_key()
     if not api_key:
-        raise RuntimeError("未检测到 API 密钥，请在设置或 murioki_settings.json 中配置 openrouter_api_key。")
+        raise RuntimeError("未检测到智谱 API 密钥，请在系统设置中配置 识图 Token (bigmodel.cn)。")
 
     img_base64 = _image_to_base64(image)
+    model_name = load_settings().get("glm_ocr_model", "").strip() or DEFAULT_ZHIPU_OCR_MODEL
 
-    models_to_try = get_candidate_models(vision_only=True)
-    last_err = None
+    payload = json.dumps({
+        "model": model_name,
+        "file": f"data:image/png;base64,{img_base64}"
+    }).encode('utf-8')
 
-    for idx, model_name in enumerate(models_to_try):
-        payload = json.dumps({
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an advanced OCR system. Extract ALL text from the image exactly as it appears. "
-                        "Preserve the original line breaks and formatting. "
-                        "Output ONLY the extracted text, nothing else. Do not output any thought process, reasoning or descriptions."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{img_base64}"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": "Extract all text from this image."
-                        }
-                    ]
-                }
-            ],
-            "temperature": 0.1,
-            "max_tokens": 2048,
-        }).encode('utf-8')
+    auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
+    req = urllib.request.Request(
+        ZHIPU_OCR_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": auth_header,
+        },
+        method="POST"
+    )
 
-        req = urllib.request.Request(
-            OPENROUTER_API_URL,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer": "https://murioki-capture.local",
-                "X-Title": "Murioki Capture AI OCR",
-            },
-            method="POST"
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                choice = data['choices'][0]['message']
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            
+            # 1. 优先读取 GLM-OCR 返回的标准 Markdown 格式解析结果
+            if "md_results" in data and data["md_results"]:
+                return str(data["md_results"]).strip()
+            
+            # 2. 兼容 chat 结构返回
+            if "choices" in data and data["choices"]:
+                choice = data["choices"][0].get("message", {})
                 result = _clean_ai_output(choice)
                 if result:
-                    if idx > 0:
-                        logging.info("首选模型受限，已自动切换备用模型 %s 识别成功", model_name)
                     return result
-                last_err = f"模型 {model_name} 返回空结果"
-                if idx < len(models_to_try) - 1:
-                    continue
-        except urllib.error.HTTPError as e:
-            body = e.read().decode('utf-8', errors='replace') if e.fp else ''
-            logging.warning("AI OCR 模型 %s 请求失败 (HTTP %s): %s", model_name, e.code, body[:120])
-            last_err = f"HTTP {e.code}"
-            if e.code == 401:
-                raise RuntimeError("OpenRouter API 密钥无效或未授权 (HTTP 401)，请在设置中检查您的 API Key。")
-            if idx < len(models_to_try) - 1:
-                continue
-            if idx == len(models_to_try) - 1:
-                raise RuntimeError(f"AI 识别失败 (所有模型均受限，最后报错: {last_err})。")
-        except Exception as e:
-            logging.warning("AI OCR 模型 %s 调用异常: %s", model_name, e)
-            last_err = str(e)
-            if idx < len(models_to_try) - 1:
-                continue
 
-    raise RuntimeError(f"AI 识别请求失败: {last_err}")
+            # 3. 兼容 layout_details 元素列表拼接
+            if "layout_details" in data and isinstance(data["layout_details"], list):
+                parts = []
+                for item in data["layout_details"]:
+                    if isinstance(item, list):
+                        for sub in item:
+                            c = sub.get("content", "")
+                            if c: parts.append(str(c))
+                    elif isinstance(item, dict):
+                        c = item.get("content", "")
+                        if c: parts.append(str(c))
+                if parts:
+                    return "\n".join(parts).strip()
+
+            return ""
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace') if e.fp else ''
+        logging.warning("智谱 GLM-OCR 请求失败 (HTTP %s): %s", e.code, body[:180])
+        if e.code == 401:
+            raise RuntimeError("智谱 API 密钥无效或未授权 (HTTP 401)，请在系统设置中检查您的识图 Token。")
+        try:
+            err_json = json.loads(body)
+            msg = err_json.get("error", {}).get("message") or err_json.get("msg") or f"HTTP {e.code}"
+            raise RuntimeError(f"智谱 GLM-OCR 识别失败: {msg}")
+        except Exception:
+            raise RuntimeError(f"智谱 GLM-OCR 识别失败 (HTTP {e.code})。")
+    except Exception as e:
+        logging.warning("智谱 GLM-OCR 调用异常: %s", e)
+        raise RuntimeError(f"智谱 GLM-OCR 请求失败: {e}")
 
 # ==========================================
 # OCR 后台工作线程 (智能双引擎融合: 懒加载 RapidOCR + 深度预处理 Tesseract / AI 视觉识别)
@@ -3876,13 +3768,13 @@ class HistoryDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """系统偏好设置面板：快捷键自定义、默认保存目录与画质、OpenRouter AI 模型配置"""
+    """系统偏好设置面板：快捷键自定义、默认保存目录与画质、智谱 GLM-OCR 及火山方舟豆包配置"""
     def __init__(self, parent=None, hotkey_mgr=None):
         super().__init__(parent)
         self.hotkey_mgr = hotkey_mgr
         self.setWindowTitle("⚙ 系统设置 - Murioki Capture")
-        self.resize(580, 560)
-        self.setMinimumSize(520, 500)
+        self.resize(600, 680)
+        self.setMinimumSize(540, 620)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("""
             QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
@@ -3990,52 +3882,76 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(save_group)
 
-        # 3. AI 识别与翻译分组
-        ai_group = QGroupBox("🤖 AI 大模型服务 (OpenRouter)")
+        # 3. AI 识别与翻译分组 (智谱 GLM-OCR & 火山方舟豆包翻译)
+        ai_group = QGroupBox("🤖 AI 大模型服务 (智谱 GLM-OCR & 火山方舟豆包)")
         ai_layout = QGridLayout(ai_group)
         ai_layout.setContentsMargins(14, 14, 14, 14)
         ai_layout.setSpacing(10)
 
-        ai_layout.addWidget(QLabel("API Key:"), 0, 0)
-        key_box = QHBoxLayout()
-        self.input_api_key = QLineEdit()
-        self.input_api_key.setEchoMode(QLineEdit.Password)
-        self.input_api_key.setPlaceholderText("sk-or-v1-...")
-        key_box.addWidget(self.input_api_key, 1)
-        btn_toggle_key = QPushButton("👁")
-        btn_toggle_key.setFixedWidth(30)
-        btn_toggle_key.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_toggle_key)
-        def _toggle_key():
-            if self.input_api_key.echoMode() == QLineEdit.Password:
-                self.input_api_key.setEchoMode(QLineEdit.Normal)
+        # 3.1 智谱 GLM-OCR 识图配置
+        self.cb_ai_ocr = QCheckBox("启用 AI 多模态文字识别 (智谱 GLM-OCR)")
+        self.cb_ai_ocr.setStyleSheet("font-weight: 600; color: #0969da;")
+        ai_layout.addWidget(self.cb_ai_ocr, 0, 0, 1, 2)
+
+        ai_layout.addWidget(QLabel("识图 Token:"), 1, 0)
+        key_box_ocr = QHBoxLayout()
+        self.input_zhipu_key = QLineEdit()
+        self.input_zhipu_key.setEchoMode(QLineEdit.Password)
+        self.input_zhipu_key.setPlaceholderText("输入智谱 AI API Key (bigmodel.cn)...")
+        key_box_ocr.addWidget(self.input_zhipu_key, 1)
+        btn_toggle_zhipu = QPushButton("👁")
+        btn_toggle_zhipu.setFixedWidth(30)
+        btn_toggle_zhipu.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_toggle_zhipu)
+        def _toggle_zhipu():
+            if self.input_zhipu_key.echoMode() == QLineEdit.Password:
+                self.input_zhipu_key.setEchoMode(QLineEdit.Normal)
             else:
-                self.input_api_key.setEchoMode(QLineEdit.Password)
-        btn_toggle_key.clicked.connect(_toggle_key)
-        key_box.addWidget(btn_toggle_key)
-        ai_layout.addLayout(key_box, 0, 1)
+                self.input_zhipu_key.setEchoMode(QLineEdit.Password)
+        btn_toggle_zhipu.clicked.connect(_toggle_zhipu)
+        key_box_ocr.addWidget(btn_toggle_zhipu)
+        ai_layout.addLayout(key_box_ocr, 1, 1)
 
-        ai_layout.addWidget(QLabel("首选模型:"), 1, 0)
-        self.combo_model = QComboBox()
-        self.combo_model.setEditable(True)
-        model_options = [
-            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-            "stealth/space-bunny-alpha",
-            "google/gemma-4-26b-a4b-it:free",
-            "google/gemma-4-31b-it:free",
-            "qwen/qwen3.8-27b:free",
-            "openrouter/free",
-            "openrouter/auto"
-        ]
-        self.combo_model.addItems(model_options)
-        ai_layout.addWidget(self.combo_model, 1, 1)
+        ai_layout.addWidget(QLabel("识图模型:"), 2, 0)
+        self.input_ocr_model = QLineEdit()
+        self.input_ocr_model.setPlaceholderText("默认 glm-ocr")
+        ai_layout.addWidget(self.input_ocr_model, 2, 1)
 
-        chk_box = QHBoxLayout()
-        self.cb_ai_trans = QCheckBox("启用 AI 智能翻译")
-        self.cb_ai_ocr = QCheckBox("启用 AI 多模态文字识别")
-        chk_box.addWidget(self.cb_ai_trans)
-        chk_box.addWidget(self.cb_ai_ocr)
-        ai_layout.addLayout(chk_box, 2, 0, 1, 2)
+        # 分割线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        line.setStyleSheet("color: #d0d7de; margin: 4px 0;")
+        ai_layout.addWidget(line, 3, 0, 1, 2)
+
+        # 3.2 火山方舟豆包翻译配置
+        self.cb_ai_trans = QCheckBox("启用 AI 智能翻译 (火山引擎豆包)")
+        self.cb_ai_trans.setStyleSheet("font-weight: 600; color: #0969da;")
+        ai_layout.addWidget(self.cb_ai_trans, 4, 0, 1, 2)
+
+        ai_layout.addWidget(QLabel("翻译 Token:"), 5, 0)
+        key_box_trans = QHBoxLayout()
+        self.input_volc_key = QLineEdit()
+        self.input_volc_key.setEchoMode(QLineEdit.Password)
+        self.input_volc_key.setPlaceholderText("输入火山方舟 API Key (ARK_API_KEY)...")
+        key_box_trans.addWidget(self.input_volc_key, 1)
+        btn_toggle_volc = QPushButton("👁")
+        btn_toggle_volc.setFixedWidth(30)
+        btn_toggle_volc.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_toggle_volc)
+        def _toggle_volc():
+            if self.input_volc_key.echoMode() == QLineEdit.Password:
+                self.input_volc_key.setEchoMode(QLineEdit.Normal)
+            else:
+                self.input_volc_key.setEchoMode(QLineEdit.Password)
+        btn_toggle_volc.clicked.connect(_toggle_volc)
+        key_box_trans.addWidget(btn_toggle_volc)
+        ai_layout.addLayout(key_box_trans, 5, 1)
+
+        ai_layout.addWidget(QLabel("翻译接入点:"), 6, 0)
+        self.input_volc_model = QLineEdit()
+        self.input_volc_model.setPlaceholderText("例如: ep-20260629102203-cfllm")
+        ai_layout.addWidget(self.input_volc_model, 6, 1)
 
         layout.addWidget(ai_group)
 
@@ -4081,13 +3997,13 @@ class SettingsDialog(QDialog):
         self.slider_quality.setValue(qual)
         self.lbl_qual_val.setText(f"{qual}%")
 
-        self.input_api_key.setText(s.get("openrouter_api_key", ""))
-        saved_model = s.get("openrouter_model", DEFAULT_OPENROUTER_MODEL).strip()
-        if not saved_model or saved_model in DEPRECATED_OPENROUTER_MODELS:
-            saved_model = DEFAULT_OPENROUTER_MODEL
-        self.combo_model.setCurrentText(saved_model)
-        self.cb_ai_trans.setChecked(s.get("use_ai_translation", False))
+        self.input_zhipu_key.setText(s.get("zhipu_api_key", ""))
+        self.input_ocr_model.setText(s.get("glm_ocr_model", DEFAULT_ZHIPU_OCR_MODEL))
         self.cb_ai_ocr.setChecked(s.get("use_ai_ocr", False))
+
+        self.input_volc_key.setText(s.get("volc_api_key", ""))
+        self.input_volc_model.setText(s.get("volc_model", DEFAULT_VOLC_TRANS_MODEL))
+        self.cb_ai_trans.setChecked(s.get("use_ai_translation", False))
 
     def _reset_default_hotkeys(self):
         self.input_hk_snip.setText("F1")
@@ -4113,8 +4029,10 @@ class SettingsDialog(QDialog):
             "auto_save_enabled": self.cb_auto_save.isChecked(),
             "save_format": fmt_str,
             "save_quality": self.slider_quality.value(),
-            "openrouter_api_key": self.input_api_key.text().strip(),
-            "openrouter_model": self.combo_model.currentText().strip() or DEFAULT_OPENROUTER_MODEL,
+            "zhipu_api_key": self.input_zhipu_key.text().strip(),
+            "glm_ocr_model": self.input_ocr_model.text().strip() or DEFAULT_ZHIPU_OCR_MODEL,
+            "volc_api_key": self.input_volc_key.text().strip(),
+            "volc_model": self.input_volc_model.text().strip() or DEFAULT_VOLC_TRANS_MODEL,
             "use_ai_translation": self.cb_ai_trans.isChecked(),
             "use_ai_ocr": self.cb_ai_ocr.isChecked(),
         }

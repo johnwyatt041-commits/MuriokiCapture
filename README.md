@@ -12,7 +12,7 @@
 - 🗃️ **截图历史记录** — 独立历史管理面板，支持查看、搜索、重新编辑、复制与保存
 - ⚙️ **偏好设置面板** — 自定义快捷键绑定、默认存储路径、多格式保存（PNG / JPG / WebP）与质量调节
 - 🔤 **OCR 文字识别** — RapidOCR + Tesseract 双引擎融合，支持中/英/泰/菲多语言离线识别
-- 🤖 **AI 视觉与翻译** — OpenRouter 视觉语言模型，多模型自动故障转移（429 降级兜底）
+- 🤖 **AI 视觉与翻译** — 智谱 AI GLM-OCR 专业多模态文字识别 + 火山引擎方舟豆包翻译（关闭思考以实现极速高准确率翻译）
 - 🌐 **在线翻译** — Google Translate + MyMemory 双通道翻译
 - ⌨️ **全局快捷键** — 默认 F1 截图 / F2 文字识别 / F3 贴图 / F4 录屏（可在设置中自定义）
 
@@ -46,20 +46,20 @@ pyinstaller MuriokiCapture.spec
 
 ## 🤖 AI 功能配置
 
-应用内置 AI 翻译和 AI 文字识别功能，通过 [OpenRouter](https://openrouter.ai/) 调用视觉语言模型。在 OCR 弹窗中可以切换：
+应用内置 AI 翻译和 AI 文字识别功能，识图与翻译 Token 独立配置：
 
-- **识别模式**: `📷 OCR 识别` / `🤖 AI 识别`
-- **翻译模式**: `🌐 普通翻译` / `🤖 AI 翻译`
+- **AI 文字识别**: 接入 [智谱 AI GLM-OCR](https://docs.bigmodel.cn/cn/guide/models/vlm/glm-ocr) 专用多模态版面解析与 OCR 模型，极高识别精度。
+- **AI 智能翻译**: 接入 [火山引擎方舟平台](https://console.volcengine.com/) 豆包大模型（接入点 `ep-20260629102203-cfllm`），参数自动关闭思考以达到超低延迟与高质量翻译。
 
-### 模型自定义与高可用自动降级
-在 `murioki_settings.json` 中可自定义首选模型：
+可在「⚙️ 设置」面板中直接填写各自的 API Key：
 ```json
 {
-  "openrouter_api_key": "你的 OpenRouter 密钥",
-  "openrouter_model": "qwen/qwen3.8-27b:free"
+  "zhipu_api_key": "你的智谱 AI API Key (bigmodel.cn)",
+  "glm_ocr_model": "glm-ocr",
+  "volc_api_key": "你的火山方舟 API Key (ARK_API_KEY)",
+  "volc_model": "ep-20260629102203-cfllm"
 }
 ```
-> 💡 当首选模型由于公共调用量大触发 **HTTP 429** 限流或临时故障时，程序会自动依次降级回退至 `inclusionai/ling-3.0-flash-vl:free`、`nex-agi/nex-n2.5-mini:free` 等备用免费多模态视觉模型，确保翻译与文字识别稳定可用。
 
 ## 📄 License
 
