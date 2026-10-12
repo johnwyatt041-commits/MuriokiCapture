@@ -97,7 +97,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='MuriokiCapture',
+    name='Capture',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

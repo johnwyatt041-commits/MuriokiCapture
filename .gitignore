@@ -24,7 +24,7 @@ capture_history/
 *.bak
 
 # Settings (may contain API keys)
-murioki_settings.json
+*settings.json
 
 # Windows
 Thumbs.db

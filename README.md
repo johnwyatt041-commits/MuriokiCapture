@@ -19,7 +19,7 @@
 ## 🚀 快速开始
 
 ### 直接使用
-从 [Releases](../../releases) 页面下载最新的 `MuriokiCapture.exe`，双击运行即可。
+从 [Releases](../../releases) 页面下载最新的 `Capture.exe`，双击运行即可。
 
 ### 从源码运行
 ```bash
@@ -32,7 +32,7 @@ python capture.py
 
 ### 打包 exe
 ```bash
-pyinstaller MuriokiCapture.spec
+pyinstaller Capture.spec
 ```
 
 ## ⌨️ 快捷键
