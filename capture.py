@@ -131,6 +131,7 @@ def load_settings():
         "auto_save_enabled": False,
         "save_format": "png",
         "save_quality": 95,
+        "show_mode_hints": True,
     }
     try:
         cfg_file = SETTINGS_FILE
@@ -5051,6 +5052,9 @@ class SettingsDialog(QDialog):
         qual_box.addWidget(self.lbl_qual_val)
         save_layout.addLayout(qual_box, 3, 1)
 
+        self.cb_show_mode_hints = QCheckBox("显示快捷识图/录屏操作指引条 (支持智能上下避让与拖拽隐藏)")
+        save_layout.addWidget(self.cb_show_mode_hints, 4, 0, 1, 2)
+
         content_layout.addWidget(save_group)
 
         # 3. AI 识别与翻译分组 (智谱 GLM-OCR & 火山方舟豆包翻译)
@@ -5169,6 +5173,7 @@ class SettingsDialog(QDialog):
 
         self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
         self.cb_auto_save.setChecked(s.get("auto_save_enabled", False))
+        self.cb_show_mode_hints.setChecked(s.get("show_mode_hints", True))
 
         fmt = s.get("save_format", "png").lower()
         if "jp" in fmt: self.combo_format.setCurrentIndex(1)
@@ -5209,6 +5214,7 @@ class SettingsDialog(QDialog):
             "hotkey_record": self.input_hk_rec.text().strip() or "F4",
             "default_save_dir": self.input_save_dir.text().strip(),
             "auto_save_enabled": self.cb_auto_save.isChecked(),
+            "show_mode_hints": self.cb_show_mode_hints.isChecked(),
             "save_format": fmt_str,
             "save_quality": self.slider_quality.value(),
             "zhipu_api_key": self.input_zhipu_key.text().strip(),
@@ -6706,6 +6712,9 @@ class ScreenshotTool(QWidget):
         self.redo_stack.clear()
         self.ocr_intent = ocr_intent
         self.recording_intent = recording_intent
+        self.mode_banner_dismissed = False
+        self.mode_banner_show_time = _time.time()
+        self.current_mouse_pos = self.mapFromGlobal(QCursor.pos())
 
         self.ocr_rect = None
         self.color_pick_pos = self.mapFromGlobal(QCursor.pos())
@@ -7336,6 +7345,96 @@ class ScreenshotTool(QWidget):
                 return
             self.hide_app(keep_history=False)
 
+    def _get_mode_banner_geometry(self, banner_w=480, banner_h=32):
+        screen_w = self.width()
+        screen_h = self.height()
+        bx = (screen_w - banner_w) // 2
+
+        m_pos = getattr(self, 'current_mouse_pos', None)
+        if m_pos is None:
+            m_pos = self.mapFromGlobal(QCursor.pos())
+
+        top_y = 16
+        bottom_y = screen_h - banner_h - 18
+
+        # 智能上下避让：如果鼠标位于屏幕上半部分 (y < 240) 或悬停吸附的窗口在屏幕顶部，立刻避让到底部！
+        dodge_to_bottom = False
+        if m_pos.y() < 240:
+            dodge_to_bottom = True
+        elif hasattr(self, 'hovered_window_rect') and self.hovered_window_rect:
+            if self.hovered_window_rect.top() < 120 and self.hovered_window_rect.intersects(QRect(bx, top_y, banner_w, banner_h + 30)):
+                dodge_to_bottom = True
+
+        # 如果鼠标直接接近顶部 banner 50px 范围内，强制避让到底部
+        if not dodge_to_bottom and (abs(m_pos.x() - screen_w // 2) < banner_w // 2 + 40) and m_pos.y() < top_y + banner_h + 40:
+            dodge_to_bottom = True
+        # 如果避让到底部后鼠标又移动到底部 banner 50px 范围内，则翻转回顶部
+        elif dodge_to_bottom and (abs(m_pos.x() - screen_w // 2) < banner_w // 2 + 40) and m_pos.y() > bottom_y - 40:
+            dodge_to_bottom = False
+
+        by = bottom_y if dodge_to_bottom else top_y
+        return QRect(bx, by, banner_w, banner_h)
+
+    def _draw_mode_banner(self, painter, is_ocr, is_rec):
+        if not load_settings().get("show_mode_hints", True):
+            self._mode_banner_rect = None
+            self._mode_banner_close_rect = None
+            return
+
+        if getattr(self, 'mode_banner_dismissed', False):
+            self._mode_banner_rect = None
+            self._mode_banner_close_rect = None
+            return
+
+        # 只要用户开始拖选或已存在选区，彻底隐藏指引条，100% 杜绝遮挡任何屏幕画面
+        if not self.selection_rect.isNull() or getattr(self, 'drag_mode', None):
+            self._mode_banner_rect = None
+            self._mode_banner_close_rect = None
+            return
+
+        banner_w = 480
+        banner_h = 32
+        banner_rect = self._get_mode_banner_geometry(banner_w, banner_h)
+        self._mode_banner_rect = banner_rect
+        close_btn_rect = QRect(banner_rect.right() - 25, banner_rect.top() + (banner_h - 16) // 2, 16, 16)
+        self._mode_banner_close_rect = close_btn_rect
+
+        border_color = QColor(9, 105, 218) if is_ocr else QColor(239, 68, 68)
+
+        # 柔和轻量阴影
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 25))
+        painter.drawRoundedRect(banner_rect.adjusted(0, 2, 0, 2), 8, 8)
+
+        # 胶囊卡片主体（纯白背景、微圆角）
+        painter.setPen(QPen(border_color, 1.2))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 248)))
+        painter.drawRoundedRect(banner_rect, 7, 7)
+
+        # 提示文字
+        painter.setPen(QPen(QColor(36, 41, 47)))
+        painter.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
+        text = "🔤 识图翻译: 拖选识别区域 | 双击/回车全屏识别 | ESC 取消" if is_ocr else "🎥 屏幕录制: 拖选录制区域 | 双击/回车全屏录制 | ESC 取消"
+        text_rect = QRect(banner_rect.left() + 10, banner_rect.top(), banner_rect.width() - 36, banner_rect.height())
+        painter.drawText(text_rect, Qt.AlignCenter, text)
+
+        # 右侧关闭小按钮 ×
+        m_pos = getattr(self, 'current_mouse_pos', None)
+        is_close_hover = (m_pos is not None and close_btn_rect.contains(m_pos))
+        if is_close_hover:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(240, 243, 246))
+            painter.drawRoundedRect(close_btn_rect, 3, 3)
+
+        painter.setPen(QPen(QColor(220, 38, 38) if is_close_hover else QColor(140, 149, 159), 1.5))
+        cx = close_btn_rect.center().x()
+        cy = close_btn_rect.center().y()
+        d = 4
+        painter.drawLine(cx - d, cy - d, cx + d, cy + d)
+        painter.drawLine(cx + d, cy - d, cx - d, cy + d)
+
+        painter.setBrush(Qt.NoBrush)
+
     def paintEvent(self, event):
         if not hasattr(self, 'original_screen') or self.original_screen is None: return 
         painter = QPainter(self)
@@ -7378,26 +7477,9 @@ class ScreenshotTool(QWidget):
                 for r in outer_region.rects():
                     painter.fillRect(r, mask_color)
 
-            # 3. 顶部指引胶囊条
-            if is_ocr and self.state == "SELECTING":
-                banner_rect = QRect(self.width() // 2 - 270, 20, 540, 38)
-                painter.setPen(QPen(QColor(9, 105, 218), 1.5))
-                painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
-                painter.drawRoundedRect(banner_rect, 9, 9)
-                painter.setPen(QPen(QColor(36, 41, 47)))
-                painter.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-                painter.drawText(banner_rect, Qt.AlignCenter, "🔤 识图翻译：拖选识别区域 | 双击或回车全屏识别 | ESC 取消")
-                painter.setBrush(Qt.NoBrush)
-
-            elif is_rec and self.state == "SELECTING":
-                banner_rect = QRect(self.width() // 2 - 270, 20, 540, 38)
-                painter.setPen(QPen(QColor(239, 68, 68), 1.5))
-                painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
-                painter.drawRoundedRect(banner_rect, 9, 9)
-                painter.setPen(QPen(QColor(36, 41, 47)))
-                painter.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-                painter.drawText(banner_rect, Qt.AlignCenter, "🎥 屏幕录制：拖选录制区域 | 双击或回车全屏录制 | ESC 取消")
-                painter.setBrush(Qt.NoBrush)
+            # 3. 顶部/底部智能避让指引胶囊条（拖选时彻底隐藏，靠近时自动上下对调，点击可关闭）
+            if (is_ocr or is_rec) and self.state == "SELECTING":
+                self._draw_mode_banner(painter, is_ocr, is_rec)
 
             # 4. 选区渲染：选区内部 100% 原屏通透（零遮罩、零底色），配高精边框与取景器角标
             if not self.selection_rect.isNull():
@@ -7546,6 +7628,13 @@ class ScreenshotTool(QWidget):
                 return
         if event.button() != Qt.LeftButton: return
         pos = event.pos()
+
+        # 识图/录屏模式下，点击指引条自身或右侧关闭按钮时即刻关闭该提示，不影响后续选区
+        if (getattr(self, 'ocr_intent', False) or getattr(self, 'recording_intent', False)) and self.state == "SELECTING":
+            if hasattr(self, '_mode_banner_rect') and self._mode_banner_rect and self._mode_banner_rect.contains(pos):
+                self.mode_banner_dismissed = True
+                self.update()
+                return
 
         if self.state == "SELECTING":
             self.color_picker_visible = False
@@ -7733,6 +7822,7 @@ class ScreenshotTool(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.pos()
+        self.current_mouse_pos = pos
         if self.state == "SELECTING":
             if event.buttons() == Qt.LeftButton:
                 self.selection_rect = QRect(self.begin_point, pos).normalized()
