@@ -127,6 +127,10 @@ def load_settings():
         "hotkey_ocr": "F2",
         "hotkey_pin": "F3",
         "hotkey_record": "F4",
+        "hotkey_window_pin": "",
+        "hotkey_scroll": "",
+        "hotkey_history": "",
+        "hotkey_settings": "",
         "default_save_dir": os.path.join(os.path.expanduser("~"), "Pictures"),
         "auto_save_enabled": False,
         "save_format": "png",
@@ -449,6 +453,34 @@ class WindowSnapper:
             pass
         return None, ""
 
+    def detect_top_level_at(self, screen_x, screen_y):
+        try:
+            for w in self.cached_windows:
+                if w['rect'].contains(screen_x, screen_y):
+                    return w['hwnd'], w['rect'], w['title']
+        except Exception:
+            pass
+        try:
+            pt = wintypes.POINT(int(screen_x), int(screen_y))
+            hwnd = _user32.WindowFromPoint(pt)
+            if hwnd:
+                root = _user32.GetAncestor(hwnd, 2)  # GA_ROOT = 2
+                if root and root not in self.exclude_hwnds:
+                    r = _RECT()
+                    hr = _dwmapi.DwmGetWindowAttribute(root, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r))
+                    if hr != 0:
+                        _user32.GetWindowRect(root, ctypes.byref(r))
+                    length = _user32.GetWindowTextLengthW(root)
+                    title = ""
+                    if length > 0:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        _user32.GetWindowTextW(root, buf, length + 1)
+                        title = buf.value.strip()
+                    return root, QRect(r.left, r.top, r.right - r.left, r.bottom - r.top), title
+        except Exception:
+            pass
+        return None, None, ""
+
 
 _global_window_snapper = None
 
@@ -497,6 +529,242 @@ def create_brush_cursor(radius=8):
     p.drawEllipse(2, 2, size - 4, size - 4)
     p.end()
     return QCursor(pix, size // 2, size // 2)
+
+def create_deskpin_cursor():
+    """绘制高精 DeskPin 大头针指针 (红白醒目配色的图钉，针尖定位于 (3, 3))"""
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    # 针尖钢针：自 (3, 3) 延伸至 (12, 12)
+    pen_needle_shadow = QPen(QColor(40, 40, 40, 200), 2.8, Qt.SolidLine, Qt.RoundCap)
+    p.setPen(pen_needle_shadow)
+    p.drawLine(QPointF(3.0, 3.0), QPointF(12.0, 12.0))
+    pen_needle = QPen(QColor(220, 220, 225), 1.6, Qt.SolidLine, Qt.RoundCap)
+    p.setPen(pen_needle)
+    p.drawLine(QPointF(3.5, 3.5), QPointF(11.5, 11.5))
+
+    # 旋转 45 度绘制大头针塑料主体
+    p.save()
+    p.translate(13.0, 13.0)
+    p.rotate(45)
+
+    # 针座基环 (圆环底盘)
+    p.setPen(QPen(QColor(153, 27, 27), 1.2))
+    p.setBrush(QBrush(QColor(220, 38, 38)))
+    p.drawRoundedRect(QRectF(-6.0, -1.0, 12.0, 3.5), 1.5, 1.5)
+
+    # 针柱主体
+    p.setBrush(QBrush(QColor(239, 68, 68)))
+    p.drawRoundedRect(QRectF(-3.5, 2.5, 7.0, 8.0), 1.5, 1.5)
+
+    # 针顶圆顶大帽
+    p.setBrush(QBrush(QColor(248, 113, 113)))
+    p.drawEllipse(QRectF(-5.5, 9.5, 11.0, 6.0))
+
+    p.restore()
+    p.end()
+    return QCursor(pix, 3, 3)
+
+
+class PinToast(QWidget):
+    """置顶/取消置顶浮动状态轻量级提示框"""
+    def __init__(self, text, pinned=True, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.ToolTip | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 8, 14, 8)
+
+        lbl = QLabel(text)
+        bg = "#10b981" if pinned else "#4b5563"
+        lbl.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg};
+                color: #ffffff;
+                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 8px 18px;
+                border-radius: 8px;
+            }}
+        """)
+        layout.addWidget(lbl)
+        self.adjustSize()
+
+        geo = QApplication.primaryScreen().geometry()
+        x = geo.x() + (geo.width() - self.width()) // 2
+        y = geo.y() + 60
+        self.move(x, y)
+
+        QTimer.singleShot(2200, self.close)
+
+
+_active_pin_toast = None
+
+def show_pin_toast(text, pinned=True):
+    global _active_pin_toast
+    try:
+        if _active_pin_toast:
+            _active_pin_toast.close()
+    except Exception:
+        pass
+    _active_pin_toast = PinToast(text, pinned)
+    _active_pin_toast.show()
+
+
+class WindowPinPicker(QWidget):
+    """DeskPin 窗口置顶拾取器：全屏覆盖并吸附顶层窗口，左键切换置顶，右键/ESC 退出"""
+    _instance = None
+
+    @classmethod
+    def start_picking(cls):
+        if cls._instance is not None:
+            try:
+                cls._instance.close()
+            except Exception:
+                pass
+        cls._instance = WindowPinPicker()
+        cls._instance.show()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(create_deskpin_cursor())
+
+        desktop = QApplication.desktop()
+        geom = desktop.geometry() if desktop else QApplication.primaryScreen().geometry()
+        self.setGeometry(geom)
+
+        self.snapper = WindowSnapper(my_pid=os.getpid())
+        self.snapper.exclude_hwnds.add(int(self.winId()))
+        self.snapper.refresh_window_tree()
+
+        self.hovered_hwnd = None
+        self.hovered_rect = None
+        self.hovered_title = ""
+        self.hovered_is_topmost = False
+
+    def mouseMoveEvent(self, event):
+        pos = event.globalPos()
+        hwnd, rect, title = self.snapper.detect_top_level_at(pos.x(), pos.y())
+        if hwnd and hwnd != int(self.winId()):
+            self.hovered_hwnd = hwnd
+            self.hovered_rect = rect
+            self.hovered_title = title
+            try:
+                ex_style = _user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+                self.hovered_is_topmost = bool(ex_style & 0x00000008)  # WS_EX_TOPMOST
+            except Exception:
+                self.hovered_is_topmost = False
+        else:
+            self.hovered_hwnd = None
+            self.hovered_rect = None
+            self.hovered_title = ""
+            self.hovered_is_topmost = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.globalPos()
+            hwnd, rect, title = self.snapper.detect_top_level_at(pos.x(), pos.y())
+            if hwnd and hwnd != int(self.winId()):
+                self.toggle_topmost(hwnd, title)
+            self.close()
+        elif event.button() == Qt.RightButton:
+            self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        super().keyPressEvent(event)
+
+    def toggle_topmost(self, hwnd, title):
+        try:
+            ex_style = _user32.GetWindowLongW(hwnd, -20)
+            is_top = bool(ex_style & 0x00000008)
+            SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+            win_name = title if title else f"窗口 (HWND:{hwnd})"
+            if is_top:
+                _user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, SWP_FLAGS)  # HWND_NOTOPMOST = -2
+                show_pin_toast(f"📌 已取消窗口置顶: {win_name}", pinned=False)
+                logging.info("已取消置顶窗口 %s (HWND %d)", win_name, hwnd)
+            else:
+                _user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, SWP_FLAGS)  # HWND_TOPMOST = -1
+                show_pin_toast(f"📌 已将窗口固定置顶: {win_name}", pinned=True)
+                logging.info("已将窗口置顶 %s (HWND %d)", win_name, hwnd)
+        except Exception as e:
+            logging.error("切换窗口置顶失败: %s", e)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # 细微暗化屏幕背景，增强焦点吸附感
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 30))
+
+        if self.hovered_rect and not self.hovered_rect.isNull():
+            local_tl = self.mapFromGlobal(self.hovered_rect.topLeft())
+            draw_rect = QRect(local_tl.x(), local_tl.y(), self.hovered_rect.width(), self.hovered_rect.height())
+
+            border_color = QColor("#ef4444") if self.hovered_is_topmost else QColor("#0ea5e9")
+            bg_fill = QColor(239, 68, 68, 30) if self.hovered_is_topmost else QColor(14, 165, 233, 30)
+
+            painter.setBrush(QBrush(bg_fill))
+            painter.setPen(QPen(border_color, 3))
+            painter.drawRoundedRect(draw_rect, 4, 4)
+
+            status_text = "📌 窗口当前已置顶 (点击取消置顶)" if self.hovered_is_topmost else "📌 点击将此窗口置顶"
+            disp_title = self.hovered_title[:45] + ("..." if len(self.hovered_title) > 45 else "")
+            badge_text = f"{status_text}  |  {disp_title}" if disp_title else status_text
+
+            font = QFont("Microsoft YaHei UI", 9, QFont.Bold)
+            painter.setFont(font)
+            fm = QFontMetrics(font)
+            bw = fm.horizontalAdvance(badge_text) + 24
+            bh = 30
+            bx = max(10, min(draw_rect.left(), self.width() - bw - 10))
+            by = draw_rect.top() - bh - 8
+            if by < 10:
+                by = draw_rect.top() + 10
+
+            badge_rect = QRect(bx, by, bw, bh)
+            painter.setPen(Qt.NoPen)
+            badge_bg = QColor(220, 38, 38, 235) if self.hovered_is_topmost else QColor(15, 23, 42, 235)
+            painter.setBrush(QBrush(badge_bg))
+            painter.drawRoundedRect(badge_rect, 6, 6)
+
+            painter.setPen(QPen(Qt.white))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+        # 屏幕顶部操作指引卡片
+        banner_font = QFont("Microsoft YaHei UI", 10, QFont.Bold)
+        painter.setFont(banner_font)
+        bfm = QFontMetrics(banner_font)
+        inst_text = "📌 窗口置顶模式 (DeskPin)：点击任意窗口切换置顶状态  |  右键或 ESC 退出"
+        iw = bfm.horizontalAdvance(inst_text) + 36
+        ih = 36
+        ix = (self.width() - iw) // 2
+        iy = 20
+        inst_rect = QRect(ix, iy, iw, ih)
+
+        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
+        painter.setBrush(QBrush(QColor(24, 24, 27, 235)))
+        painter.drawRoundedRect(inst_rect, 8, 8)
+
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(inst_rect, Qt.AlignCenter, inst_text)
+
+    def closeEvent(self, event):
+        WindowPinPicker._instance = None
+        super().closeEvent(event)
+
 
 def draw_viewfinder_corners(painter, rect, color, length=14, width=3):
     """在选区四角绘制高精相机取景框角标"""
@@ -2479,6 +2747,19 @@ class VectorIconFactory:
             p.drawEllipse(QRectF(4.5, 4.5, 18.0, 18.0))
             p.drawLine(QPointF(13.5, 13.5), QPointF(13.5, 8.5))
             p.drawLine(QPointF(13.5, 13.5), QPointF(17.5, 13.5))
+        elif name == 'window_pin':
+            p.drawRoundedRect(QRectF(4.0, 5.0, 19.0, 17.0), 2.0, 2.0)
+            p.drawLine(QPointF(4.0, 9.5), QPointF(23.0, 9.5))
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QRectF(6.5, 6.8, 1.5, 1.5))
+            p.drawEllipse(QRectF(9.5, 6.8, 1.5, 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawLine(QPointF(13.5, 19.5), QPointF(13.5, 12.0))
+            arr = QPainterPath()
+            arr.moveTo(10.0, 15.0)
+            arr.lineTo(13.5, 11.5)
+            arr.lineTo(17.0, 15.0)
+            p.drawPath(arr)
 
         p.end()
         return pm
@@ -2729,6 +3010,11 @@ class SnipasteToolbar(QWidget):
         self.btn_history = self._create_btn("history", "截图历史", checkable=False)
         self.btn_history.clicked.connect(lambda: self.action_triggered.emit('HISTORY'))
         layout.addWidget(self.btn_history)
+
+        # 15. 窗口置顶 (DeskPin)
+        self.btn_win_pin = self._create_btn("window_pin", "窗口置顶 (DeskPin: 点击任意窗口将其置顶)", checkable=False)
+        self.btn_win_pin.clicked.connect(lambda: self.action_triggered.emit('WINDOW_PIN'))
+        layout.addWidget(self.btn_win_pin)
 
         # 分隔线 3: 1 × 24 px, #D4D4D4
         layout.addWidget(self._create_divider())
@@ -4904,14 +5190,205 @@ class HistoryDialog(QDialog):
             self.populate_cards()
 
 
+class _HotkeyInnerEdit(QLineEdit):
+    keyRecorded = pyqtSignal(str)
+    recordingCancelled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self._recording = False
+        self._original_val = ""
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.start_recording()
+        super().mousePressEvent(event)
+
+    def start_recording(self):
+        self._recording = True
+        self._original_val = self.text()
+        self.setText("请按下键盘快捷键...")
+        self.setStyleSheet("border: 2px solid #0969da; background: #f0f7ff; color: #0969da; font-weight: 600;")
+
+    def stop_recording(self, restore=True):
+        if self._recording:
+            self._recording = False
+            self.setStyleSheet("")
+            if restore:
+                self.setText(self._original_val)
+                self.recordingCancelled.emit()
+
+    def focusOutEvent(self, event):
+        if self._recording:
+            self.stop_recording(restore=True)
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self._recording:
+            super().keyPressEvent(event)
+            return
+
+        key = event.key()
+        modifiers = event.modifiers()
+
+        if key == Qt.Key_Escape:
+            self.stop_recording(restore=True)
+            return
+
+        # Backspace or Delete without modifiers -> clear hotkey
+        if key in (Qt.Key_Backspace, Qt.Key_Delete) and not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)):
+            self._recording = False
+            self.setStyleSheet("")
+            self.setText("")
+            self.keyRecorded.emit("")
+            return
+
+        # Modifier key only -> show feedback
+        mod_names = []
+        if modifiers & Qt.ControlModifier:
+            mod_names.append("Ctrl")
+        if modifiers & Qt.AltModifier:
+            mod_names.append("Alt")
+        if modifiers & Qt.ShiftModifier:
+            mod_names.append("Shift")
+        if modifiers & Qt.MetaModifier:
+            mod_names.append("Win")
+
+        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            if mod_names:
+                self.setText(" + ".join(mod_names) + " + ...")
+            return
+
+        # Regular or function key
+        key_name = ""
+        if Qt.Key_F1 <= key <= Qt.Key_F24:
+            f_num = key - Qt.Key_F1 + 1
+            key_name = f"F{f_num}"
+        elif Qt.Key_A <= key <= Qt.Key_Z:
+            key_name = chr(key).upper()
+        elif Qt.Key_0 <= key <= Qt.Key_9:
+            key_name = chr(key)
+        else:
+            KEY_NAME_MAP = {
+                Qt.Key_Space: "Space",
+                Qt.Key_Tab: "Tab",
+                Qt.Key_Return: "Enter",
+                Qt.Key_Enter: "Enter",
+                Qt.Key_Print: "PrintScreen",
+                Qt.Key_Insert: "Insert",
+                Qt.Key_Home: "Home",
+                Qt.Key_End: "End",
+                Qt.Key_PageUp: "PageUp",
+                Qt.Key_PageDown: "PageDown",
+                Qt.Key_Left: "Left",
+                Qt.Key_Right: "Right",
+                Qt.Key_Up: "Up",
+                Qt.Key_Down: "Down",
+                Qt.Key_Minus: "-",
+                Qt.Key_Equal: "=",
+                Qt.Key_BracketLeft: "[",
+                Qt.Key_BracketRight: "]",
+                Qt.Key_Backslash: "\\",
+                Qt.Key_Semicolon: ";",
+                Qt.Key_Apostrophe: "'",
+                Qt.Key_Comma: ",",
+                Qt.Key_Period: ".",
+                Qt.Key_Slash: "/",
+                Qt.Key_QuoteLeft: "`",
+            }
+            key_name = KEY_NAME_MAP.get(key, "")
+
+        if not key_name:
+            txt = event.text().strip().upper()
+            if txt and len(txt) == 1:
+                key_name = txt
+
+        if key_name:
+            parts = mod_names[:]
+            if key_name not in parts:
+                parts.append(key_name)
+            final_hotkey = "+".join(parts)
+            self._recording = False
+            self.setStyleSheet("")
+            self.setText(final_hotkey)
+            self.keyRecorded.emit(final_hotkey)
+
+
+class HotkeyRecorderWidget(QWidget):
+    hotkeyChanged = pyqtSignal(str)
+
+    def __init__(self, placeholder="未绑定 (点击录制)", parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.edit = _HotkeyInnerEdit(self)
+        self.edit.setFixedHeight(32)
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.keyRecorded.connect(self._on_recorded)
+        self.edit.recordingCancelled.connect(self._update_clear_btn)
+        layout.addWidget(self.edit, 1)
+
+        self.btn_clear = QPushButton("×")
+        self.btn_clear.setFixedSize(28, 28)
+        self.btn_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_clear.setToolTip("清除快捷键")
+        self.btn_clear.setStyleSheet("""
+            QPushButton {
+                background: #f1f3f5;
+                color: #6c757d;
+                border: 1px solid #d0d7de;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: bold;
+                padding-bottom: 2px;
+            }
+            QPushButton:hover {
+                background: #ffebe9;
+                color: #cf222e;
+                border-color: #ff8182;
+            }
+        """)
+        self.btn_clear.clicked.connect(self.clear)
+        layout.addWidget(self.btn_clear)
+
+        self._update_clear_btn()
+
+    def _on_recorded(self, val):
+        self._update_clear_btn()
+        self.hotkeyChanged.emit(val)
+
+    def _update_clear_btn(self):
+        val = self.edit.text().strip()
+        self.btn_clear.setVisible(bool(val and val != "请按下键盘快捷键..."))
+
+    def text(self):
+        t = self.edit.text().strip()
+        if t == "请按下键盘快捷键...":
+            return ""
+        return t
+
+    def setText(self, val):
+        self.edit.setText(val or "")
+        self._update_clear_btn()
+
+    def clear(self):
+        self.edit.setText("")
+        self._update_clear_btn()
+        self.hotkeyChanged.emit("")
+
+
 class SettingsDialog(QDialog):
     """系统偏好设置面板：快捷键自定义、默认保存目录与画质、智谱 GLM-OCR 及火山方舟豆包配置"""
     def __init__(self, parent=None, hotkey_mgr=None):
         super().__init__(parent)
         self.hotkey_mgr = hotkey_mgr
         self.setWindowTitle("⚙ 系统设置 - Capture")
-        self.resize(580, 600)
-        self.setMinimumSize(460, 380)
+        self.resize(600, 640)
+        self.setMinimumSize(480, 420)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("""
             QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
@@ -4973,42 +5450,58 @@ class SettingsDialog(QDialog):
         content_layout.setContentsMargins(4, 4, 10, 4)
         content_layout.setSpacing(14)
 
-        # 1. 全局快捷键分组
-        hk_group = QGroupBox("⌨ 全局快捷键自定义")
+        # 1. 全局快捷键分组 (按键录制模式，支持全部 8 项功能)
+        hk_group = QGroupBox("⌨ 全局快捷键自定义 (点击输入框直接按下按键录制)")
         hk_layout = QGridLayout(hk_group)
         hk_layout.setContentsMargins(14, 16, 14, 14)
         hk_layout.setSpacing(10)
 
-        hk_layout.addWidget(QLabel("截屏快捷键:"), 0, 0)
-        self.input_hk_snip = QLineEdit()
-        self.input_hk_snip.setFixedHeight(32)
-        self.input_hk_snip.setPlaceholderText("例如: F1 或 Ctrl+Alt+A")
+        # 0: 屏幕截图 (默认 F1)
+        hk_layout.addWidget(QLabel("屏幕截图:"), 0, 0)
+        self.input_hk_snip = HotkeyRecorderWidget("未绑定 (默认 F1)")
         hk_layout.addWidget(self.input_hk_snip, 0, 1)
 
+        # 1: 识图翻译 (默认 F2)
         hk_layout.addWidget(QLabel("识图/翻译:"), 1, 0)
-        self.input_hk_ocr = QLineEdit()
-        self.input_hk_ocr.setFixedHeight(32)
-        self.input_hk_ocr.setPlaceholderText("例如: F2")
+        self.input_hk_ocr = HotkeyRecorderWidget("未绑定 (默认 F2)")
         hk_layout.addWidget(self.input_hk_ocr, 1, 1)
 
+        # 2: 贴图置顶 (默认 F3)
         hk_layout.addWidget(QLabel("贴图置顶:"), 2, 0)
-        self.input_hk_pin = QLineEdit()
-        self.input_hk_pin.setFixedHeight(32)
-        self.input_hk_pin.setPlaceholderText("例如: F3")
+        self.input_hk_pin = HotkeyRecorderWidget("未绑定 (默认 F3)")
         hk_layout.addWidget(self.input_hk_pin, 2, 1)
 
+        # 3: 屏幕录制 (默认 F4)
         hk_layout.addWidget(QLabel("屏幕录制:"), 3, 0)
-        self.input_hk_rec = QLineEdit()
-        self.input_hk_rec.setFixedHeight(32)
-        self.input_hk_rec.setPlaceholderText("例如: F4")
+        self.input_hk_rec = HotkeyRecorderWidget("未绑定 (默认 F4)")
         hk_layout.addWidget(self.input_hk_rec, 3, 1)
 
-        btn_reset_hk = QPushButton("恢复默认快捷键 (F1~F4)")
+        # 4: 窗口置顶 (DeskPin)
+        hk_layout.addWidget(QLabel("窗口置顶 (DeskPin):"), 4, 0)
+        self.input_hk_win_pin = HotkeyRecorderWidget("未绑定 (点击录制)")
+        hk_layout.addWidget(self.input_hk_win_pin, 4, 1)
+
+        # 5: 滚动长截图
+        hk_layout.addWidget(QLabel("滚动长截图:"), 5, 0)
+        self.input_hk_scroll = HotkeyRecorderWidget("未绑定 (点击录制)")
+        hk_layout.addWidget(self.input_hk_scroll, 5, 1)
+
+        # 6: 截图历史
+        hk_layout.addWidget(QLabel("截图历史:"), 6, 0)
+        self.input_hk_history = HotkeyRecorderWidget("未绑定 (点击录制)")
+        hk_layout.addWidget(self.input_hk_history, 6, 1)
+
+        # 7: 打开系统设置
+        hk_layout.addWidget(QLabel("打开系统设置:"), 7, 0)
+        self.input_hk_settings = HotkeyRecorderWidget("未绑定 (点击录制)")
+        hk_layout.addWidget(self.input_hk_settings, 7, 1)
+
+        btn_reset_hk = QPushButton("恢复默认快捷键 (仅基础功能 F1~F4)")
         btn_reset_hk.setFixedHeight(30)
         btn_reset_hk.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_reset_hk)
         btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
-        hk_layout.addWidget(btn_reset_hk, 4, 1, Qt.AlignRight)
+        hk_layout.addWidget(btn_reset_hk, 8, 1, Qt.AlignRight)
 
         content_layout.addWidget(hk_group)
 
@@ -5170,6 +5663,10 @@ class SettingsDialog(QDialog):
         self.input_hk_ocr.setText(s.get("hotkey_ocr", "F2"))
         self.input_hk_pin.setText(s.get("hotkey_pin", "F3"))
         self.input_hk_rec.setText(s.get("hotkey_record", "F4"))
+        self.input_hk_win_pin.setText(s.get("hotkey_window_pin", ""))
+        self.input_hk_scroll.setText(s.get("hotkey_scroll", ""))
+        self.input_hk_history.setText(s.get("hotkey_history", ""))
+        self.input_hk_settings.setText(s.get("hotkey_settings", ""))
 
         self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
         self.cb_auto_save.setChecked(s.get("auto_save_enabled", False))
@@ -5197,6 +5694,10 @@ class SettingsDialog(QDialog):
         self.input_hk_ocr.setText("F2")
         self.input_hk_pin.setText("F3")
         self.input_hk_rec.setText("F4")
+        self.input_hk_win_pin.setText("")
+        self.input_hk_scroll.setText("")
+        self.input_hk_history.setText("")
+        self.input_hk_settings.setText("")
 
     def _browse_save_dir(self):
         chosen = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.input_save_dir.text())
@@ -5212,6 +5713,10 @@ class SettingsDialog(QDialog):
             "hotkey_ocr": self.input_hk_ocr.text().strip() or "F2",
             "hotkey_pin": self.input_hk_pin.text().strip() or "F3",
             "hotkey_record": self.input_hk_rec.text().strip() or "F4",
+            "hotkey_window_pin": self.input_hk_win_pin.text().strip(),
+            "hotkey_scroll": self.input_hk_scroll.text().strip(),
+            "hotkey_history": self.input_hk_history.text().strip(),
+            "hotkey_settings": self.input_hk_settings.text().strip(),
             "default_save_dir": self.input_save_dir.text().strip(),
             "auto_save_enabled": self.cb_auto_save.isChecked(),
             "show_mode_hints": self.cb_show_mode_hints.isChecked(),
@@ -6157,12 +6662,24 @@ class RecordingExportDialog(QDialog):
         super().closeEvent(event)
 
 def parse_hotkey_to_native(hotkey_str):
-    """解析如 'F1', 'Ctrl+Alt+A', 'Shift+F2' 等快捷键字符串为 Windows 原生 MOD 掩码与 VK 键码"""
-    if not hotkey_str:
+    """解析如 'F1', 'Ctrl+Alt+A', 'Shift+F2', 'Win+Shift+S' 等快捷键字符串为 Windows 原生 MOD 掩码与 VK 键码"""
+    if not hotkey_str or not hotkey_str.strip():
         return 0, 0
     parts = [p.strip().lower() for p in hotkey_str.split('+')]
     mod = 0x4000  # MOD_NOREPEAT
     vk = 0
+    VK_MAP = {
+        'backspace': 0x08, 'tab': 0x09, 'clear': 0x0C, 'return': 0x0D, 'enter': 0x0D,
+        'pause': 0x13, 'capslock': 0x14, 'caps_lock': 0x14, 'escape': 0x1B, 'esc': 0x1B,
+        'space': 0x20, 'pageup': 0x21, 'pagedown': 0x22, 'end': 0x23, 'home': 0x24,
+        'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'select': 0x29,
+        'print': 0x2A, 'execute': 0x2B, 'printscreen': 0x2C, 'prtscr': 0x2C,
+        'insert': 0x2D, 'delete': 0x2E, 'del': 0x2E, 'help': 0x2F,
+        'multiply': 0x6A, 'add': 0x6B, 'separator': 0x6C, 'subtract': 0x6D,
+        'decimal': 0x6E, 'divide': 0x6F,
+        ';': 0xBA, '=': 0xBB, ',': 0xBC, '-': 0xBD, '.': 0xBE, '/': 0xBF, '`': 0xC0,
+        '[': 0xDB, '\\': 0xDC, ']': 0xDD, "'": 0xDE,
+    }
     for p in parts:
         if p in ['ctrl', 'control']:
             mod |= 0x0002
@@ -6170,20 +6687,16 @@ def parse_hotkey_to_native(hotkey_str):
             mod |= 0x0001
         elif p == 'shift':
             mod |= 0x0004
-        elif p in ['win', 'windows']:
+        elif p in ['win', 'windows', 'meta']:
             mod |= 0x0008
         elif p.startswith('f') and p[1:].isdigit():
             f_num = int(p[1:])
             if 1 <= f_num <= 24:
                 vk = 0x70 + (f_num - 1)
+        elif p in VK_MAP:
+            vk = VK_MAP[p]
         elif len(p) == 1 and p.isalnum():
             vk = ord(p.upper())
-        elif p == 'space':
-            vk = 0x20
-        elif p == 'esc':
-            vk = 0x1B
-        elif p in ['printscreen', 'prtscr']:
-            vk = 0x2C
     return mod, vk
 
 
@@ -6194,16 +6707,19 @@ class GlobalHotkeyManager(QObject):
     优势：
     1. 不依赖易被系统静默卸载的低级键盘钩子 (WH_KEYBOARD_LL)。
     2. 无需周期性 unhook_all 刷新，彻底解决快捷键失效、打字卡顿与丢键问题。
-    3. F1 (截图)、F3 (贴图) 原生常驻；Space 和 Esc 仅在滚动截图期间动态启用，
-       绝不影响用户在日常使用、游戏、IDE 中的正常按键（特别是 Esc 键）。
+    3. 支持全部 8 项基础与扩展功能绑定，默认 F1~F4 注册生效。
     4. 若原生 API 注册冲突，自动降级为 keyboard 库作为兜底。
     """
-    on_hotkey_pressed = pyqtSignal()  # F1: 截图
-    on_ocr_pressed = pyqtSignal()     # F2: 文字识别与翻译
-    on_record_pressed = pyqtSignal()  # F4: 录屏
-    on_stop_scroll = pyqtSignal()     # Esc: 取消滚动截图
-    on_pin_pressed = pyqtSignal()     # F3: 贴图
-    on_space_pressed = pyqtSignal()   # Space: 滚动截图开始/停止
+    on_hotkey_pressed = pyqtSignal()   # F1: 截图
+    on_ocr_pressed = pyqtSignal()      # F2: 文字识别与翻译
+    on_record_pressed = pyqtSignal()   # F4: 录屏
+    on_stop_scroll = pyqtSignal()      # Esc: 取消滚动截图
+    on_pin_pressed = pyqtSignal()      # F3: 贴图
+    on_space_pressed = pyqtSignal()    # Space: 滚动截图开始/停止
+    on_win_pin_pressed = pyqtSignal()  # 窗口置顶 (DeskPin)
+    on_scroll_pressed = pyqtSignal()   # 滚动长截图
+    on_history_pressed = pyqtSignal()  # 截图历史
+    on_settings_pressed = pyqtSignal() # 打开系统设置
 
     HOTKEY_F1_ID = 101
     HOTKEY_F3_ID = 102
@@ -6211,6 +6727,10 @@ class GlobalHotkeyManager(QObject):
     HOTKEY_ESC_ID = 104
     HOTKEY_F4_ID = 105
     HOTKEY_F2_ID = 106
+    HOTKEY_WIN_PIN_ID = 107
+    HOTKEY_SCROLL_ID = 108
+    HOTKEY_HISTORY_ID = 109
+    HOTKEY_SETTINGS_ID = 110
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6259,11 +6779,19 @@ class GlobalHotkeyManager(QObject):
         hk_ocr = settings.get("hotkey_ocr", "F2")
         hk_pin = settings.get("hotkey_pin", "F3")
         hk_rec = settings.get("hotkey_record", "F4")
+        hk_win_pin = settings.get("hotkey_window_pin", "")
+        hk_scroll = settings.get("hotkey_scroll", "")
+        hk_hist = settings.get("hotkey_history", "")
+        hk_sett = settings.get("hotkey_settings", "")
 
         self._register_one_hotkey(self.HOTKEY_F1_ID, hk_snip, self.trigger_snip)
         self._register_one_hotkey(self.HOTKEY_F2_ID, hk_ocr, self.trigger_ocr)
         self._register_one_hotkey(self.HOTKEY_F3_ID, hk_pin, self.trigger_pin)
         self._register_one_hotkey(self.HOTKEY_F4_ID, hk_rec, self.trigger_record)
+        self._register_one_hotkey(self.HOTKEY_WIN_PIN_ID, hk_win_pin, self.trigger_win_pin)
+        self._register_one_hotkey(self.HOTKEY_SCROLL_ID, hk_scroll, self.trigger_scroll)
+        self._register_one_hotkey(self.HOTKEY_HISTORY_ID, hk_hist, self.trigger_history)
+        self._register_one_hotkey(self.HOTKEY_SETTINGS_ID, hk_sett, self.trigger_settings)
 
     def reload_hotkeys(self):
         for hid in list(self._registered_native_ids):
@@ -6338,6 +6866,14 @@ class GlobalHotkeyManager(QObject):
             self.trigger_pin()
         elif hotkey_id == self.HOTKEY_F4_ID:
             self.trigger_record()
+        elif hotkey_id == self.HOTKEY_WIN_PIN_ID:
+            self.trigger_win_pin()
+        elif hotkey_id == self.HOTKEY_SCROLL_ID:
+            self.trigger_scroll()
+        elif hotkey_id == self.HOTKEY_HISTORY_ID:
+            self.trigger_history()
+        elif hotkey_id == self.HOTKEY_SETTINGS_ID:
+            self.trigger_settings()
         elif hotkey_id == self.HOTKEY_SPACE_ID:
             self.trigger_space()
         elif hotkey_id == self.HOTKEY_ESC_ID:
@@ -6370,6 +6906,34 @@ class GlobalHotkeyManager(QObject):
             self.on_pin_pressed.emit()
         except Exception as e:
             logging.error("F3 触发异常: %s", e)
+
+    def trigger_win_pin(self):
+        try:
+            logging.info("触发窗口置顶热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_win_pin_pressed.emit()
+        except Exception as e:
+            logging.error("窗口置顶热键触发异常: %s", e)
+
+    def trigger_scroll(self):
+        try:
+            logging.info("触发滚动截图热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_scroll_pressed.emit()
+        except Exception as e:
+            logging.error("滚动截图热键触发异常: %s", e)
+
+    def trigger_history(self):
+        try:
+            logging.info("触发截图历史热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_history_pressed.emit()
+        except Exception as e:
+            logging.error("截图历史热键触发异常: %s", e)
+
+    def trigger_settings(self):
+        try:
+            logging.info("触发系统设置热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_settings_pressed.emit()
+        except Exception as e:
+            logging.error("系统设置热键触发异常: %s", e)
 
     def trigger_space(self):
         try:
@@ -6547,6 +7111,7 @@ class ScreenshotTool(QWidget):
         self.btn_scroll = self.toolbar.btn_scroll
         self.btn_record = self.toolbar.btn_record
         self.btn_history = self.toolbar.btn_history
+        self.btn_win_pin = getattr(self.toolbar, 'btn_win_pin', None)
         self.btn_pin = self.toolbar.btn_pin
         self.btn_save = self.toolbar.btn_save
         self.btn_copy = self.toolbar.btn_copy
@@ -6577,6 +7142,8 @@ class ScreenshotTool(QWidget):
             self.activate_recording()
         elif action_name == 'HISTORY':
             self.show_history_dialog()
+        elif action_name == 'WINDOW_PIN':
+            self.activate_window_pin()
         elif action_name == 'CLOSE':
             self.hide_app(keep_history=False)
         elif action_name == 'PIN':
@@ -6825,6 +7392,19 @@ class ScreenshotTool(QWidget):
 
         # 2. 否则进入快速文字识别选区模式 (完全免除深色遮罩)
         self.activate_capture(ocr_intent=True)
+
+    def activate_window_pin(self):
+        """激活窗口置顶拾取模式 (DeskPin)"""
+        if self.isVisible():
+            self.hide_app(keep_history=False)
+        WindowPinPicker.start_picking()
+
+    def activate_scroll_capture(self):
+        """激活滚动长截图模式"""
+        if self.state == "EDITING" and hasattr(self, 'selection_rect') and not self.selection_rect.isNull() and self.selection_rect.width() >= SCROLL_MIN_CAPTURE_SIZE and self.selection_rect.height() >= SCROLL_MIN_CAPTURE_SIZE:
+            self.start_scroll()
+            return
+        self.activate_capture()
 
     def start_quick_ocr_session(self, target_rect, pre_pixmap=None):
         """对目标矩形区域执行高精 OCR 识别并弹出多语言翻译窗口"""
@@ -8661,18 +9241,25 @@ class AppTrayIcon(QSystemTrayIcon):
         self.setToolTip("Capture (F1 截图 | F2 识图翻译 | F4 录屏 | F3 贴图)")
         
         menu = QMenu()
-        snip_action = QAction("✂ 开始截图 (F1)", menu)
+        snip_action = QAction("✂ 开始截图", menu)
         snip_action.triggered.connect(self.main_app.activate_capture)
         menu.addAction(snip_action)
-        ocr_action = QAction("🔤 识图翻译 (F2)", menu)
+        ocr_action = QAction("🔤 识图翻译", menu)
         ocr_action.triggered.connect(self.main_app.activate_ocr)
         menu.addAction(ocr_action)
-        rec_action = QAction("🎥 屏幕录制 (F4)", menu)
+        rec_action = QAction("🎥 屏幕录制", menu)
         rec_action.triggered.connect(self.main_app.activate_recording)
         menu.addAction(rec_action)
-        pin_action = QAction("📌 贴图置顶 (F3)", menu)
+        pin_action = QAction("📌 贴图置顶", menu)
         pin_action.triggered.connect(self.main_app.hotkey_pin)
         menu.addAction(pin_action)
+        menu.addSeparator()
+        win_pin_action = QAction("📌 窗口置顶 (DeskPin)", menu)
+        win_pin_action.triggered.connect(self.main_app.activate_window_pin)
+        menu.addAction(win_pin_action)
+        scroll_action = QAction("📜 滚动截图 (Scroll)", menu)
+        scroll_action.triggered.connect(self.main_app.activate_scroll_capture)
+        menu.addAction(scroll_action)
         menu.addSeparator()
         history_action = QAction("📜 截图历史 (History)", menu)
         history_action.triggered.connect(self.main_app.show_history_dialog)
@@ -8774,6 +9361,10 @@ if __name__ == '__main__':
         hotkey_mgr.on_stop_scroll.connect(ex.stop_trigger)
         hotkey_mgr.on_pin_pressed.connect(ex.hotkey_pin)
         hotkey_mgr.on_space_pressed.connect(ex.toggle_auto_scroll_capture)
+        hotkey_mgr.on_win_pin_pressed.connect(ex.activate_window_pin)
+        hotkey_mgr.on_scroll_pressed.connect(ex.activate_scroll_capture)
+        hotkey_mgr.on_history_pressed.connect(ex.show_history_dialog)
+        hotkey_mgr.on_settings_pressed.connect(ex.show_settings_dialog)
 
         sys.exit(app.exec_())
     except Exception as e:
