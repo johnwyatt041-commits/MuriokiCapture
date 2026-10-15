@@ -312,6 +312,19 @@ _user32.IsIconic.restype = wintypes.BOOL
 _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
 _user32.GetWindowRect.restype = wintypes.BOOL
 
+_user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+_user32.SetWindowPos.restype = wintypes.BOOL
+_user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongW.restype = wintypes.LONG
+_user32.BringWindowToTop.argtypes = [wintypes.HWND]
+_user32.BringWindowToTop.restype = wintypes.BOOL
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.restype = wintypes.BOOL
+
+HWND_TOPMOST = wintypes.HWND(-1)
+HWND_NOTOPMOST = wintypes.HWND(-2)
+WS_EX_TOPMOST = 0x00000008
+
 try:
     _user32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
     _user32.OpenWindowStationW.restype = wintypes.HANDLE
@@ -454,31 +467,51 @@ class WindowSnapper:
         return None, ""
 
     def detect_top_level_at(self, screen_x, screen_y):
+        ensure_interactive_desktop()
+        found = None
+        my_pid = self.my_pid
+
+        def enum_cb(h, _):
+            nonlocal found
+            if h in self.exclude_hwnds:
+                return True
+            if not _user32.IsWindowVisible(h) or _user32.IsIconic(h):
+                return True
+            pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if pid.value == my_pid:
+                return True
+
+            buf = ctypes.create_unicode_buffer(256)
+            _user32.GetClassNameW(h, buf, 256)
+            cls = buf.value
+            if cls in ['Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd']:
+                return True
+
+            r = _RECT()
+            hr = _dwmapi.DwmGetWindowAttribute(h, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r))
+            if hr != 0:
+                _user32.GetWindowRect(h, ctypes.byref(r))
+
+            w = r.right - r.left
+            height = r.bottom - r.top
+            if w >= 40 and height >= 40 and r.left <= screen_x < r.right and r.top <= screen_y < r.bottom:
+                _user32.GetWindowTextW(h, buf, 256)
+                title = buf.value.strip()
+                ex = _user32.GetWindowLongW(h, -20)
+                if not title and (ex & 0x00000080):  # WS_EX_TOOLWINDOW
+                    return True
+                found = (h, QRect(r.left, r.top, w, height), title)
+                return False
+            return True
+
         try:
-            for w in self.cached_windows:
-                if w['rect'].contains(screen_x, screen_y):
-                    return w['hwnd'], w['rect'], w['title']
+            _user32.EnumWindows(_WNDENUMPROC(enum_cb), 0)
         except Exception:
             pass
-        try:
-            pt = wintypes.POINT(int(screen_x), int(screen_y))
-            hwnd = _user32.WindowFromPoint(pt)
-            if hwnd:
-                root = _user32.GetAncestor(hwnd, 2)  # GA_ROOT = 2
-                if root and root not in self.exclude_hwnds:
-                    r = _RECT()
-                    hr = _dwmapi.DwmGetWindowAttribute(root, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r))
-                    if hr != 0:
-                        _user32.GetWindowRect(root, ctypes.byref(r))
-                    length = _user32.GetWindowTextLengthW(root)
-                    title = ""
-                    if length > 0:
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        _user32.GetWindowTextW(root, buf, length + 1)
-                        title = buf.value.strip()
-                    return root, QRect(r.left, r.top, r.right - r.left, r.bottom - r.top), title
-        except Exception:
-            pass
+
+        if found:
+            return found
         return None, None, ""
 
 
@@ -595,7 +628,8 @@ class PinToast(QWidget):
         layout.addWidget(lbl)
         self.adjustSize()
 
-        geo = QApplication.primaryScreen().geometry()
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        geo = screen.geometry()
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + 60
         self.move(x, y)
@@ -642,9 +676,7 @@ class WindowPinPicker(QWidget):
         geom = desktop.geometry() if desktop else QApplication.primaryScreen().geometry()
         self.setGeometry(geom)
 
-        self.snapper = WindowSnapper(my_pid=os.getpid())
-        self.snapper.exclude_hwnds.add(int(self.winId()))
-        self.snapper.refresh_window_tree()
+        self.snapper = WindowSnapper(my_pid=os.getpid(), exclude_hwnds={int(self.winId())})
 
         self.hovered_hwnd = None
         self.hovered_rect = None
@@ -660,7 +692,7 @@ class WindowPinPicker(QWidget):
             self.hovered_title = title
             try:
                 ex_style = _user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-                self.hovered_is_topmost = bool(ex_style & 0x00000008)  # WS_EX_TOPMOST
+                self.hovered_is_topmost = bool(ex_style & WS_EX_TOPMOST)
             except Exception:
                 self.hovered_is_topmost = False
         else:
@@ -688,17 +720,29 @@ class WindowPinPicker(QWidget):
     def toggle_topmost(self, hwnd, title):
         try:
             ex_style = _user32.GetWindowLongW(hwnd, -20)
-            is_top = bool(ex_style & 0x00000008)
-            SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+            is_top = bool(ex_style & WS_EX_TOPMOST)
+            SWP_FLAGS = 0x0001 | 0x0002  # SWP_NOSIZE | SWP_NOMOVE
             win_name = title if title else f"窗口 (HWND:{hwnd})"
             if is_top:
-                _user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, SWP_FLAGS)  # HWND_NOTOPMOST = -2
-                show_pin_toast(f"📌 已取消窗口置顶: {win_name}", pinned=False)
-                logging.info("已取消置顶窗口 %s (HWND %d)", win_name, hwnd)
+                res = _user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_FLAGS)
+                ex_after = _user32.GetWindowLongW(hwnd, -20)
+                still_top = bool(ex_after & WS_EX_TOPMOST)
+                if not still_top or res:
+                    show_pin_toast(f"📌 已取消窗口置顶: {win_name}", pinned=False)
+                    logging.info("已成功取消置顶窗口 %s (HWND %d, res=%s)", win_name, hwnd, res)
+                else:
+                    logging.warning("取消置顶窗口失败 %s (HWND %d, res=%s)", win_name, hwnd, res)
             else:
-                _user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, SWP_FLAGS)  # HWND_TOPMOST = -1
-                show_pin_toast(f"📌 已将窗口固定置顶: {win_name}", pinned=True)
-                logging.info("已将窗口置顶 %s (HWND %d)", win_name, hwnd)
+                res = _user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
+                _user32.BringWindowToTop(hwnd)
+                _user32.SetForegroundWindow(hwnd)
+                ex_after = _user32.GetWindowLongW(hwnd, -20)
+                now_top = bool(ex_after & WS_EX_TOPMOST)
+                if now_top or res:
+                    show_pin_toast(f"📌 已将窗口固定置顶: {win_name}", pinned=True)
+                    logging.info("已成功将窗口固定置顶 %s (HWND %d, res=%s)", win_name, hwnd, res)
+                else:
+                    logging.warning("置顶窗口失败 %s (HWND %d, res=%s)", win_name, hwnd, res)
         except Exception as e:
             logging.error("切换窗口置顶失败: %s", e)
 
