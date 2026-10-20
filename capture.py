@@ -28,6 +28,8 @@ for _dll_name in ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msv
             pass
 import re
 import json
+import hashlib
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -46,22 +48,26 @@ import shutil
 import subprocess
 import logging # 引入日志模块
 from logging.handlers import RotatingFileHandler
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # RapidOCR 离线引擎懒加载单例（高精度中文/英文识别，首次 OCR 时再按需加载，彻底杜绝冷启动卡顿）
 _RAPID_OCR_ENGINE = None
 _RAPID_OCR_TRIED = False
+_RAPID_OCR_LOCK = threading.Lock()
+_RAPID_OCR_INFER_LOCK = threading.Lock()
 
 def get_rapid_ocr_engine():
     global _RAPID_OCR_ENGINE, _RAPID_OCR_TRIED
     if not _RAPID_OCR_TRIED:
-        _RAPID_OCR_TRIED = True
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _RAPID_OCR_ENGINE = RapidOCR()
-            logging.info("RapidOCR 引擎按需懒加载成功")
-        except Exception as _ocr_pre_err:
-            logging.warning("RapidOCR 引擎加载失败: %s", _ocr_pre_err)
+        with _RAPID_OCR_LOCK:
+            if not _RAPID_OCR_TRIED:
+                _RAPID_OCR_TRIED = True
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+                    _RAPID_OCR_ENGINE = RapidOCR()
+                    logging.info("RapidOCR 引擎按需懒加载成功")
+                except Exception as _ocr_pre_err:
+                    logging.warning("RapidOCR 引擎加载失败: %s", _ocr_pre_err)
     return _RAPID_OCR_ENGINE
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QHBoxLayout, QVBoxLayout,
@@ -69,7 +75,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QHBoxLayout, QV
                              QColorDialog, QFontDialog, QTextEdit, QMenu, QComboBox, QSpinBox,
                              QSystemTrayIcon, QAction, QFrame, QSlider, QProgressBar, QToolTip,
                              QGraphicsDropShadowEffect, QGroupBox, QGridLayout, QLineEdit, QCheckBox,
-                             QStackedWidget)
+                             QStackedWidget, QSizePolicy)
 from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QSharedMemory, QTimer, QAbstractNativeEventFilter, QObject, QUrl, QMimeData, QPointF, QRectF
 from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QBrush, QWheelEvent,
                          QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QFontMetricsF, QRegion)
@@ -119,6 +125,8 @@ def load_settings():
     defaults = {
         "use_ai_translation": False,
         "use_ai_ocr": False,
+        "ocr_target_lang": "",
+        "translation_display_mode": "dialog",
         "zhipu_api_key": "",
         "glm_ocr_model": DEFAULT_ZHIPU_OCR_MODEL,
         "volc_api_key": "",
@@ -260,6 +268,16 @@ def get_tesseract_languages():
     return "chi_sim+eng+tha+fil"
 
 TESSERACT_LANGS = get_tesseract_languages()
+
+
+def _pick_auto_ocr_langs():
+    """取字/截图翻译默认只用中英，避免泰语/菲律宾语包把中文误识别成泰文。"""
+    available = set(TESSERACT_LANGS.split('+'))
+    preferred = [l for l in ('chi_sim', 'eng') if l in available]
+    return '+'.join(preferred) if preferred else TESSERACT_LANGS
+
+
+AUTO_OCR_LANGS = _pick_auto_ocr_langs()
 
 # 初始化日志配置（采用 RotatingFileHandler 限制最大 1MB，日常仅记录 INFO/ERROR，彻底避免无限膨胀）
 LOG_FILE = os.path.join(BASE_DIR, "capture_app.log")
@@ -892,6 +910,14 @@ LANG_NAME_MAP = {
     "th": "泰语",
 }
 
+def resolve_ocr_target_lang(text=""):
+    """目标语言：优先使用用户上次手动选择并持久化的值；未设置时中文译英、其余译中。"""
+    saved = str(load_settings().get("ocr_target_lang", "") or "").strip()
+    valid_codes = {code for code, _label in SUPPORTED_LANGUAGES}
+    if saved in valid_codes:
+        return saved
+    return "en" if re.search(r'[\u4e00-\u9fff]', text or "") else "zh-CN"
+
 def translate_single_chunk(text, target_lang, source_lang='auto', timeout=6):
     """单段落文本在线翻译：主通道 Chrome 接口，备用通道 MyMemory"""
     if not text or not text.strip():
@@ -915,6 +941,14 @@ def translate_single_chunk(text, target_lang, source_lang='auto', timeout=6):
             result = "".join([part[0] for part in data[0] if part[0]])
             detected_src = data[2] if len(data) > 2 else source_lang
             if result:
+                low = result.strip().lower()
+                # 源语言与目标语言相同时 Google 会返回这句提示，直接保留原文
+                if "please select two distinct languages" in low:
+                    return text, detected_src
+                src_base = str(detected_src).split('-')[0].lower()
+                tgt_base = str(target_lang).split('-')[0].lower()
+                if src_base == tgt_base:
+                    return text, detected_src
                 return result, detected_src
     except Exception as e:
         logging.warning("Google 翻译通道请求失败: %s，尝试备用通道", e)
@@ -929,11 +963,32 @@ def translate_single_chunk(text, target_lang, source_lang='auto', timeout=6):
             data = json.loads(resp.read().decode('utf-8'))
             trans_text = data.get('responseData', {}).get('translatedText')
             if trans_text:
+                low = str(trans_text).strip().lower()
+                if "please select two distinct languages" in low or "invalid language pair" in low:
+                    return text, source_lang
                 return trans_text, source_lang
     except Exception as e2:
         logging.error("备用翻译通道请求失败: %s", e2)
 
     raise RuntimeError("翻译请求超时或网络异常，请检查网络设置。")
+
+def _looks_like_target(text, target_lang):
+    """粗略判断文本是否已经是目标语言，避免英文/数字块再走一遍在线翻译。"""
+    t = (text or "").strip()
+    if not t:
+        return True
+    letters = [c for c in t if c.isalpha()]
+    if not letters:
+        return True
+    ascii_ratio = sum(1 for c in letters if ord(c) < 128) / len(letters)
+    cjk_ratio = sum(1 for c in letters if '\u4e00' <= c <= '\u9fff') / len(letters)
+    base = str(target_lang).split('-')[0].lower()
+    if base == 'en':
+        return ascii_ratio >= 0.9
+    if base == 'zh':
+        return cjk_ratio >= 0.5
+    return False
+
 
 def translate_text(text, target_lang, source_lang='auto'):
     """多段落/超长文本翻译处理"""
@@ -1136,7 +1191,7 @@ class TranslationWorker(QThread):
 # OCR 结果展示与多语言智能翻译弹窗 (现代浅色双栏对照风格)
 # ==========================================
 class OcrResultDialog(QDialog):
-    def __init__(self, text, parent=None):
+    def __init__(self, text, parent=None, prefill_translation=None, target_lang=None, prefill_error=""):
         super().__init__(parent)
         self.setWindowTitle("🔤 文字识别与翻译 (OCR & Translation)")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
@@ -1145,19 +1200,40 @@ class OcrResultDialog(QDialog):
 
         self.current_worker = None
         self.detected_lang = "auto"
+        self.prefill_translation = prefill_translation
+        self.prefill_error = prefill_error
         self.debounce_timer = QTimer(self)
         self.debounce_timer.setSingleShot(True)
         self.debounce_timer.timeout.connect(self.trigger_translation)
 
-        # 智能判定初始目标语言：包含中文则目标为英文，其余语言目标为中文
-        has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in text)
-        self.initial_target = "en" if has_chinese else "zh-CN"
+        # 初始目标语言：外部指定 > 上次手动选择 > 内容智能判断（中文译英，其余译中）
+        saved_target = str(load_settings().get("ocr_target_lang", "") or "").strip()
+        valid_codes = {code for code, _label in SUPPORTED_LANGUAGES}
+        if target_lang in valid_codes:
+            self.initial_target = target_lang
+        elif saved_target in valid_codes:
+            self.initial_target = saved_target
+        else:
+            has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in text)
+            self.initial_target = "en" if has_chinese else "zh-CN"
 
         self._setup_ui(text)
         self._apply_style()
 
-        # 弹窗打开后立即发起初次自动翻译
-        QTimer.singleShot(80, self.trigger_translation)
+        if prefill_translation is not None:
+            # 一键翻译入口已经在后台完成翻译，这里仅负责展示，避免重复请求
+            self.target_edit.setPlainText(prefill_translation)
+            if prefill_error:
+                self.status_lbl.setText("⚠ 翻译失败")
+                self.status_lbl.setStyleSheet("color: #cf222e; font-weight: 500;")
+                self.target_edit.setPlaceholderText(f"翻译失败: {prefill_error}")
+            else:
+                use_ai = self.combo_mode.currentData() == "ai"
+                self.status_lbl.setText("✓ AI 翻译完成" if use_ai else "✓ 翻译完成")
+                self.status_lbl.setStyleSheet("color: #1a7f37; font-weight: 500;")
+        else:
+            # 普通识别入口：弹窗打开后立即发起初次自动翻译
+            QTimer.singleShot(80, self.trigger_translation)
 
     def _setup_ui(self, initial_text):
         main_layout = QVBoxLayout(self)
@@ -1233,7 +1309,7 @@ class OcrResultDialog(QDialog):
         idx = self.combo_target.findData(self.initial_target)
         if idx >= 0:
             self.combo_target.setCurrentIndex(idx)
-        self.combo_target.currentIndexChanged.connect(lambda: self.trigger_translation())
+        self.combo_target.currentIndexChanged.connect(self._on_target_changed)
 
         # 翻译按钮
         self.btn_translate = QPushButton("🔄 翻译")
@@ -1488,6 +1564,13 @@ class OcrResultDialog(QDialog):
         save_settings({"use_ai_translation": use_ai})
         self.trigger_translation()
 
+    def _on_target_changed(self):
+        """目标语言修改后持久化记忆，后续所有 OCR 入口默认沿用"""
+        code = self.combo_target.currentData()
+        if code:
+            save_settings({"ocr_target_lang": code})
+        self.trigger_translation()
+
     def _on_ocr_mode_changed(self):
         """识别模式切换时保存设置"""
         use_ai_ocr = self.combo_ocr_mode.currentData() == "ai_ocr"
@@ -1660,16 +1743,241 @@ def ai_ocr_recognize(image: QImage, timeout=30):
         raise RuntimeError(f"智谱 GLM-OCR 请求失败: {e}")
 
 # ==========================================
+# OCR 版面数据 (保留文字块的几何坐标，供图上取字 / 译文覆盖使用)
+# ==========================================
+class OcrRow:
+    """一行文字：包含整行文本、包围盒，以及逐字符的近似矩形。"""
+
+    __slots__ = ("text", "rect", "char_rects")
+
+    def __init__(self, text, rect, char_rects):
+        self.text = text
+        self.rect = rect
+        self.char_rects = char_rects
+
+
+class OcrDoc:
+    """一次 OCR 的完整版面结果，坐标以识别图像的左上角为原点。"""
+
+    __slots__ = ("rows", "image_size", "text")
+
+    def __init__(self, rows, image_size):
+        self.rows = rows
+        self.image_size = QSize(image_size)
+        self.text = "\n".join(r.text for r in rows if r.text)
+
+    def is_empty(self):
+        return not self.rows or not self.text.strip()
+
+
+def _ocr_item_bbox(points):
+    """把 RapidOCR 的四点/多边形坐标转换为整数包围盒"""
+    try:
+        xs = [float(pt[0]) for pt in points]
+        ys = [float(pt[1]) for pt in points]
+        if not xs or not ys:
+            return None
+        left, top = int(math.floor(min(xs))), int(math.floor(min(ys)))
+        right, bottom = int(math.ceil(max(xs))), int(math.ceil(max(ys)))
+        if right - left < 2 or bottom - top < 2:
+            return None
+        return QRect(left, top, right - left, bottom - top)
+    except Exception:
+        return None
+
+
+def build_ocr_doc(rapid_lines, image_size):
+    """
+    将 RapidOCR 的逐块结果整理为按阅读顺序排列的行：
+    1. 先按纵向中心聚类成视觉行；
+    2. 行内按横坐标排序，英文词块之间补空格；
+    3. 为每个字符估算一个矩形，用于鼠标框选与高亮。
+    """
+    if not rapid_lines:
+        return None
+
+    segments = []
+    for item in rapid_lines:
+        try:
+            if not item or len(item) < 2:
+                continue
+            text = str(item[1]).strip()
+            if not text:
+                continue
+            rect = _ocr_item_bbox(item[0])
+            if rect is None:
+                continue
+            score = float(item[2]) if len(item) > 2 else 1.0
+            segments.append((rect, text, score))
+        except Exception:
+            continue
+
+    if not segments:
+        return None
+
+    segments.sort(key=lambda s: (s[0].center().y(), s[0].left()))
+
+    # 纵向聚类成行：以行内平均中心为基准，容差取行高的一半左右
+    grouped = []
+    for seg in segments:
+        rect = seg[0]
+        placed = False
+        for row in grouped:
+            row_rect = row["rect"]
+            anchor = row["anchor"]
+            h_min = max(1, min(row_rect.height(), rect.height()))
+            overlap = min(row_rect.bottom(), rect.bottom()) - max(row_rect.top(), rect.top())
+            center_delta = abs(rect.center().y() - anchor.center().y())
+            same_row = (center_delta <= max(8.0, max(anchor.height(), rect.height()) * 0.7)
+                        or (overlap >= h_min * 0.5 and center_delta <= anchor.height() * 1.2))
+            if same_row:
+                row["items"].append(seg)
+                row["rect"] = row_rect.united(rect)
+                placed = True
+                break
+        if not placed:
+            grouped.append({"rect": QRect(rect), "items": [seg], "anchor": QRect(rect)})
+
+    grouped.sort(key=lambda r: (r["rect"].top(), r["rect"].left()))
+
+    rows = []
+    for group in grouped:
+        items = sorted(group["items"], key=lambda s: s[0].left())
+
+        # 同一视觉行内按横向间隙再分块：聊天气泡、左右分栏、标签+值不会被强行拼成一条超长行。
+        clusters = []
+        for item in items:
+            rect = item[0]
+            if clusters:
+                prev_rect = clusters[-1][-1][0]
+                gap = rect.left() - prev_rect.right()
+                gap_limit = max(56.0, min(rect.height(), prev_rect.height()) * 3.0)
+                if gap <= gap_limit:
+                    clusters[-1].append(item)
+                    continue
+            clusters.append([item])
+
+        for cluster in clusters:
+            parts = []
+            char_rects = []
+            prev_rect = None
+            prev_char = ""
+            for rect, text, _score in cluster:
+                if prev_rect is not None and prev_char and text:
+                    next_char = text[0]
+                    if prev_char.isascii() and prev_char.isalnum() and next_char.isascii() and next_char.isalnum():
+                        gap_left = prev_rect.right() + 1
+                        gap_right = rect.left() - 1
+                        if gap_right - gap_left >= 2:
+                            space_rect = QRect(gap_left, min(prev_rect.top(), rect.top()),
+                                               gap_right - gap_left, max(prev_rect.height(), rect.height()))
+                        else:
+                            space_rect = QRect(rect.left() - 2, rect.top(), 2, rect.height())
+                        parts.append(" ")
+                        char_rects.append(space_rect)
+                char_w = rect.width() / max(1, len(text))
+                for idx, ch in enumerate(text):
+                    parts.append(ch)
+                    char_rects.append(QRect(int(rect.left() + idx * char_w), rect.top(),
+                                            max(1, int(math.ceil(char_w))), rect.height()))
+                prev_rect = rect
+                prev_char = text[-1]
+
+            row_text = "".join(parts).strip()
+            if not row_text:
+                continue
+            cluster_rect = QRect(cluster[0][0])
+            for item in cluster[1:]:
+                cluster_rect = cluster_rect.united(item[0])
+            rows.append(OcrRow(row_text, cluster_rect, char_rects))
+
+    if not rows:
+        return None
+    return OcrDoc(rows, image_size)
+
+
+def tesseract_ocr_lines(image_rgb, lang_str=None, min_conf=5):
+    """
+    RapidOCR 不可用时的坐标回退：用 Tesseract image_to_data 获取词级 bbox，
+    再交给 build_ocr_doc 聚合成行。这样即使只装了 Tesseract，取字/译文覆盖也能定位文字。
+    """
+    requested_lang = lang_str or AUTO_OCR_LANGS
+    try:
+        pil_img = Image.fromarray(image_rgb).convert('L')
+        # 深色截图（白字黑底）先反色，避免 Tesseract 完全识别不到
+        from PIL import ImageOps
+        if np.mean(np.asarray(pil_img)) < 127:
+            pil_img = ImageOps.invert(pil_img)
+        # 提升灰色小字/低对比度正文的识别率
+        pil_img = ImageOps.autocontrast(pil_img, cutoff=1)
+
+        # 小图放大 + 边缘留白，显著提升小字号中文的识别率；坐标会在下面换算回原图
+        scale = 2.0 if pil_img.height < 220 else 1.0
+        if scale > 1.0:
+            try:
+                resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample = Image.LANCZOS
+            pil_img = pil_img.resize((int(pil_img.width * scale), int(pil_img.height * scale)),
+                                     resample)
+        pad = 16
+        arr_gray = np.asarray(pil_img)
+        edge_val = int(np.median(arr_gray[:2, :])) if arr_gray.size else 255
+        canvas = Image.new('L', (pil_img.width + pad * 2, pil_img.height + pad * 2), edge_val)
+        canvas.paste(pil_img, (pad, pad))
+
+        data = pytesseract.image_to_data(
+            canvas, lang=requested_lang, config='--oem 1 --psm 3',
+            output_type=pytesseract.Output.DICT
+        )
+    except Exception as e:
+        logging.warning("Tesseract 词级版面识别失败: %s", e)
+        return []
+
+    lines = []
+    count = len(data.get('text', []) or [])
+    for i in range(count):
+        text = str(data['text'][i]).strip()
+        if not text:
+            continue
+        try:
+            conf = float(data['conf'][i])
+        except Exception:
+            conf = 0.0
+        if conf < min_conf:
+            continue
+        try:
+            x = int((data['left'][i] - pad) / scale)
+            y = int((data['top'][i] - pad) / scale)
+            w = int(data['width'][i] / scale)
+            h = int(data['height'][i] / scale)
+        except Exception:
+            continue
+        if w < 2 or h < 2:
+            continue
+        box = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        lines.append((box, text, max(0.0, min(1.0, conf / 100.0))))
+    if not lines and lang_str is None and requested_lang != TESSERACT_LANGS:
+        # 中英没识别到内容时，再尝试泰语/菲律宾语等完整语言包
+        return tesseract_ocr_lines(image_rgb, TESSERACT_LANGS, min_conf)
+    return lines
+
+
+
+# ==========================================
 # OCR 后台工作线程 (智能双引擎融合: 懒加载 RapidOCR + 深度预处理 Tesseract / AI 视觉识别)
 # ==========================================
 class OcrWorker(QThread):
     finished = pyqtSignal(str)
+    doc_ready = pyqtSignal(object)
 
-    def __init__(self, image: QImage, use_ai=False):
+    def __init__(self, image: QImage, use_ai=False, fast=False):
         super().__init__()
         # 严格使用主线程传入的 QImage 纯数据对象，彻底杜绝 QPixmap 跨线程调用崩溃
         self.image = image
         self.use_ai = use_ai
+        # fast=True 时仅跑本地 RapidOCR 并直接返回版面文本，跳过耗时的 Tesseract 融合
+        self.fast = fast
 
     def run(self):
         try:
@@ -1713,11 +2021,36 @@ class OcrWorker(QThread):
             rapid_engine = get_rapid_ocr_engine()
             if rapid_engine is not None:
                 try:
-                    res, _ = rapid_engine(arr)
+                    # RapidOCR 单例不做并发保护时可能被多个线程同时推理，这里串行化确保稳定
+                    with _RAPID_OCR_INFER_LOCK:
+                        res, _ = rapid_engine(arr)
                     if res:
                         rapid_lines = res
                 except Exception as ex_r:
                     logging.warning(f"RapidOCR 执行异常: {ex_r}")
+
+            # 1.05 RapidOCR 不可用（未安装/加载失败）时，用 Tesseract 词级 bbox 兜底，
+            #     否则取字和图上译文会因为没有坐标而完全失效
+            if not rapid_lines and self.fast:
+                try:
+                    rapid_lines = tesseract_ocr_lines(arr)
+                    if rapid_lines:
+                        logging.info("Tesseract 词级坐标回退成功: %d 个文本块", len(rapid_lines))
+                except Exception as ex_tb:
+                    logging.warning(f"Tesseract 词级坐标回退异常: {ex_tb}")
+
+            # 1.1 同步构建带坐标的版面结果（供取字层与译文覆盖使用），不受后续文本融合影响
+            if rapid_lines:
+                try:
+                    doc = build_ocr_doc(rapid_lines, self.image.size())
+                    if doc is not None and not doc.is_empty():
+                        self.doc_ready.emit(doc)
+                        if self.fast:
+                            # 取字/一键翻译只需要版面文本，跳过 Tesseract 融合以降低延迟
+                            self.finished.emit(doc.text)
+                            return
+                except Exception as ex_doc:
+                    logging.warning(f"OCR 版面构建异常: {ex_doc}")
 
             # 2. 运行 Tesseract 多语言识别
             tess_text = ""
@@ -1755,7 +2088,7 @@ class OcrWorker(QThread):
             # 进行行级置信度修补，若某行在 RapidOCR 中置信度偏低（< 0.65）或为生僻乱码，
             # 说明命中 RapidOCR 字典盲区，此时保留 Tesseract 的完整段落或做联合输出
             rapid_full = "\n".join([item[1] for item in rapid_lines if item and item[1].strip()])
-            
+
             # 若 Tesseract 字符数明显更多（涵盖了 Rapid 漏掉的小语种行）
             if len(tess_text) > len(rapid_full) * 1.2:
                 self.finished.emit(tess_text)
@@ -1765,6 +2098,1271 @@ class OcrWorker(QThread):
         except Exception as e:
             logging.error("OCR Worker Error: %s", e, exc_info=True)
             self.finished.emit(f"识别发生错误:\n{e}")
+
+# ==========================================
+# 图上取字层 (拖选 OCR 文字并复制)
+# ==========================================
+class TextSelectLayer(QWidget):
+    """覆盖在截图选区上的文字选择层：拖选高亮、Ctrl+C 复制、Esc 退出。"""
+
+    copied = pyqtSignal(str)
+    closed = pyqtSignal()
+
+    def __init__(self, doc: OcrDoc, parent=None):
+        super().__init__(parent)
+        self.doc = doc
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.IBeamCursor)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+        self._dragging = False
+        self._drag_start = QPoint()
+        self._sel_rect = QRect()
+        self._selected = set()
+        self._flash_text = ""
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._clear_flash)
+        self._sx = 1.0
+        self._sy = 1.0
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._recalc_scale()
+        self.setFocus()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._recalc_scale()
+
+    def _recalc_scale(self):
+        iw = max(1, self.doc.image_size.width())
+        ih = max(1, self.doc.image_size.height())
+        self._sx = self.width() / iw if iw else 1.0
+        self._sy = self.height() / ih if ih else 1.0
+
+    def _scale_rect(self, rect):
+        return QRect(int(rect.left() * self._sx), int(rect.top() * self._sy),
+                     max(1, int(rect.width() * self._sx)), max(1, int(rect.height() * self._sy)))
+
+    def _clear_flash(self):
+        self._flash_text = ""
+        self.update()
+
+    def _update_selected(self):
+        self._selected.clear()
+        if self._sel_rect.isNull() or not self._sel_rect.isValid():
+            return
+        probe = self._sel_rect.adjusted(-1, -1, 1, 1)
+        for ri, row in enumerate(self.doc.rows):
+            for ci, cr in enumerate(row.char_rects):
+                if probe.contains(self._scale_rect(cr).center()):
+                    self._selected.add((ri, ci))
+
+    def _selected_text(self):
+        lines = []
+        for ri, row in enumerate(self.doc.rows):
+            chars = [row.text[ci] for ci in range(len(row.text)) if (ri, ci) in self._selected]
+            if chars:
+                lines.append("".join(chars).rstrip())
+        return "\n".join(lines).strip()
+
+    def _select_all(self):
+        self._selected = {(ri, ci) for ri, row in enumerate(self.doc.rows) for ci in range(len(row.text))}
+        self._sel_rect = QRect(0, 0, self.width(), self.height())
+        self.update()
+
+    def _select_row_at(self, pos):
+        for ri, row in enumerate(self.doc.rows):
+            if self._scale_rect(row.rect).adjusted(-2, -2, 2, 2).contains(pos):
+                self._selected = {(ri, ci) for ci in range(len(row.text))}
+                self._sel_rect = self._scale_rect(row.rect)
+                self.update()
+                return
+
+    def _copy_selection(self):
+        text = self._selected_text()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._flash_text = f"已复制 {len(text)} 字"
+        self._flash_timer.start(1800)
+        self.copied.emit(text)
+        self.update()
+
+    def _close_layer(self):
+        self.closed.emit()
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if self._selected:
+            fill = QColor(55, 138, 221, 88)
+            border = QColor(24, 95, 165, 70)
+            painter.setPen(QPen(border, 1))
+            for ri, row in enumerate(self.doc.rows):
+                idxs = sorted(ci for (r, ci) in self._selected if r == ri and ci < len(row.char_rects))
+                if not idxs:
+                    continue
+                # 合并连续字符为一段，避免逐字描边形成网格感
+                runs = []
+                start = prev = idxs[0]
+                for ci in idxs[1:]:
+                    if ci == prev + 1:
+                        prev = ci
+                    else:
+                        runs.append((start, prev))
+                        start = prev = ci
+                runs.append((start, prev))
+                for a, b in runs:
+                    ra = self._scale_rect(row.char_rects[a])
+                    rb = self._scale_rect(row.char_rects[b])
+                    rect = QRect(ra.left(), min(ra.top(), rb.top()),
+                                 max(1, rb.right() - ra.left() + 1), max(ra.height(), rb.height()))
+                    painter.fillRect(rect, fill)
+                    painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
+        if self._dragging and not self._sel_rect.isNull():
+            painter.setPen(QPen(QColor(24, 95, 165, 180), 1, Qt.DashLine))
+            painter.setBrush(QColor(55, 138, 221, 20))
+            painter.drawRect(self._sel_rect.normalized())
+            painter.setBrush(Qt.NoBrush)
+
+        if self._flash_text:
+            self._draw_pill(painter, self._flash_text, center=True)
+        else:
+            self._draw_pill(painter, "拖选文字 · Ctrl+C 复制 · Esc 退出", center=False)
+        painter.end()
+
+    def _draw_pill(self, painter, text, center=False):
+        font = QFont("Microsoft YaHei UI")
+        font.setPixelSize(12)
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        tw = fm.horizontalAdvance(text)
+        th = fm.height()
+        w = tw + 22
+        h = th + 10
+        if center:
+            x = max(6, int((self.width() - w) / 2))
+            y = 10
+        else:
+            x = max(6, self.width() - w - 8)
+            y = 8
+        rect = QRect(x, y, min(w, self.width() - 12), h)
+        painter.setPen(QPen(QColor(203, 213, 225), 1))
+        painter.setBrush(QColor(255, 255, 255, 236))
+        painter.drawRoundedRect(rect, 7, 7)
+        painter.setPen(QColor(51, 65, 85))
+        painter.drawText(rect.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            menu = QMenu(self)
+            act_copy = menu.addAction("复制选中文字")
+            act_copy.setEnabled(bool(self._selected))
+            act_all = menu.addAction("全选")
+            menu.addSeparator()
+            act_exit = menu.addAction("退出取字")
+            chosen = menu.exec_(event.globalPos())
+            if chosen == act_copy:
+                self._copy_selection()
+            elif chosen == act_all:
+                self._select_all()
+            elif chosen == act_exit:
+                self._close_layer()
+            return
+
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_start = event.pos()
+            self._sel_rect = QRect(self._drag_start, self._drag_start)
+            self._selected.clear()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self._sel_rect = QRect(self._drag_start, event.pos()).normalized()
+            self._update_selected()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            moved = (event.pos() - self._drag_start).manhattanLength()
+            self._sel_rect = QRect(self._drag_start, event.pos()).normalized()
+            if moved < 3:
+                # 单击直接选中该行，方便快速复制单行
+                self._select_row_at(event.pos())
+            else:
+                self._update_selected()
+            self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._select_row_at(event.pos())
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self._close_layer()
+        elif event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier:
+            self._select_all()
+        elif event.key() in (Qt.Key_C, Qt.Key_Return, Qt.Key_Enter) and (
+                event.key() != Qt.Key_C or event.modifiers() & Qt.ControlModifier):
+            self._copy_selection()
+        else:
+            super().keyPressEvent(event)
+
+
+# ==========================================
+# 图上译文覆盖层 (逐行并发翻译，原地替换显示)
+# ==========================================
+class RowTranslationWorker(QThread):
+    """按行并发翻译，逐行回传，避免整段翻译无法定位到原文位置。"""
+
+    row_ready = pyqtSignal(int, str)
+    progress = pyqtSignal(int, int)
+    all_done = pyqtSignal(bool)
+
+    def __init__(self, texts, target_lang, use_ai=False):
+        super().__init__()
+        self.texts = list(texts)
+        self.target_lang = target_lang
+        self.use_ai = use_ai
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _translate_one(self, text):
+        if self._cancelled or not text.strip():
+            return text
+        if _looks_like_target(text, self.target_lang):
+            return text
+        if self.use_ai:
+            res, _ = ai_translate_single_chunk(text, self.target_lang, 'auto', timeout=25,
+                                               is_cancelled_fn=lambda: self._cancelled)
+        else:
+            res, _ = translate_single_chunk(text, self.target_lang, 'auto', timeout=8)
+        return res if res else text
+
+    def _build_batches(self):
+        batches = []
+        current = []
+        size = 0
+        for i, text in enumerate(self.texts):
+            add = len(text) + 2
+            if current and (size + add > 1700 or len(current) >= 10):
+                batches.append(current)
+                current = []
+                size = 0
+            current.append(i)
+            size += add
+        if current:
+            batches.append(current)
+        return batches
+
+    def _translate_batch(self, indices):
+        results = [None] * len(indices)
+        pending = []
+        for pos, i in enumerate(indices):
+            if _looks_like_target(self.texts[i], self.target_lang):
+                results[pos] = self.texts[i]
+            else:
+                pending.append((pos, i))
+        if not pending:
+            return results, True
+        if self.use_ai or len(pending) == 1:
+            ok = True
+            for pos, i in pending:
+                try:
+                    results[pos] = self._translate_one(self.texts[i])
+                except Exception:
+                    results[pos] = self.texts[i]
+                    ok = False
+            return results, ok
+
+        # 普通在线翻译把多个段落拼成一次请求；用 [[n]] 编号防止 Google 合并/重排后译文错位
+        plain = [self.texts[i].replace("\n\n", "\n").strip() for _, i in pending]
+        try:
+            marked = "\n\n".join(f"[[{k + 1}]] {p}" for k, p in enumerate(plain))
+            res, _ = translate_single_chunk(marked, self.target_lang, 'auto', timeout=12)
+            matches = list(re.finditer(r'\[\[(\d+)\]\]', res or ""))
+            if len(matches) == len(pending):
+                ok = True
+                for k, match in enumerate(matches):
+                    num = int(match.group(1)) - 1
+                    start = match.end()
+                    end = matches[k + 1].start() if k + 1 < len(matches) else len(res)
+                    part = res[start:end].strip()
+                    if 0 <= num < len(pending) and part:
+                        results[pending[num][0]] = part
+                    else:
+                        ok = False
+                if ok and all(r is not None for r in results):
+                    return results, True
+            logging.warning("批量翻译编号回收失败 (%d 个标记/%d 段)，回退逐块翻译", len(matches), len(pending))
+        except Exception as e:
+            logging.warning("批量翻译失败，回退逐块翻译: %s", e)
+
+        ok = True
+        for pos, i in pending:
+            try:
+                results[pos] = self._translate_one(self.texts[i])
+            except Exception:
+                results[pos] = self.texts[i]
+                ok = False
+        return results, ok
+
+    def run(self):
+        total = len(self.texts)
+        if total == 0:
+            self.all_done.emit(True)
+            return
+        ok_all = True
+        done = 0
+        batches = self._build_batches()
+        try:
+            with ThreadPoolExecutor(max_workers=min(5 if not self.use_ai else 4, max(1, len(batches)))) as pool:
+                future_map = {pool.submit(self._translate_batch, b): b for b in batches}
+                for fut in as_completed(future_map):
+                    if self._cancelled:
+                        break
+                    batch = future_map[fut]
+                    try:
+                        results, ok = fut.result()
+                        ok_all = ok_all and ok
+                    except Exception:
+                        results = [self.texts[i] for i in batch]
+                        ok_all = False
+                    for i, result in zip(batch, results):
+                        done += 1
+                        if not self._cancelled:
+                            self.row_ready.emit(i, result)
+                            self.progress.emit(done, total)
+        except Exception as e:
+            logging.warning("逐行翻译异常: %s", e)
+            ok_all = False
+        self.all_done.emit(ok_all and not self._cancelled)
+
+
+class TranslationBlock:
+    """把相邻的文字行合并成段落/气泡，整段翻译并整段覆盖，避免逐行小白块。"""
+
+    __slots__ = ("text", "rect", "row_indices")
+
+    def __init__(self, row_indices, rect):
+        self.row_indices = list(row_indices)
+        self.rect = QRect(rect)
+        self.text = ""
+
+
+def _clean_ocr_text(text):
+    """清掉 OCR 把图标识别成的孤立字母/符号，避免译文出现奇怪的 O、Q、©。"""
+    t = (text or "").strip()
+    t = re.sub(r'^[\s\|\[\]{}()<>«»“”"\'`~^*_+=|\\/]+', '', t)
+    t = re.sub(r'[\s\|\[\]{}()<>«»“”"\'`~^*_+=|\\/]+$', '', t)
+    # OEditing / Q Search 这类“图标字母 + 正文”只去掉前面的图标字母
+    t = re.sub(r'^[0OQ]\s*(?=[A-Za-z])', '', t)
+    # 铅笔/搜索图标 + 中文：去掉 O/Q，但保留“O型圈”这类真实词
+    t = re.sub(r'^[OQ]\s*(?=[\u4e00-\u9fff])(?!型|币)', '', t)
+    t = re.sub(r'^[©®™•·]\s*', '', t)
+    return t.strip()
+
+
+def _is_meaningful_block(text, rect):
+    clean = re.sub(r'[^\w\u4e00-\u9fff]+', '', text or '', flags=re.UNICODE)
+    if not clean:
+        return False
+    if len(clean) < 2 and not any('\u4e00' <= c <= '\u9fff' for c in clean):
+        return False
+    if rect.width() < 18 or rect.height() < 10:
+        return False
+    return True
+
+
+def build_translation_blocks(rows):
+    blocks = []
+    for idx, row in enumerate(rows):
+        target = None
+        for block in blocks:
+            inter = block.rect.intersected(row.rect)
+            min_w = max(1, min(block.rect.width(), row.rect.width()))
+            overlap_ratio = inter.width() / min_w if inter.isValid() else 0.0
+            gap = row.rect.top() - block.rect.bottom()
+            if overlap_ratio >= 0.35 and -max(10.0, row.rect.height() * 0.6) <= gap <= max(8.0, row.rect.height() * 0.8):
+                target = block
+                break
+        if target is not None:
+            target.row_indices.append(idx)
+            target.rect = target.rect.united(row.rect)
+        else:
+            blocks.append(TranslationBlock([idx], row.rect))
+    for block in blocks:
+        lines = []
+        for i in block.row_indices:
+            cleaned = _clean_ocr_text(rows[i].text)
+            if cleaned:
+                lines.append(cleaned)
+        block.text = "\n".join(lines)
+    return [b for b in blocks if _is_meaningful_block(b.text, b.rect)]
+
+
+def _sample_block_bg(image, rect):
+    """采样文字块四周的背景色，让译文底板尽量贴合原图背景。"""
+    points = [
+        (rect.left() - 4, rect.top() + 2),
+        (rect.left() - 4, rect.bottom() - 2),
+        (rect.right() + 4, rect.top() + 2),
+        (rect.right() + 4, rect.bottom() - 2),
+        (rect.center().x(), rect.top() - 4),
+        (rect.center().x(), rect.bottom() + 4),
+    ]
+    colors = []
+    for x, y in points:
+        if 0 <= x < image.width() and 0 <= y < image.height():
+            c = image.pixelColor(x, y)
+            if c.alpha() > 0:
+                colors.append(c)
+    if not colors:
+        return QColor(255, 255, 255, 240)
+    mean_lum = sum(c.lightness() for c in colors) / len(colors)
+    # 亮色界面取最亮的采样点（避开文字），暗色界面取最暗的采样点
+    picked = max(colors, key=lambda c: c.lightness()) if mean_lum >= 128 \
+        else min(colors, key=lambda c: c.lightness())
+    return QColor(picked.red(), picked.green(), picked.blue(), 242)
+
+
+def _render_translation_sheet(base_pixmap, blocks, translations, scale=1.0):
+    """密集界面（聊天/多气泡）改用左右两栏的干净译文卡片，避免补丁互相遮挡。"""
+    width = base_pixmap.width()
+    sw = max(1, int(width * scale))
+    base_h = max(1, int(base_pixmap.height() * scale))
+    margin = max(8, int(12 * scale))
+    gap = max(8, int(12 * scale))
+    col_w = max(int(120 * scale), (sw - margin * 2 - gap) // 2)
+    cursors = {0: margin, 1: margin}
+    layouts = []
+
+    order = sorted(range(len(blocks)), key=lambda i: (blocks[i].rect.top(), blocks[i].rect.left()))
+    for idx in order:
+        if idx >= len(translations):
+            continue
+        block = blocks[idx]
+        trans = (translations[idx] or "").strip()
+        if not trans or trans == block.text.strip():
+            continue
+        if len(block.text.strip()) < 2 or block.rect.width() < 30 or block.rect.height() < 10:
+            continue
+        col = 0 if block.rect.center().x() < width // 2 else 1
+        size = int((12 if block.rect.height() >= 34 else 11) * scale)
+        family = "Segoe UI" if all(ord(c) < 128 for c in trans) else "Microsoft YaHei UI"
+        font = QFont(family)
+        font.setPixelSize(max(7, size))
+        inner_w = max(40, col_w - int(12 * scale))
+        bound = QFontMetrics(font).boundingRect(QRect(0, 0, inner_w, 10000), Qt.TextWordWrap, trans)
+        h = max(int(28 * scale), bound.height() + int(12 * scale))
+        y = max(int(block.rect.top() * scale), cursors[col])
+        x = margin + col * (col_w + gap)
+        layouts.append((QRect(x, y, col_w, h), font, trans))
+        cursors[col] = y + h + int(8 * scale)
+
+    final_h = max(base_h, max(cursors.values()) + margin)
+    canvas = QPixmap(sw, final_h)
+    canvas.fill(QColor(250, 251, 252))
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.TextAntialiasing, True)
+    # 原图只作为很淡的底图保留布局线索，不参与阅读
+    painter.setOpacity(0.14)
+    painter.drawPixmap(QRect(0, 0, sw, base_h), base_pixmap,
+                       QRect(0, 0, base_pixmap.width(), base_pixmap.height()))
+    painter.setOpacity(1.0)
+
+    for rect, font, text in layouts:
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 246))
+        painter.drawRoundedRect(rect, max(3, int(5 * scale)), max(3, int(5 * scale)))
+        painter.setPen(QColor(15, 23, 42))
+        painter.setFont(font)
+        pad_x = max(4, int(7 * scale))
+        pad_y = max(3, int(5 * scale))
+        painter.drawText(rect.adjusted(pad_x, pad_y, -pad_x, -pad_y),
+                         Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, text)
+    painter.end()
+    return canvas
+
+
+def render_translated_pixmap(base_pixmap, blocks, translations):
+    """把段落级译文绘制到原图副本上，生成一张可对比/可保存的译文图。"""
+    if base_pixmap is None or base_pixmap.isNull():
+        return QPixmap()
+    width = base_pixmap.width()
+    height = base_pixmap.height()
+    important = [b for b in blocks
+                 if len(b.text.strip()) >= 2 and b.rect.width() >= 30 and b.rect.height() >= 10]
+    narrow = sum(1 for b in important if b.rect.width() < width * 0.6)
+    left_blocks = [b for b in important if b.rect.center().x() < width * 0.42]
+    right_blocks = [b for b in important if b.rect.center().x() > width * 0.58]
+    multi_col = len(left_blocks) >= 4 and len(right_blocks) >= 4
+
+    def _median(values):
+        values = sorted(values)
+        return values[len(values) // 2] if values else 0
+
+    left_max_right = max((b.rect.right() for b in left_blocks), default=0)
+    # 左侧文字都挤在窄带里 = 侧边栏 + 正文：必须原位渲染，否则正文会被分到左栏
+    sidebar_layout = len(left_blocks) >= 3 and len(right_blocks) >= 3 and left_max_right < width * 0.28
+
+    # 译文图始终按 1.25~3 倍分辨率渲染，保证文字本身清晰，不受原图模糊/窗口放大影响
+    scale = 2.0
+    if max(width, height) >= 1600:
+        scale = 1.5
+    if width < 460 or height < 300:
+        scale = 3.0
+    if max(width, height) * scale > 3200:
+        scale = max(1.0, 3200.0 / max(width, height))
+
+    if multi_col and not sidebar_layout and len(important) >= 12 and narrow >= len(important) * 0.45:
+        # 左右都有大量短块（聊天/多栏）：补丁式覆盖会互相压住，改用干净的双栏译文卡片
+        return _render_translation_sheet(base_pixmap, blocks, translations, scale)
+
+    target_w = max(1, int(width * scale))
+    target_h = max(1, int(height * scale))
+    if scale != 1.0:
+        result = base_pixmap.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    else:
+        result = QPixmap(base_pixmap)
+    source_image = result.toImage()
+    scaled_rects = [
+        QRect(int(b.rect.left() * scale), int(b.rect.top() * scale),
+              max(1, int(b.rect.width() * scale)), max(1, int(b.rect.height() * scale)))
+        for b in blocks
+    ]
+
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.TextAntialiasing, True)
+
+    for idx, block in enumerate(blocks):
+        if idx >= len(translations):
+            break
+        trans = (translations[idx] or "").strip()
+        if not trans or trans == block.text.strip():
+            continue
+        # 过滤图标、标点、细小 UI 元素（按原图尺寸判断）
+        if block.rect.width() < 14 or block.rect.height() < 9:
+            continue
+        rect = scaled_rects[idx].intersected(result.rect())
+        if rect.width() < 8 or rect.height() < 6:
+            continue
+
+        # 优先尝试向下扩展，空间足够时允许译文换成两行，避免一句话被截断
+        layout_rect = QRect(rect)
+        for factor in (1.6, 1.3, 1.0):
+            test = QRect(rect.left(), rect.top(), rect.width(), max(rect.height(), int(rect.height() * factor)))
+            collision = any(test.intersects(other) for j, other in enumerate(scaled_rects)
+                            if j != idx and other.width() > 2)
+            if not collision:
+                layout_rect = test
+                break
+
+        max_w = max(int(12 * scale), rect.width() - int(6 * scale))
+        max_h = max(int(8 * scale), layout_rect.height() - int(4 * scale))
+        family = "Segoe UI" if all(ord(c) < 128 for c in trans) else "Microsoft YaHei UI"
+        start_size = max(int(7 * scale), min(int(16 * scale), int(rect.height() * 0.55)))
+        if rect.height() < 20 * scale:
+            start_size = min(start_size, int(10 * scale))
+        min_size = max(6, int(6 * scale))
+        font = None
+        bound = None
+        for size in range(start_size, min_size - 1, -1):
+            f = QFont(family)
+            f.setPixelSize(size)
+            br = QFontMetrics(f).boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, trans)
+            if br.height() <= max_h and br.width() <= max_w:
+                font, bound = f, br
+                break
+        if font is None:
+            font = QFont(family)
+            font.setPixelSize(min_size)
+            bound = QFontMetrics(font).boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, trans)
+
+        pad = max(1, int(3 * scale))
+        box = QRect(rect.left() - pad, rect.top() - pad,
+                    min(result.width() - rect.left() + pad, rect.width() + pad * 2),
+                    min(result.height() - rect.top() + pad,
+                        max(rect.height() + pad * 2,
+                            min(bound.height() + int(8 * scale), layout_rect.height() + pad * 2))))
+        box = box.intersected(result.rect())
+        bg = _sample_block_bg(source_image, rect)
+        bg.setAlpha(255)  # 原位覆盖必须完全不透明，否则原文会透出来形成重影
+        painter.setPen(Qt.NoPen)  # 无边框，尽量接近原生排版
+        painter.setBrush(bg)
+        painter.drawRoundedRect(box, max(2, int(2 * scale)), max(2, int(2 * scale)))
+        painter.setPen(QColor(15, 23, 42) if bg.lightness() > 128 else QColor(240, 244, 248))
+        painter.setFont(font)
+        painter.setClipRect(box.adjusted(1, 1, -1, -1))
+        painter.drawText(box.adjusted(int(4 * scale), int(3 * scale), -int(4 * scale), -int(3 * scale)),
+                         Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter, trans)
+        painter.setClipping(False)
+        painter.setBrush(Qt.NoBrush)
+
+    painter.end()
+    return result
+
+class TranslationResultWindow(QDialog):
+    """
+    一键翻译结果窗口：
+    - compare：左原图 / 右覆盖译文的图
+    - overlay：只显示覆盖译文的图
+    """
+
+    def __init__(self, original_pixmap, doc, target_lang, use_ai=False, mode="compare", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🌐 翻译结果")
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setObjectName("transResultDialog")
+
+        self._original_pm = QPixmap(original_pixmap)
+        self._translated_pm = QPixmap(original_pixmap)
+        self.doc = doc
+        self.rows = doc.rows
+        self.blocks = build_translation_blocks(doc.rows)
+        self.target_lang = target_lang
+        self.use_ai = use_ai
+        self.mode = "overlay" if mode == "overlay" else "compare"
+        self.translations = ["" for _ in self.blocks]
+        self._workers = []
+        self._worker = None
+        self._closed = False
+        self.content = None
+        self.lbl_original = None
+        self.lbl_translated = None
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        pw, ph = self._original_pm.width(), self._original_pm.height()
+        if self.mode == "compare":
+            content_w = max(760, pw * 1.9 + 80)
+            content_h = max(480, ph * 1.15 + 100)
+        else:
+            content_w = max(540, pw * 1.35 + 40)
+            content_h = max(400, ph * 1.2 + 80)
+        self.resize(min(int(screen.width() * 0.92), int(content_w)),
+                    min(int(screen.height() * 0.88), int(content_h)))
+        self.setMinimumSize(540, 380)
+
+        self._setup_ui()
+        self._apply_style()
+        QTimer.singleShot(40, self._start_translation)
+
+    def _setup_ui(self):
+        main = QVBoxLayout(self)
+        main.setContentsMargins(16, 14, 16, 14)
+        main.setSpacing(10)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+        title = QLabel("🔎 双栏对照" if self.mode == "compare" else "🖼️ 覆盖翻译")
+        title.setObjectName("transTitle")
+        self.lbl_status = QLabel("正在翻译…")
+        self.lbl_status.setObjectName("transStatus")
+
+        bar.addWidget(title)
+        bar.addWidget(self.lbl_status)
+        bar.addStretch()
+
+        bar.addWidget(QLabel("目标语言:"))
+        self.combo_lang = QComboBox()
+        for code, label in SUPPORTED_LANGUAGES:
+            self.combo_lang.addItem(label, code)
+        idx = self.combo_lang.findData(self.target_lang)
+        if idx >= 0:
+            self.combo_lang.setCurrentIndex(idx)
+        self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
+        bar.addWidget(self.combo_lang)
+
+        self.btn_copy = QPushButton("复制译文图")
+        self.btn_copy.setObjectName("transSecondary")
+        self.btn_copy.setCursor(Qt.PointingHandCursor)
+        self.btn_copy.clicked.connect(self._copy_image)
+        bar.addWidget(self.btn_copy)
+
+        self.btn_save = QPushButton("保存译文图")
+        self.btn_save.setObjectName("transSecondary")
+        self.btn_save.setCursor(Qt.PointingHandCursor)
+        self.btn_save.clicked.connect(self._save_image)
+        bar.addWidget(self.btn_save)
+
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("transPrimary")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.close)
+        bar.addWidget(btn_close)
+        main.addLayout(bar)
+
+        self.content = QWidget()
+        content_layout = QHBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(12)
+
+        self.lbl_original = None
+        self.lbl_translated = None
+        if self.mode == "compare":
+            left_card, self.lbl_original = self._make_card("原图")
+            right_card, self.lbl_translated = self._make_card("译文图")
+            content_layout.addWidget(left_card, 1)
+            content_layout.addWidget(right_card, 1)
+        else:
+            card, self.lbl_translated = self._make_card("译文图")
+            content_layout.addWidget(card, 1)
+
+        main.addWidget(self.content, 1)
+
+    def _make_card(self, title_text):
+        card = QFrame()
+        card.setObjectName("transCard")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(6)
+        title = QLabel(title_text)
+        title.setObjectName("transCardTitle")
+        lay.addWidget(title)
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        label.setMinimumSize(240, 180)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        label.setStyleSheet("background: #FFFFFF;")
+        lay.addWidget(label, 1)
+        return card, label
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QDialog#transResultDialog {
+                background-color: #F6F8FA;
+                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+                font-size: 13px;
+            }
+            QLabel#transTitle {
+                font-size: 16px;
+                font-weight: 700;
+                color: #0F172A;
+            }
+            QLabel#transStatus {
+                font-size: 12px;
+                font-weight: 600;
+                color: #0969DA;
+                padding: 0 6px;
+            }
+            QLabel#transCardTitle {
+                font-size: 13px;
+                font-weight: 600;
+                color: #334155;
+                padding: 2px 4px;
+            }
+            QFrame#transCard {
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 10px;
+            }
+            QComboBox {
+                background: #FFFFFF;
+                color: #0F172A;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 5px 10px;
+                min-width: 110px;
+            }
+            QPushButton#transSecondary {
+                background: #FFFFFF;
+                color: #334155;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 7px 14px;
+                font-weight: 500;
+            }
+            QPushButton#transSecondary:hover {
+                background: #F1F5F9;
+                border-color: #94A3B8;
+            }
+            QPushButton#transPrimary {
+                background: #0969DA;
+                color: #FFFFFF;
+                border: 1px solid #085CC0;
+                border-radius: 6px;
+                padding: 7px 18px;
+                font-weight: 600;
+            }
+            QPushButton#transPrimary:hover {
+                background: #085CC0;
+            }
+        """)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._update_display()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_display()
+
+    def _update_display(self):
+        if self.content is None or self.lbl_translated is None:
+            return
+        avail_w = max(120, self.content.width() - 12)
+        avail_h = max(100, self.content.height() - 40)
+        if self.mode == "compare":
+            col_w = max(120, (avail_w - 12) // 2)
+            common_h = min(avail_h, max(self._original_pm.height(), self._translated_pm.height()))
+            self._set_scaled_height(self.lbl_original, self._original_pm, col_w, common_h)
+            self._set_scaled_height(self.lbl_translated, self._translated_pm, col_w, common_h)
+        else:
+            self._set_scaled(self.lbl_translated, self._translated_pm, avail_w, avail_h)
+
+    @staticmethod
+    def _set_scaled(label, pixmap, width, height):
+        if label is None or pixmap is None or pixmap.isNull():
+            return
+        label.setPixmap(pixmap.scaled(max(50, width), max(50, height),
+                                      Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    @staticmethod
+    def _set_scaled_height(label, pixmap, width, height):
+        if label is None or pixmap is None or pixmap.isNull():
+            return
+        target_h = max(50, height)
+        scaled = pixmap.scaledToHeight(target_h, Qt.SmoothTransformation)
+        if scaled.width() > width:
+            scaled = scaled.scaledToWidth(max(50, width), Qt.SmoothTransformation)
+        label.setPixmap(scaled)
+
+    def _start_translation(self):
+        if self._closed:
+            return
+        self.translations = ["" for _ in self.blocks]
+        self._translated_pm = QPixmap(self._original_pm)
+        self.lbl_status.setText("正在翻译…")
+        self.lbl_status.setStyleSheet("color: #0969DA;")
+        self.btn_copy.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        self._update_display()
+
+        worker = RowTranslationWorker([b.text for b in self.blocks], self.target_lang, self.use_ai)
+        worker.row_ready.connect(self._on_row_ready)
+        worker.progress.connect(self._on_progress)
+        worker.all_done.connect(self._on_all_done)
+        worker.finished.connect(self._on_worker_finished)
+        self._workers.append(worker)
+        self._worker = worker
+        worker.start()
+
+    def _stop_worker(self):
+        old = self._worker
+        self._worker = None
+        if old is None:
+            return
+        old.cancel()
+        try:
+            old.row_ready.disconnect(self._on_row_ready)
+            old.progress.disconnect(self._on_progress)
+            old.all_done.disconnect(self._on_all_done)
+        except Exception:
+            pass
+
+    def _on_worker_finished(self):
+        worker = self.sender()
+        if worker in self._workers:
+            self._workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
+        if self._closed and not self._workers:
+            self.deleteLater()
+
+    def _on_row_ready(self, index, text):
+        if self._closed or self.sender() is not self._worker:
+            return
+        if 0 <= index < len(self.translations):
+            self.translations[index] = text
+
+    def _on_progress(self, done, total):
+        if self._closed or self.sender() is not self._worker:
+            return
+        self.lbl_status.setText(f"正在翻译 {done}/{total}…")
+
+    def _on_all_done(self, ok):
+        if self._closed or self.sender() is not self._worker:
+            return
+        self._translated_pm = render_translated_pixmap(self._original_pm, self.blocks, self.translations)
+        self._update_display()
+        if not self.translations:
+            self.lbl_status.setText("未识别到可翻译文字")
+            self.lbl_status.setStyleSheet("color: #CF222E;")
+        elif not ok:
+            self.lbl_status.setText("⚠ 部分内容翻译失败，已保留原文")
+            self.lbl_status.setStyleSheet("color: #9A6700;")
+        else:
+            self.lbl_status.setText("✓ 翻译完成")
+            self.lbl_status.setStyleSheet("color: #1A7F37;")
+        self.btn_copy.setEnabled(True)
+        self.btn_save.setEnabled(True)
+
+    def _on_lang_changed(self):
+        code = self.combo_lang.currentData()
+        if not code or code == self.target_lang:
+            return
+        self.target_lang = code
+        save_settings({"ocr_target_lang": code})
+        self._stop_worker()
+        self._start_translation()
+
+    def _copy_image(self):
+        if self._translated_pm is None or self._translated_pm.isNull():
+            return
+        QApplication.clipboard().setPixmap(self._translated_pm)
+        self.lbl_status.setText("✓ 译文图已复制")
+        self.lbl_status.setStyleSheet("color: #1A7F37;")
+
+    def _save_image(self):
+        if self._translated_pm is None or self._translated_pm.isNull():
+            return
+        try:
+            save_image_dialog(self, self._translated_pm, default_prefix="translated")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+
+    def closeEvent(self, event):
+        if self._closed:
+            event.accept()
+            self.reject()
+            return
+        self._closed = True
+        self._stop_worker()
+        for worker in list(self._workers):
+            worker.cancel()
+        self.hide()
+        event.accept()
+        self.reject()
+        if not self._workers:
+            self.deleteLater()
+
+
+class TranslationOverlay(QWidget):
+    """把译文按原文字块位置覆盖在截图上，支持语言切换与复制。"""
+
+    closed = pyqtSignal()
+
+    def __init__(self, doc: OcrDoc, target_lang, use_ai=False, parent=None):
+        super().__init__(parent)
+        self.doc = doc
+        self.rows = doc.rows
+        self.target_lang = target_lang
+        self.use_ai = use_ai
+        self.translations = ["" for _ in self.rows]
+        self.show_translation = True
+        self._worker = None
+        self._workers = []
+        self._closed = False
+        self._sx = 1.0
+        self._sy = 1.0
+
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.ArrowCursor)
+
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._restore_status)
+
+        self._build_bar()
+        # 延迟到控件显示后再发请求，避免尺寸/布局尚未就绪
+        self._start_timer = QTimer(self)
+        self._start_timer.setSingleShot(True)
+        self._start_timer.timeout.connect(self._start_translation)
+        self._start_timer.start(30)
+
+    def _build_bar(self):
+        self.bar = QWidget(self)
+        self.bar.setObjectName("transOverlayBar")
+        self.bar.setStyleSheet("""
+            QWidget#transOverlayBar {
+                background: #FFFFFF;
+                border: 1px solid #DCDCDC;
+                border-radius: 7px;
+            }
+            QLabel#transStatus {
+                color: #0969da;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 0 6px;
+            }
+            QComboBox {
+                background: #FFFFFF;
+                color: #0f172a;
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+                padding: 3px 8px;
+                font-size: 12px;
+                min-width: 86px;
+            }
+            QPushButton {
+                background: transparent;
+                color: #334155;
+                border: 1px solid transparent;
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: #F1F5F9;
+                border-color: #CBD5E1;
+            }
+            QPushButton#transClose {
+                color: #64748B;
+                font-weight: 600;
+            }
+        """)
+        lay = QHBoxLayout(self.bar)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(6)
+
+        self.lbl_status = QLabel("正在翻译…")
+        self.lbl_status.setObjectName("transStatus")
+        lay.addWidget(self.lbl_status)
+
+        self.combo_lang = QComboBox()
+        for code, label in SUPPORTED_LANGUAGES:
+            self.combo_lang.addItem(label, code)
+        idx = self.combo_lang.findData(self.target_lang)
+        if idx >= 0:
+            self.combo_lang.setCurrentIndex(idx)
+        self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
+        lay.addWidget(self.combo_lang)
+
+        self.btn_toggle = QPushButton("显示原文")
+        self.btn_toggle.clicked.connect(self._toggle_view)
+        lay.addWidget(self.btn_toggle)
+
+        self.btn_copy = QPushButton("复制译文")
+        self.btn_copy.clicked.connect(self._copy_all)
+        lay.addWidget(self.btn_copy)
+
+        btn_close = QPushButton("✕")
+        btn_close.setObjectName("transClose")
+        btn_close.setFixedWidth(26)
+        btn_close.clicked.connect(self.close_overlay)
+        lay.addWidget(btn_close)
+
+        self.bar.adjustSize()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._recalc_scale()
+        self.setFocus()
+        self._place_bar()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._recalc_scale()
+        self._place_bar()
+
+    def _place_bar(self):
+        # 选区很窄时逐级隐藏次要控件，保证“复制/关闭”始终可点
+        self.lbl_status.setVisible(self.width() >= 520)
+        self.btn_toggle.setVisible(self.width() >= 430)
+        self.combo_lang.setVisible(self.width() >= 300)
+        self.bar.adjustSize()
+        x = max(6, self.width() - self.bar.width() - 8)
+        self.bar.move(x, 8)
+        self.bar.raise_()
+
+    def _recalc_scale(self):
+        iw = max(1, self.doc.image_size.width())
+        ih = max(1, self.doc.image_size.height())
+        self._sx = self.width() / iw if iw else 1.0
+        self._sy = self.height() / ih if ih else 1.0
+
+    def _scale_rect(self, rect):
+        return QRect(int(rect.left() * self._sx), int(rect.top() * self._sy),
+                     max(1, int(rect.width() * self._sx)), max(1, int(rect.height() * self._sy)))
+
+    def _start_translation(self):
+        if self._closed:
+            return
+        if self._start_timer.isActive():
+            self._start_timer.stop()
+        texts = [r.text for r in self.rows]
+        self.translations = ["" for _ in self.rows]
+        self.lbl_status.setText("正在翻译…")
+        self.btn_copy.setEnabled(False)
+        worker = RowTranslationWorker(texts, self.target_lang, self.use_ai)
+        worker.row_ready.connect(self._on_row_ready)
+        worker.progress.connect(self._on_progress)
+        worker.all_done.connect(self._on_all_done)
+        worker.finished.connect(self._on_worker_finished)
+        self._workers.append(worker)
+        self._worker = worker
+        worker.start()
+        self.update()
+
+    def _stop_worker(self):
+        """语言切换时取消旧任务；旧线程保留引用，结束后自动释放，避免销毁运行中的 QThread。"""
+        old = self._worker
+        self._worker = None
+        if old is None:
+            return
+        old.cancel()
+        try:
+            old.row_ready.disconnect(self._on_row_ready)
+            old.progress.disconnect(self._on_progress)
+            old.all_done.disconnect(self._on_all_done)
+        except Exception:
+            pass
+
+    def _on_worker_finished(self):
+        worker = self.sender()
+        if worker in self._workers:
+            self._workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
+        if self._closed and not self._workers:
+            self.deleteLater()
+
+    def _on_lang_changed(self):
+        code = self.combo_lang.currentData()
+        if not code or code == self.target_lang:
+            return
+        self.target_lang = code
+        save_settings({"ocr_target_lang": code})
+        self._stop_worker()
+        self._start_translation()
+
+    def _on_row_ready(self, index, text):
+        if self._closed or self.sender() is not self._worker:
+            return
+        if index < 0 or index >= len(self.translations):
+            return
+        self.translations[index] = text
+        self.update()
+
+    def _on_progress(self, done, total):
+        if self._closed or self.sender() is not self._worker:
+            return
+        self.lbl_status.setText(f"正在翻译 {done}/{total}…")
+
+    def _on_all_done(self, ok):
+        if self.sender() is not self._worker:
+            return
+        if self._closed:
+            return
+        self.btn_copy.setEnabled(any(t.strip() for t in self.translations))
+        if ok:
+            self._done_text = "✓ 翻译完成"
+        else:
+            self._done_text = "⚠ 部分行翻译失败"
+        self.lbl_status.setText(self._done_text)
+        self.update()
+
+    def _toggle_view(self):
+        self.show_translation = not self.show_translation
+        self.btn_toggle.setText("显示译文" if not self.show_translation else "显示原文")
+        self.update()
+
+    def _copy_all(self):
+        text = "\n".join(t for t in self.translations if t.strip())
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self.lbl_status.setText("✓ 译文已复制")
+        self._status_timer.start(1600)
+
+    def _restore_status(self):
+        if self._closed:
+            return
+        self.lbl_status.setText(getattr(self, "_done_text", "✓ 翻译完成"))
+
+    def close_overlay(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._start_timer.stop()
+        self._status_timer.stop()
+        self._stop_worker()
+        for worker in list(self._workers):
+            worker.cancel()
+        self.hide()
+        self.closed.emit()
+        if not self._workers:
+            self.deleteLater()
+
+    def paintEvent(self, event):
+        if not self.show_translation:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+
+        painter.fillRect(self.rect(), QColor(255, 255, 255, 26))
+
+        for idx, row in enumerate(self.rows):
+            text = self.translations[idx] if idx < len(self.translations) else ""
+            if not text.strip():
+                continue
+            rect = self._scale_rect(row.rect)
+            if not rect.intersects(self.rect()):
+                continue
+            self._draw_translated_block(painter, rect, text)
+
+        painter.end()
+
+    def _draw_translated_block(self, painter, rect, text):
+        max_w = max(30, min(self.width() - rect.left() - 8, max(rect.width(), int(rect.width() * 2.2))))
+        base_size = max(9, min(16, int(rect.height() * 0.62)))
+        chosen_font = None
+        chosen_rect = None
+        for size in range(base_size, 7, -1):
+            font = QFont("Microsoft YaHei UI")
+            font.setPixelSize(size)
+            fm = QFontMetrics(font)
+            bound = fm.boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, text)
+            if bound.height() <= max(rect.height(), int(rect.height() * 2.2)) and bound.width() <= max_w + 2:
+                chosen_font = font
+                chosen_rect = bound
+                break
+        if chosen_font is None:
+            chosen_font = QFont("Microsoft YaHei UI")
+            chosen_font.setPixelSize(8)
+            fm = QFontMetrics(chosen_font)
+            chosen_rect = fm.boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, text)
+
+        box_w = max(rect.width(), chosen_rect.width() + 10)
+        box_h = max(rect.height(), chosen_rect.height() + 8)
+        box = QRect(rect.left() - 3, rect.top() - 3, box_w + 6, box_h + 6)
+        if box.right() > self.width() - 4:
+            box.setRight(self.width() - 4)
+        if box.bottom() > self.height() - 4:
+            box.setBottom(self.height() - 4)
+
+        painter.setPen(QPen(QColor(203, 213, 225), 1))
+        painter.setBrush(QColor(255, 255, 255, 242))
+        painter.drawRoundedRect(box, 3, 3)
+
+        painter.setFont(chosen_font)
+        painter.setPen(QColor(15, 23, 42))
+        text_rect = box.adjusted(5, 4, -5, -4)
+        painter.drawText(text_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter, text)
+        painter.setBrush(Qt.NoBrush)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close_overlay()
+        elif event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+            self._copy_all()
+        else:
+            super().keyPressEvent(event)
+
 # ==========================================
 # UTILITIES & DRAWING ENGINE
 # ==========================================
@@ -2767,6 +4365,27 @@ class VectorIconFactory:
             a_path.lineTo(18.5, 19.0)
             p.drawPath(a_path)
             p.drawLine(QPointF(10.2, 15.5), QPointF(16.8, 15.5))
+        elif name == 'text_pick':
+            # I 形文字光标 + 右侧文本行
+            p.drawLine(QPointF(6.5, 5.0), QPointF(10.5, 5.0))
+            p.drawLine(QPointF(8.5, 5.0), QPointF(8.5, 22.0))
+            p.drawLine(QPointF(6.5, 22.0), QPointF(10.5, 22.0))
+            p.drawLine(QPointF(14.0, 8.0), QPointF(22.0, 8.0))
+            p.drawLine(QPointF(14.0, 13.5), QPointF(22.0, 13.5))
+            p.drawLine(QPointF(14.0, 19.0), QPointF(19.5, 19.0))
+        elif name == 'translate':
+            # 原文卡片 -> 译文卡片
+            p.drawRoundedRect(QRectF(3.5, 6.0, 9.0, 11.0), 1.5, 1.5)
+            p.drawRoundedRect(QRectF(14.5, 10.0, 9.0, 11.0), 1.5, 1.5)
+            p.drawLine(QPointF(6.0, 9.5), QPointF(10.0, 9.5))
+            p.drawLine(QPointF(6.0, 12.5), QPointF(10.0, 12.5))
+            p.drawLine(QPointF(17.0, 13.5), QPointF(21.0, 13.5))
+            p.drawLine(QPointF(17.0, 16.5), QPointF(21.0, 16.5))
+            arrow = QPainterPath()
+            arrow.moveTo(12.0, 7.5)
+            arrow.lineTo(15.0, 10.5)
+            arrow.lineTo(12.0, 13.5)
+            p.drawPath(arrow)
         elif name == 'scroll':
             p.drawRoundedRect(QRectF(5.0, 4.0, 17.0, 19.0), 2.5, 2.5)
             p.drawLine(QPointF(13.5, 8.0), QPointF(13.5, 18.0))
@@ -2929,7 +4548,7 @@ class ColorPaletteWidget(QWidget):
 
 class SnipasteToolbar(QWidget):
     tool_triggered = pyqtSignal(str)   # 'RECT_ELLIPSE', 'ARROW', 'PEN', 'MARKER', 'MOSAIC_BLUR', 'TEXT', 'ERASER'
-    action_triggered = pyqtSignal(str) # 'UNDO', 'REDO', 'CROP', 'OCR', 'SCROLL', 'RECORD', 'HISTORY', 'CLOSE', 'PIN', 'SAVE', 'COPY'
+    action_triggered = pyqtSignal(str) # 'UNDO', 'REDO', 'CROP', 'OCR', 'TRANSLATE', 'SCROLL', 'RECORD', 'HISTORY', 'CLOSE', 'PIN', 'SAVE', 'COPY'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3040,22 +4659,27 @@ class SnipasteToolbar(QWidget):
         self.btn_ocr.clicked.connect(lambda: self.action_triggered.emit('OCR'))
         layout.addWidget(self.btn_ocr)
 
-        # 12. 滚动截图
+        # 12. 一键翻译 (识别 + 翻译，直接出结果)
+        self.btn_ocr_translate = self._create_btn("translate", "一键翻译当前截图 (结果显示方式可在设置中切换)", checkable=False)
+        self.btn_ocr_translate.clicked.connect(lambda: self.action_triggered.emit('TRANSLATE'))
+        layout.addWidget(self.btn_ocr_translate)
+
+        # 13. 滚动截图
         self.btn_scroll = self._create_btn("scroll", "滚动长截图 (Space)", checkable=False)
         self.btn_scroll.clicked.connect(lambda: self.action_triggered.emit('SCROLL'))
         layout.addWidget(self.btn_scroll)
 
-        # 13. 屏幕录制
+        # 14. 屏幕录制
         self.btn_record = self._create_btn("record", "屏幕录制 (F4)", checkable=False)
         self.btn_record.clicked.connect(lambda: self.action_triggered.emit('RECORD'))
         layout.addWidget(self.btn_record)
 
-        # 14. 截图历史
+        # 15. 截图历史
         self.btn_history = self._create_btn("history", "截图历史", checkable=False)
         self.btn_history.clicked.connect(lambda: self.action_triggered.emit('HISTORY'))
         layout.addWidget(self.btn_history)
 
-        # 15. 窗口置顶 (DeskPin)
+        # 16. 窗口置顶 (DeskPin)
         self.btn_win_pin = self._create_btn("window_pin", "窗口置顶 (DeskPin: 点击任意窗口将其置顶)", checkable=False)
         self.btn_win_pin.clicked.connect(lambda: self.action_triggered.emit('WINDOW_PIN'))
         layout.addWidget(self.btn_win_pin)
@@ -5669,6 +7293,13 @@ class SettingsDialog(QDialog):
         self.input_volc_model.setPlaceholderText("例如: ep-20260629102203-cfllm")
         ai_layout.addWidget(self.input_volc_model, 6, 1)
 
+        ai_layout.addWidget(QLabel("结果展示:"), 7, 0)
+        self.combo_trans_display = QComboBox()
+        self.combo_trans_display.setFixedHeight(32)
+        self.combo_trans_display.addItem("双栏对照（左原图 / 右译文图）", "dialog")
+        self.combo_trans_display.addItem("译文图（单图显示）", "overlay")
+        ai_layout.addWidget(self.combo_trans_display, 7, 1)
+
         content_layout.addWidget(ai_group)
         content_layout.addStretch(1)
 
@@ -5733,6 +7364,11 @@ class SettingsDialog(QDialog):
         self.input_volc_model.setText(s.get("volc_model", DEFAULT_VOLC_TRANS_MODEL))
         self.cb_ai_trans.setChecked(s.get("use_ai_translation", False))
 
+        display_mode = str(s.get("translation_display_mode", "dialog") or "dialog")
+        idx_display = self.combo_trans_display.findData(display_mode)
+        if idx_display >= 0:
+            self.combo_trans_display.setCurrentIndex(idx_display)
+
     def _reset_default_hotkeys(self):
         self.input_hk_snip.setText("F1")
         self.input_hk_ocr.setText("F2")
@@ -5772,6 +7408,7 @@ class SettingsDialog(QDialog):
             "volc_model": self.input_volc_model.text().strip() or DEFAULT_VOLC_TRANS_MODEL,
             "use_ai_translation": self.cb_ai_trans.isChecked(),
             "use_ai_ocr": self.cb_ai_ocr.isChecked(),
+            "translation_display_mode": self.combo_trans_display.currentData(),
         }
         save_settings(new_settings)
         if self.hotkey_mgr:
@@ -7070,6 +8707,35 @@ class ScreenshotTool(QWidget):
         
         self.ocr_rect = None 
         self.ocr_worker = None
+        self._ocr_doc = None
+        self._ocr_doc_key = None
+        self._ocr_doc_image = None
+        self._ocr_doc_worker = None
+        self._ocr_busy = False
+        self._text_select_layer = None
+        self._translation_overlay = None
+        self._retired_overlays = []
+        self._translate_worker = None
+        self._active_translation_window = None
+        self._ocr_running = False
+        self._ocr_generation = 0
+        self._ocr_waiters = []
+        self._text_dragging = False
+        self._text_sel_start = QPoint()
+        self._text_sel_start_index = None
+        self._text_sel_column_rect = QRect()
+        self._text_sel_rect = QRect()
+        self._text_selected = set()
+        self._text_hover = None
+        self._text_flash = ""
+        self._text_ocr_hint = ""
+        self._auto_ocr_pending = False
+        self._text_flash_timer = QTimer(self)
+        self._text_flash_timer.setSingleShot(True)
+        self._text_flash_timer.timeout.connect(self._clear_text_flash)
+        self._auto_ocr_timer = QTimer(self)
+        self._auto_ocr_timer.setSingleShot(True)
+        self._auto_ocr_timer.timeout.connect(self._run_auto_text_ocr)
         self.color_pick_pos = None
         self.color_picker_visible = False
         self.color_output_hex = False
@@ -7110,9 +8776,15 @@ class ScreenshotTool(QWidget):
             })
             state = self.undo_stack.pop()
             self.edits = state['edits']
-            self.selection_rect = state['selection_rect']
+            new_rect = state['selection_rect']
+            sel_changed = new_rect != self.selection_rect
+            self.selection_rect = new_rect
             self.update_undo_redo_states()
             self.update()
+            if sel_changed:
+                self._invalidate_text_doc()
+                if self.state == "EDITING":
+                    self._schedule_auto_text_ocr()
 
     def redo(self):
         if self.redo_stack:
@@ -7123,9 +8795,15 @@ class ScreenshotTool(QWidget):
             })
             state = self.redo_stack.pop()
             self.edits = state['edits']
-            self.selection_rect = state['selection_rect']
+            new_rect = state['selection_rect']
+            sel_changed = new_rect != self.selection_rect
+            self.selection_rect = new_rect
             self.update_undo_redo_states()
             self.update()
+            if sel_changed:
+                self._invalidate_text_doc()
+                if self.state == "EDITING":
+                    self._schedule_auto_text_ocr()
 
     def erase_annotation_under_mouse(self, pos):
         for i in range(len(self.edits) - 1, -1, -1):
@@ -7172,6 +8850,9 @@ class ScreenshotTool(QWidget):
             self.set_tool(tool_name)
 
     def on_action_triggered(self, action_name):
+        if action_name != 'TRANSLATE':
+            self._close_text_select_layer()
+            self._close_translation_overlay()
         if action_name == 'UNDO':
             self.undo()
         elif action_name == 'REDO':
@@ -7180,6 +8861,8 @@ class ScreenshotTool(QWidget):
             self.enter_crop_mode()
         elif action_name == 'OCR':
             self.activate_ocr()
+        elif action_name == 'TRANSLATE':
+            self.translate_current_capture()
         elif action_name == 'SCROLL':
             self.start_scroll()
         elif action_name == 'RECORD':
@@ -7345,6 +9028,14 @@ class ScreenshotTool(QWidget):
         self.crop_ratio = None
         self.crop_drag_handle = None
         self._cached_selection_pixmap = None
+        self._close_text_select_layer()
+        self._close_translation_overlay()
+        self._close_translation_result_window()
+        self._auto_ocr_timer.stop()
+        self._text_flash_timer.stop()
+        self._auto_ocr_pending = False
+        self._text_flash = ""
+        self._invalidate_text_doc()
         self.toolbar.hide()
         if hasattr(self, 'options_bar'):
             self.options_bar.hide()
@@ -7385,6 +9076,13 @@ class ScreenshotTool(QWidget):
             self.recording_intent = False
             if hasattr(self, 'crop_toolbar'):
                 self.crop_toolbar.hide()
+            self._close_text_select_layer()
+            self._close_translation_overlay()
+            self._close_translation_result_window()
+            self._auto_ocr_timer.stop()
+            self._text_flash_timer.stop()
+            self._auto_ocr_pending = False
+            self._invalidate_text_doc()
             self.commit_text_edit()
             has_selection = hasattr(self, 'selection_rect') and not self.selection_rect.isNull() and not self.selection_rect.isEmpty()
             if keep_history and has_selection:
@@ -7492,6 +9190,575 @@ class ScreenshotTool(QWidget):
             dlg.exec_()
         except Exception as e:
             logging.error("_on_quick_ocr_finished 异常: %s", e, exc_info=True)
+
+    # ---------- 取字 / 一键翻译 ----------
+    def _valid_capture_selection(self):
+        return (self.isVisible() and self.state == "EDITING" and not self.selection_rect.isNull()
+                and self.selection_rect.width() > 10 and self.selection_rect.height() > 10)
+
+    def _enter_modal_layer(self):
+        """进入取字/译文层时隐藏截图工具栏，退出后恢复"""
+        if hasattr(self, 'toolbar'):
+            self.toolbar.hide()
+        if hasattr(self, 'options_bar'):
+            self.options_bar.hide()
+
+    def _leave_modal_layer(self):
+        self.setCursor(Qt.CrossCursor)
+        self.update_toolbar_positions()
+        self.setFocus()
+
+    def _on_text_layer_closed(self):
+        layer = self._text_select_layer
+        self._text_select_layer = None
+        if layer is not None:
+            try:
+                layer.hide()
+                layer.deleteLater()
+            except RuntimeError:
+                pass
+        self._leave_modal_layer()
+
+    def _on_translation_overlay_closed(self):
+        overlay = self._translation_overlay
+        self._translation_overlay = None
+        if overlay is not None:
+            self._retired_overlays.append(overlay)
+            try:
+                overlay.destroyed.connect(lambda _obj=None, ov=overlay: self._forget_overlay(ov))
+            except RuntimeError:
+                pass
+        self._leave_modal_layer()
+
+    def _forget_overlay(self, overlay):
+        try:
+            self._retired_overlays.remove(overlay)
+        except ValueError:
+            pass
+
+    def _on_translation_window_destroyed(self, *_args):
+        self._active_translation_window = None
+
+    def _close_text_select_layer(self):
+        if self._text_select_layer is not None:
+            self._on_text_layer_closed()
+
+    def _close_translation_overlay(self):
+        overlay = self._translation_overlay
+        if overlay is not None:
+            try:
+                overlay.close_overlay()
+            except RuntimeError:
+                self._on_translation_overlay_closed()
+
+    def _close_translation_result_window(self):
+        window = self._active_translation_window
+        if window is not None:
+            try:
+                window.close()
+            except RuntimeError:
+                pass
+            self._active_translation_window = None
+
+    def _set_ocr_busy(self, busy):
+        self._ocr_busy = busy
+        btn = getattr(self.toolbar, 'btn_ocr_translate', None)
+        if btn is not None:
+            btn.setEnabled(not busy)
+
+    def _current_capture_image(self):
+        self.commit_text_edit()
+        pixmap = self.get_final_static_image()
+        return pixmap.toImage() if pixmap is not None and not pixmap.isNull() else QImage()
+
+    @staticmethod
+    def _image_digest(image):
+        """生成稳定的图像指纹，用于 OCR 结果缓存（QImage.cacheKey 每次都会变，不能用）。"""
+        img = image.convertToFormat(QImage.Format_RGB888)
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        digest = hashlib.md5(ptr.asstring(img.byteCount())).hexdigest()
+        return (img.width(), img.height(), digest)
+
+    def _request_ocr_doc(self, on_ready, on_no_coords=None, on_error=None, silent=False):
+        """整图 OCR（强制本地引擎以保留文字坐标），同一张图优先复用缓存。"""
+        if self._ocr_running:
+            self._ocr_waiters.append({"ready": on_ready, "no_coords": on_no_coords, "error": on_error})
+            if not silent:
+                QToolTip.showText(QCursor.pos(), "正在识别文字，请稍候…", None, QRect(), 1500)
+            return
+
+        image = self._current_capture_image()
+        if image.isNull():
+            if on_error:
+                on_error("截图区域无效")
+            return
+
+        # 超大截图先缩放，显著降低 OCR 耗时；坐标会按比例映射回选区
+        if max(image.width(), image.height()) > 2600:
+            image = image.scaled(2600, 2600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        key = self._image_digest(image)
+        if self._ocr_doc is not None and self._ocr_doc_key == key and not self._ocr_doc.is_empty():
+            cached_doc = self._ocr_doc
+            def _cached_ready():
+                if self.isVisible() and self.state == "EDITING":
+                    on_ready(cached_doc)
+                    self._drain_ocr_waiters(doc=cached_doc)
+            QTimer.singleShot(0, _cached_ready)
+            return
+
+        self._ocr_running = True
+        generation = self._ocr_generation
+        if not silent:
+            self._set_ocr_busy(True)
+            QToolTip.showText(QCursor.pos(), "🔤 正在识别文字…", None, QRect(), 4000)
+        worker = OcrWorker(image, use_ai=False, fast=True)
+        self._ocr_doc_worker = worker
+        state = {"doc": None}
+
+        def _on_doc(doc):
+            if generation != self._ocr_generation:
+                # 旧截图的识别结果已过期（选区被移动/裁剪），丢弃并重新识别当前选区
+                self._ocr_running = False
+                if not silent:
+                    self._set_ocr_busy(False)
+                    QToolTip.hideText()
+                self._schedule_auto_text_ocr()
+                return
+            state["doc"] = doc
+            self._ocr_doc = doc
+            self._ocr_doc_key = key
+            self._ocr_doc_image = image
+            self._ocr_running = False
+            if not silent:
+                self._set_ocr_busy(False)
+                QToolTip.hideText()
+            if self.isVisible() and self.state == "EDITING":
+                on_ready(doc)
+            self._drain_ocr_waiters(doc=doc)
+
+        def _on_finished(text):
+            if generation != self._ocr_generation:
+                self._ocr_running = False
+                if not silent:
+                    self._set_ocr_busy(False)
+                    QToolTip.hideText()
+                self._schedule_auto_text_ocr()
+                return
+            self._ocr_running = False
+            if not silent:
+                self._set_ocr_busy(False)
+                QToolTip.hideText()
+            if self._ocr_doc_worker is worker:
+                self._ocr_doc_worker = None
+            if state["doc"] is not None:
+                return
+            clean = (text or "").strip()
+            if not self.isVisible() or self.state != "EDITING":
+                self._drain_ocr_waiters(error="截图已关闭")
+                return
+            if clean and not clean.startswith("识别发生错误"):
+                if on_no_coords:
+                    on_no_coords(clean)
+                self._drain_ocr_waiters(text=clean)
+            else:
+                msg = clean or "未识别到文字"
+                if on_error:
+                    on_error(msg)
+                self._drain_ocr_waiters(error=msg)
+
+        worker.doc_ready.connect(_on_doc)
+        worker.finished.connect(_on_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _drain_ocr_waiters(self, doc=None, text=None, error=None):
+        """后台自动识别期间用户点了一键翻译时，等识别完成后再执行，避免点击丢失。"""
+        waiters = self._ocr_waiters
+        self._ocr_waiters = []
+        for waiter in waiters:
+            try:
+                if not self.isVisible() or self.state != "EDITING":
+                    continue
+                if doc is not None:
+                    waiter["ready"](doc)
+                elif text:
+                    if waiter.get("no_coords"):
+                        waiter["no_coords"](text)
+                elif waiter.get("error"):
+                    waiter["error"](error or "未识别到文字")
+            except Exception as e:
+                logging.warning("OCR 等待回调异常: %s", e)
+
+    # ---------- 截图后自动取字 ----------
+    def _text_doc_ready(self):
+        return (self._ocr_doc is not None and not self._ocr_doc.is_empty()
+                and self.state == "EDITING" and not self.crop_mode
+                and self.current_tool is None)
+
+    def _text_geometry(self):
+        doc = self._ocr_doc
+        sel = self.selection_rect
+        iw = max(1, doc.image_size.width()) if doc else 1
+        ih = max(1, doc.image_size.height()) if doc else 1
+        return (sel.width() / iw, sel.height() / ih, sel.left(), sel.top())
+
+    def _text_widget_rect(self, char_rect):
+        sx, sy, ox, oy = self._text_geometry()
+        return QRect(ox + int(char_rect.left() * sx), oy + int(char_rect.top() * sy),
+                     max(1, int(char_rect.width() * sx)), max(1, int(char_rect.height() * sy)))
+
+    def _text_char_at(self, pos):
+        if not self._text_doc_ready():
+            return None
+        doc = self._ocr_doc
+        sx, sy, ox, oy = self._text_geometry()
+        if sx <= 0 or sy <= 0:
+            return None
+        lx = int((pos.x() - ox) / sx)
+        ly = int((pos.y() - oy) / sy)
+        for ri, row in enumerate(doc.rows):
+            if ly < row.rect.top() - 3 or ly > row.rect.bottom() + 3:
+                continue
+            for ci, cr in enumerate(row.char_rects):
+                if cr.adjusted(-2, -2, 2, 2).contains(QPoint(lx, ly)):
+                    return (ri, ci)
+        return None
+
+    def _schedule_auto_text_ocr(self):
+        if self._valid_capture_selection():
+            self._auto_ocr_timer.start(120)
+
+    def _run_auto_text_ocr(self):
+        if not self._valid_capture_selection():
+            return
+        if self._text_select_layer is not None or self._translation_overlay is not None:
+            return
+        if getattr(self, '_auto_ocr_pending', False):
+            return
+        self._auto_ocr_pending = True
+        self._text_ocr_hint = "正在识别文字…"
+        self.update()
+
+        def _ok(doc):
+            self._auto_ocr_pending = False
+            self._text_ocr_hint = ""
+            self.update()
+
+        def _fail(_msg=""):
+            self._auto_ocr_pending = False
+            self._text_ocr_hint = ""
+            self.update()
+
+        self._request_ocr_doc(_ok, on_no_coords=_fail, on_error=_fail, silent=True)
+
+    def _reset_text_selection_state(self):
+        self._text_dragging = False
+        self._text_sel_start = QPoint()
+        self._text_sel_start_index = None
+        self._text_sel_column_rect = QRect()
+        self._text_sel_rect = QRect()
+        self._text_selected = set()
+        self._text_hover = None
+
+    def _invalidate_text_doc(self):
+        self._ocr_generation += 1
+        self._ocr_waiters = []
+        self._auto_ocr_pending = False
+        self._ocr_doc = None
+        self._ocr_doc_key = None
+        self._ocr_doc_image = None
+        self._text_ocr_hint = ""
+        self._reset_text_selection_state()
+        self.update()
+
+    def _flash_text_status(self, text, ms=2600):
+        self._text_flash = text
+        self._text_flash_timer.start(ms)
+        self.update()
+
+    def _clear_text_flash(self):
+        self._text_flash = ""
+        self.update()
+
+    def _text_column_rows(self):
+        """锁定起始文字所在列，复制时不会把侧边栏/另一栏的文字混进来。"""
+        if self._ocr_doc is None:
+            return []
+        rows = self._ocr_doc.rows
+        col = self._text_sel_column_rect
+        if col.isNull():
+            return list(range(len(rows)))
+        result = []
+        img_w = self._ocr_doc.image_size.width() or col.right()
+        if col.left() >= img_w * 0.25:
+            # 起始点在右半区：锁定右侧正文列，左侧侧边栏不参与
+            col_left = max(0, col.left() - int(img_w * 0.03))
+            col_right = img_w - 1
+        elif col.width() < img_w * 0.30:
+            # 起始点在左侧窄带：按侧边栏处理
+            col_left = 0
+            col_right = min(img_w - 1, col.right() + int(img_w * 0.08))
+        else:
+            col_left, col_right = 0, img_w - 1
+        for ri, row in enumerate(rows):
+            # 只按横向区间判断同一列，纵向要覆盖整张图，不能只看起始行的高度
+            left = max(col_left, row.rect.left())
+            right = min(col_right, row.rect.right())
+            overlap = max(0, right - left + 1)
+            min_w = min(col.width(), row.rect.width())
+            if min_w > 0 and overlap / min_w >= 0.30:
+                result.append(ri)
+        return result or list(range(len(rows)))
+
+    def _text_flat(self, row_indices=None):
+        if self._ocr_doc is None:
+            return []
+        rows = self._ocr_doc.rows
+        if row_indices is None:
+            row_indices = range(len(rows))
+        flat = []
+        for ri in row_indices:
+            row = rows[ri]
+            for ci in range(len(row.text)):
+                flat.append((ri, ci))
+        return flat
+
+    def _text_index_at(self, pos, row_indices=None):
+        """把鼠标位置映射成阅读顺序中的字符索引，用于像文本编辑器一样线性选取。"""
+        if not self._text_doc_ready():
+            return None
+        doc = self._ocr_doc
+        sx, sy, ox, oy = self._text_geometry()
+        if sx <= 0 or sy <= 0:
+            return None
+        lx = (pos.x() - ox) / sx
+        ly = (pos.y() - oy) / sy
+        rows = doc.rows
+        if not rows:
+            return None
+        candidates = list(row_indices) if row_indices is not None else list(range(len(rows)))
+        if not candidates:
+            candidates = list(range(len(rows)))
+
+        def vdist(row):
+            if ly < row.rect.top():
+                return row.rect.top() - ly
+            if ly > row.rect.bottom():
+                return ly - row.rect.bottom()
+            return 0
+
+        def hdist(row):
+            if lx < row.rect.left():
+                return row.rect.left() - lx
+            if lx > row.rect.right():
+                return lx - row.rect.right()
+            return 0
+
+        # 先看纵向距离，再看横向距离，避免在左右两栏之间起选时选错列
+        ri = min(candidates, key=lambda i: (vdist(rows[i]), hdist(rows[i])))
+        row = rows[ri]
+        for ci, cr in enumerate(row.char_rects):
+            if cr.center().x() >= lx:
+                return (ri, ci)
+        return (ri, max(0, len(row.char_rects) - 1))
+
+    def _start_text_selection(self, pos):
+        self.drag_mode = None
+        self._text_dragging = True
+        self._text_sel_start = pos
+        self._text_sel_column_rect = QRect()
+        self._text_sel_start_index = self._text_index_at(pos)
+        if self._text_sel_start_index is not None and self._ocr_doc is not None:
+            ri = self._text_sel_start_index[0]
+            self._text_sel_column_rect = QRect(self._ocr_doc.rows[ri].rect)
+        self._text_sel_rect = QRect(pos, pos)
+        self._text_selected = set()
+        self._text_hover = None
+        self.color_picker_visible = False
+        self.setCursor(Qt.IBeamCursor)
+        self.update()
+
+    def _update_text_selection(self, pos):
+        self._text_sel_rect = QRect(self._text_sel_start, pos).normalized()
+        if self._ocr_doc is None or self._text_sel_start_index is None:
+            return
+        row_indices = self._text_column_rows()
+        end_index = self._text_index_at(pos, row_indices)
+        if end_index is None:
+            return
+        flat = self._text_flat(row_indices)
+        try:
+            a = flat.index(self._text_sel_start_index)
+            b = flat.index(end_index)
+        except ValueError:
+            return
+        lo, hi = (a, b) if a <= b else (b, a)
+        self._text_selected = set(flat[lo:hi + 1])
+        self.update()
+
+    def _finish_text_selection(self, pos):
+        self._text_dragging = False
+        moved = (pos - self._text_sel_start).manhattanLength()
+        if moved < 3:
+            # 单击不复制，只清掉之前的选区；整行复制改为双击
+            self._text_selected.clear()
+            self._text_sel_rect = QRect()
+            self._text_hover = self._text_char_at(pos)
+            self.update()
+            return
+        self._update_text_selection(pos)
+        self.update()
+
+    def _selected_text(self):
+        if not self._text_selected or self._ocr_doc is None:
+            return ""
+        lines = []
+        for ri, row in enumerate(self._ocr_doc.rows):
+            chars = [row.text[ci] for ci in range(len(row.text)) if (ri, ci) in self._text_selected]
+            if chars:
+                lines.append("".join(chars).rstrip())
+        return "\n".join(lines).strip()
+
+    def _copy_selected_text(self):
+        text = self._selected_text()
+        if not text:
+            return False
+        QApplication.clipboard().setText(text)
+        # 复制后立即清掉文字高亮和状态胶囊，避免白色块继续罩住原文
+        self._text_flash = ""
+        self._text_flash_timer.stop()
+        self._reset_text_selection_state()
+        self.repaint()
+        return True
+
+    def _select_all_text(self):
+        if not self._text_doc_ready():
+            return
+        self._text_selected = {(ri, ci) for ri, row in enumerate(self._ocr_doc.rows)
+                               for ci in range(len(row.text))}
+        self._text_sel_rect = QRect(self.selection_rect)
+        self.update()
+
+    def _clear_text_selection(self):
+        self._reset_text_selection_state()
+        self._text_flash = ""
+        self.update()
+
+    def _draw_text_status_pill(self, painter, text):
+        """状态提示固定在选区外侧（左下或左上），不跟随鼠标和文字选区。"""
+        if not text:
+            return
+        font = QFont("Microsoft YaHei UI")
+        font.setPixelSize(12)
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        w = fm.horizontalAdvance(text) + 20
+        h = 26
+        x = max(6, min(self.selection_rect.left(), self.width() - w - 6))
+        y = self.selection_rect.bottom() + 8
+        if y + h > self.height() - 6:
+            y = max(6, self.selection_rect.top() - h - 8)
+        rect = QRect(x, y, w, h)
+        painter.setPen(QPen(QColor(203, 213, 225), 1))
+        painter.setBrush(QColor(255, 255, 255, 242))
+        painter.drawRoundedRect(rect, 7, 7)
+        painter.setPen(QColor(51, 65, 85))
+        painter.drawText(rect, Qt.AlignCenter, text)
+
+    def _draw_text_layer(self, painter):
+        doc = self._ocr_doc
+        if doc is None or doc.is_empty():
+            return
+        if self._text_selected:
+            fill = QColor(55, 138, 221, 78)
+            border = QColor(24, 95, 165, 75)
+            painter.setPen(QPen(border, 1))
+            for ri, row in enumerate(doc.rows):
+                idxs = sorted(ci for (r, ci) in self._text_selected
+                              if r == ri and ci < len(row.char_rects))
+                if not idxs:
+                    continue
+                runs = []
+                start = prev = idxs[0]
+                for ci in idxs[1:]:
+                    if ci == prev + 1:
+                        prev = ci
+                    else:
+                        runs.append((start, prev))
+                        start = prev = ci
+                runs.append((start, prev))
+                for a, b in runs:
+                    ra = self._text_widget_rect(row.char_rects[a])
+                    rb = self._text_widget_rect(row.char_rects[b])
+                    rect = QRect(ra.left(), min(ra.top(), rb.top()),
+                                 max(1, rb.right() - ra.left() + 1), max(ra.height(), rb.height()))
+                    painter.fillRect(rect, fill)
+                    painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        elif self._text_hover is not None:
+            try:
+                ri, ci = self._text_hover
+                rect = self._text_widget_rect(doc.rows[ri].char_rects[ci])
+                painter.fillRect(QRect(rect.left(), rect.bottom() - 2, rect.width(), 2),
+                                 QColor(55, 138, 221, 190))
+            except (IndexError, KeyError):
+                pass
+
+    def translate_current_capture(self):
+        """一键翻译：OCR 后生成覆盖译文的图片，按设置显示单图或左右对照。"""
+        if not self._valid_capture_selection():
+            QMessageBox.information(None, "一键翻译", "请先框选需要翻译的截图区域。")
+            return
+
+        self._close_text_select_layer()
+        self._close_translation_overlay()
+        self._enter_modal_layer()
+
+        def _ready(doc):
+            text = doc.text.strip() if doc is not None else ""
+            if not text:
+                self._leave_modal_layer()
+                QMessageBox.information(None, "一键翻译", "未识别到文字，请重新框选清晰区域。")
+                return
+            target = resolve_ocr_target_lang(text)
+            use_ai = bool(load_settings().get("use_ai_translation", False))
+            mode = str(load_settings().get("translation_display_mode", "dialog") or "dialog")
+
+            if self._ocr_doc_image is not None and not self._ocr_doc_image.isNull():
+                base_pixmap = QPixmap.fromImage(self._ocr_doc_image)
+            else:
+                base_pixmap = self.get_final_static_image()
+            if base_pixmap is None or base_pixmap.isNull():
+                self._leave_modal_layer()
+                QMessageBox.warning(None, "一键翻译失败", "无法获取当前截图。")
+                return
+
+            window = TranslationResultWindow(
+                base_pixmap, doc, target, use_ai,
+                mode="overlay" if mode == "overlay" else "compare",
+                parent=self
+            )
+            self._active_translation_window = window
+            try:
+                window.destroyed.connect(self._on_translation_window_destroyed)
+            except Exception:
+                pass
+            window.exec_()
+            self._leave_modal_layer()
+
+        def _no_coords(text):
+            # 极少数本地引擎完全没有坐标时，退化为文字对照
+            self._leave_modal_layer()
+            dlg = OcrResultDialog(text, self)
+            self._active_ocr_dialog = dlg
+            dlg.exec_()
+
+        def _error(err):
+            self._leave_modal_layer()
+            QMessageBox.warning(None, "一键翻译失败", err or "未识别到文字")
+
+        self._request_ocr_doc(_ready, on_no_coords=_no_coords, on_error=_error)
 
     def start_recording_session(self, target_rect):
         """开启录屏准备会话（显示红框与悬浮控制条）"""
@@ -7673,10 +9940,9 @@ class ScreenshotTool(QWidget):
             self.setCursor(Qt.PointingHandCursor)
         elif self.current_tool is None:
             if pos is not None and self.state == "EDITING":
-                edge = self.get_resize_edge(pos)
-                if edge == 'move':
-                    self.setCursor(Qt.SizeAllCursor)
-                elif edge in ['topleft', 'bottomright']:
+                # 截图完成后禁止拖动整个选区，只有边框/角点可拉伸
+                edge = self.get_resize_edge(pos, allow_move=False)
+                if edge in ['topleft', 'bottomright']:
                     self.setCursor(Qt.SizeFDiagCursor)
                 elif edge in ['topright', 'bottomleft']:
                     self.setCursor(Qt.SizeBDiagCursor)
@@ -7685,7 +9951,9 @@ class ScreenshotTool(QWidget):
                 elif edge in ['top', 'bottom']:
                     self.setCursor(Qt.SizeVerCursor)
                 else:
-                    self.setCursor(Qt.CrossCursor)
+                    self.setCursor(Qt.ArrowCursor)
+            elif self.state == "EDITING":
+                self.setCursor(Qt.ArrowCursor)
             else:
                 self.setCursor(Qt.CrossCursor)
 
@@ -7716,6 +9984,8 @@ class ScreenshotTool(QWidget):
             return
 
         self.current_tool = tool_name
+        self._reset_text_selection_state()
+        self._text_flash = ""
         if hasattr(self, 'toolbar') and isinstance(self.toolbar, SnipasteToolbar):
             self.toolbar.set_active_tool(tool_name)
         if hasattr(self, 'options_bar') and isinstance(self.options_bar, ToolOptionsBar):
@@ -7729,7 +9999,7 @@ class ScreenshotTool(QWidget):
         elif self.crop_mode:
             self.exit_crop_mode()
 
-    def get_resize_edge(self, pos):
+    def get_resize_edge(self, pos, allow_move=True):
         r = self.selection_rect
         margin = 10; x, y = pos.x(), pos.y()
         left, right = abs(x - r.left()) < margin, abs(x - r.right()) < margin
@@ -7743,7 +10013,7 @@ class ScreenshotTool(QWidget):
         if right: return 'right'
         if top: return 'top'
         if bottom: return 'bottom'
-        if r.contains(pos): return 'move'
+        if r.contains(pos): return 'move' if allow_move else None
         return None
 
     def commit_text_edit(self):
@@ -7887,6 +10157,26 @@ class ScreenshotTool(QWidget):
             self.update()
 
     def keyPressEvent(self, event):
+        # 取字 / 译文层打开时，键盘事件统一交给该层处理（Esc 只退出该层，不关闭整个截图）
+        active_layer = self._text_select_layer or self._translation_overlay
+        if active_layer is not None:
+            active_layer.keyPressEvent(event)
+            return
+
+        if self.state == "EDITING" and not self.crop_mode:
+            if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier and self._text_selected:
+                if self._copy_selected_text():
+                    return
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._text_selected:
+                if self._copy_selected_text():
+                    return
+            if event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier and self._text_doc_ready():
+                self._select_all_text()
+                return
+            if event.key() == Qt.Key_Escape and self._text_selected:
+                self._clear_text_selection()
+                return
+
         if getattr(self, 'ocr_intent', False):
             if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
                 self.ocr_intent = False
@@ -7933,10 +10223,12 @@ class ScreenshotTool(QWidget):
                     self.selection_rect = QRect(self.hovered_window_rect)
                     self.hovered_window_rect = None
                     self.state = "EDITING"
+                    self.color_picker_visible = False
                     self.drag_mode = None
                     self.setFocus()
                     self.show_toolbar()
                     self.update()
+                    self._schedule_auto_text_ocr()
                     return
             if self.color_picker_visible:
                 if event.key() == Qt.Key_C:
@@ -8127,7 +10419,8 @@ class ScreenshotTool(QWidget):
                 draw_viewfinder_corners(painter, self.selection_rect, border_color, length=14, width=3)
 
                 # 悬浮尺寸徽标
-                draw_selection_badge(painter, self.selection_rect, badge_text, border_color=border_color)
+                if self.state != "EDITING":
+                    draw_selection_badge(painter, self.selection_rect, badge_text, border_color=border_color)
 
                 # 编辑状态下的标注图元绘制
                 if self.state == "EDITING":
@@ -8142,6 +10435,8 @@ class ScreenshotTool(QWidget):
                         painter.drawRect(self.text_rect.adjusted(1, 1, -1, -1))
 
                     painter.setClipping(False)
+                    if not self.crop_mode:
+                        self._draw_text_layer(painter)
 
                     if self.crop_mode and getattr(self, 'crop_rect', None):
                         crop_outer = QRegion(self.selection_rect).subtracted(QRegion(self.crop_rect))
@@ -8183,7 +10478,9 @@ class ScreenshotTool(QWidget):
                         painter.setBrush(Qt.NoBrush)
                         painter.drawRect(self.ocr_rect)
 
-            self.draw_color_picker(painter)
+            # 颜色拾取放大镜只在框选阶段显示；截图完成后不再弹出，避免遮挡文字
+            if self.state == "SELECTING":
+                self.draw_color_picker(painter)
         except Exception as e:
             logging.error("ScreenshotTool paintEvent 绘制异常: %s", e, exc_info=True)
         finally:
@@ -8191,8 +10488,22 @@ class ScreenshotTool(QWidget):
                 painter.end()
 
     def mouseDoubleClickEvent(self, event):
+        if self._text_select_layer is not None or self._translation_overlay is not None:
+            return
         if event.button() != Qt.LeftButton: return
         pos = event.pos()
+
+        # 双击文字：复制整行（单击只清选区，不复制）
+        if (self.state == "EDITING" and not self.crop_mode
+                and self.current_tool is None and self._text_doc_ready()):
+            hit = self._text_char_at(pos)
+            if hit is not None:
+                ri = hit[0]
+                self._text_selected = {(ri, ci) for ci in range(len(self._ocr_doc.rows[ri].text))}
+                self._text_sel_rect = self._text_widget_rect(self._ocr_doc.rows[ri].rect)
+                self._copy_selected_text()
+                return
+
         if getattr(self, 'ocr_intent', False):
             self.ocr_intent = False
             screen_geo = QApplication.primaryScreen().geometry()
@@ -8213,10 +10524,12 @@ class ScreenshotTool(QWidget):
                 self.selection_rect = QRect(self.hovered_window_rect)
                 self.hovered_window_rect = None
                 self.state = "EDITING"
+                self.color_picker_visible = False
                 self.drag_mode = None
                 self.setFocus()
                 self.show_toolbar()
                 self.update()
+                self._schedule_auto_text_ocr()
                 return
 
         # 裁剪模式下双击裁剪框内应用裁剪
@@ -8235,6 +10548,13 @@ class ScreenshotTool(QWidget):
                     break
 
     def mousePressEvent(self, event):
+        # 取字 / 译文层打开时，点击选区外先退出该层，避免误触发新的框选
+        if self._text_select_layer is not None:
+            self._on_text_layer_closed()
+            return
+        if self._translation_overlay is not None:
+            self._close_translation_overlay()
+            return
         if event.button() == Qt.RightButton:
             if self.current_tool is not None:
                 self.set_tool(None)
@@ -8425,24 +10745,42 @@ class ScreenshotTool(QWidget):
                 self.edits.append({'type': self.current_tool, 'rect': QRect(pos, pos), 'start': pos, 'end': pos, 'color': self.current_color, 'arrow': getattr(self, 'arrow_enabled', False), 'temp': True, 'thickness': self.current_thickness})
             
             elif self.current_tool is None:
-                edge = self.get_resize_edge(pos)
+                # 选区内（边框除外）直接进入文字拖选，允许从文字左侧/行间开始拖
+                if (not (event.modifiers() & Qt.AltModifier) and self._text_doc_ready()
+                        and self.selection_rect.contains(pos)
+                        and self.get_resize_edge(pos, allow_move=False) is None):
+                    self._start_text_selection(pos)
+                    return
+
+                # 截图完成后只允许边框/角点拉伸，不再移动整个选区
+                edge = self.get_resize_edge(pos, allow_move=False)
                 self.drag_mode = edge
-                if self.drag_mode == 'move':
-                    self.drag_offset = pos - self.selection_rect.topLeft()
-                elif self.drag_mode is None:
-                    if self.geometry().width() == QApplication.primaryScreen().geometry().width():
-                        self.state = "SELECTING"
-                        self.begin_point = pos
-                        self.selection_rect = QRect()
-                        self.current_step_num = 1
-                        self.edits.clear()
-                        self.undo_stack.clear()
-                        self.redo_stack.clear()
-                        self.update_undo_redo_states()
-                        self.toolbar.hide()
-                        if hasattr(self, 'options_bar') and self.options_bar:
-                            self.options_bar.hide()
-                        self.update()
+                if edge is not None:
+                    self._selection_before_drag = QRect(self.selection_rect)
+                    self._reset_text_selection_state()
+                elif self.selection_rect.contains(pos):
+                    self.drag_mode = None
+                    return
+                elif self.geometry().width() == QApplication.primaryScreen().geometry().width():
+                    self.state = "SELECTING"
+                    self.begin_point = pos
+                    self.selection_rect = QRect()
+                    self.current_step_num = 1
+                    self.edits.clear()
+                    self.undo_stack.clear()
+                    self.redo_stack.clear()
+                    self._invalidate_text_doc()
+                    self.update_undo_redo_states()
+                    self.toolbar.hide()
+                    if hasattr(self, 'options_bar') and self.options_bar:
+                        self.options_bar.hide()
+                    self.update()
+
+    def leaveEvent(self, event):
+        if self._text_hover is not None:
+            self._text_hover = None
+            self.update()
+        super().leaveEvent(event)
 
     def mouseMoveEvent(self, event):
         pos = event.pos()
@@ -8487,16 +10825,27 @@ class ScreenshotTool(QWidget):
                 return
 
             if event.buttons() == Qt.NoButton:
-                if self.selection_rect.contains(pos) and self.current_tool is None:
-                    self.color_pick_pos = pos
-                    self.color_picker_visible = True
-                else:
+                hover = None
+                if self.current_tool is None and not self.crop_mode:
+                    if (self.selection_rect.contains(pos)
+                            and self.get_resize_edge(pos, allow_move=False) is None):
+                        hover = self._text_char_at(pos)
+                if hover is not None:
+                    self._text_hover = hover
                     self.color_picker_visible = False
-                
+                    self.setCursor(Qt.IBeamCursor)
+                    self.update()
+                    return
+                self._text_hover = None
+                self.color_picker_visible = False
                 self.update_cursor_for_tool(pos)
                 return
 
             if not event.buttons() & Qt.LeftButton: return
+
+            if self._text_dragging:
+                self._update_text_selection(pos)
+                return
 
             if self.current_tool in ['ERASER', 'ERASE']:
                 if self.erase_annotation_under_mouse(pos):
@@ -8595,6 +10944,9 @@ class ScreenshotTool(QWidget):
                 self.update()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._text_dragging:
+            self._finish_text_selection(event.pos())
+            return
         if event.button() == Qt.LeftButton:
             if self.state == "SELECTING":
                 click_dist = (event.pos() - getattr(self, 'press_pos', event.pos())).manhattanLength()
@@ -8627,10 +10979,12 @@ class ScreenshotTool(QWidget):
                     self.start_recording_session(rect)
                     return
                 self.state = "EDITING"
+                self.color_picker_visible = False
                 self.drag_mode = None
                 self.setFocus()
                 self.show_toolbar()
                 self.color_timer.start()
+                self._schedule_auto_text_ocr()
 
             elif self.state == "EDITING":
                 if self.crop_mode:
@@ -8708,6 +11062,15 @@ class ScreenshotTool(QWidget):
                         if self.text_rect.width() > 10 and self.text_rect.height() > 10:
                             self.inline_editor.start_editing(self.text_rect)
 
+                    if self.drag_mode in ('left', 'right', 'top', 'bottom',
+                                          'topleft', 'topright', 'bottomleft', 'bottomright'):
+                        before = getattr(self, '_selection_before_drag', None)
+                        if before is not None and self.selection_rect != before:
+                            # 只有选区尺寸真的变了才重新识别，避免点击边框/空白触发无意义 OCR
+                            self._invalidate_text_doc()
+                            self._schedule_auto_text_ocr()
+                    self._selection_before_drag = None
+
                     self.drag_mode = None
                     self.setFocus()
                     self.show_toolbar()
@@ -8771,8 +11134,10 @@ class ScreenshotTool(QWidget):
         if hasattr(self, 'crop_toolbar'):
             self.crop_toolbar.hide()
         self.set_tool(None, self.btn_crop)
+        self._invalidate_text_doc()
         self.show_toolbar()
         self.update()
+        self._schedule_auto_text_ocr()
 
     def cancel_crop(self):
         """取消裁剪"""
