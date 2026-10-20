@@ -46,6 +46,8 @@ from datetime import datetime
 import pytesseract
 import shutil
 import subprocess
+import webbrowser
+import tempfile
 import logging # 引入日志模块
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -112,6 +114,16 @@ REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "capture_settings.json")
 
+# ==========================================
+# 应用版本与在线更新
+# ==========================================
+APP_VERSION = "1.3.0"
+GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_LATEST_JSON = f"https://github.com/{GITHUB_REPO}/releases/latest/download/latest.json"
+UPDATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or BASE_DIR, "MuriokiCapture", "updates")
+
 # 智谱 AI 专业文档/文字识别 (GLM-OCR) 配置
 DEFAULT_ZHIPU_OCR_MODEL = "glm-ocr"
 ZHIPU_OCR_API_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
@@ -144,6 +156,9 @@ def load_settings():
         "save_format": "png",
         "save_quality": 95,
         "show_mode_hints": True,
+        "auto_check_update": True,
+        "last_update_check": 0,
+        "skipped_version": "",
     }
     try:
         cfg_file = SETTINGS_FILE
@@ -7049,6 +7064,420 @@ class HotkeyRecorderWidget(QWidget):
         self.hotkeyChanged.emit("")
 
 
+def parse_version_tuple(text):
+    s = str(text or "").strip().lower()
+    if s.startswith("v"):
+        s = s[1:]
+    m = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?", s)
+    if not m:
+        return (0,)
+    return tuple(int(part) if part else 0 for part in m.groups())
+
+
+def _http_get_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"Capture/{APP_VERSION}",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _is_github_asset_url(url):
+    try:
+        parsed = urllib.parse.urlparse(url)
+        return parsed.scheme == "https" and parsed.hostname in {
+            "github.com",
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "github-releases.githubusercontent.com",
+        }
+    except Exception:
+        return False
+
+
+class UpdateInfo:
+    def __init__(self, version, tag, notes, asset_url, asset_name, size, sha256, page_url, published_at=""):
+        self.version = str(version or "").lstrip("vV")
+        self.tag = tag or f"v{self.version}"
+        self.notes = notes or ""
+        self.asset_url = asset_url or ""
+        self.asset_name = asset_name or "Capture.exe"
+        self.size = int(size or 0)
+        self.sha256 = (sha256 or "").lower().replace("sha256:", "").strip()
+        self.page_url = page_url or f"{GITHUB_RELEASES_PAGE}/tag/{self.tag}"
+        self.published_at = published_at or ""
+        self.version_tuple = parse_version_tuple(self.version)
+
+
+def _parse_latest_json(data):
+    version = data.get("version") or data.get("tag") or data.get("tag_name") or ""
+    version = str(version).lstrip("vV")
+    if not version:
+        return None
+    asset = data.get("asset") or {}
+    asset_url = data.get("asset_url") or asset.get("url") or data.get("url") or ""
+    if not asset_url:
+        return None
+    return UpdateInfo(
+        version,
+        data.get("tag") or f"v{version}",
+        data.get("notes") or data.get("body") or "",
+        asset_url,
+        asset.get("name") or data.get("asset_name") or "Capture.exe",
+        data.get("size") or asset.get("size") or 0,
+        data.get("sha256") or asset.get("sha256") or "",
+        data.get("page_url") or data.get("html_url") or "",
+        data.get("published_at") or "",
+    )
+
+
+def _parse_release_json(data):
+    if data.get("draft") or data.get("prerelease"):
+        return None
+    tag = data.get("tag_name") or ""
+    version = str(tag).lstrip("vV")
+    if not version:
+        return None
+    assets = data.get("assets") or []
+    asset = None
+    for item in assets:
+        if str(item.get("name", "")).lower() == "capture.exe":
+            asset = item
+            break
+    if asset is None:
+        return None
+    return UpdateInfo(
+        version,
+        tag,
+        data.get("body") or "",
+        asset.get("browser_download_url") or "",
+        asset.get("name") or "Capture.exe",
+        asset.get("size") or 0,
+        asset.get("digest") or "",
+        data.get("html_url") or "",
+        data.get("published_at") or "",
+    )
+
+
+def fetch_latest_update():
+    # 优先读取与 Release 一起发布的 latest.json（稳定 URL，不限流）；没有则回退 GitHub API
+    try:
+        data = _http_get_json(GITHUB_LATEST_JSON, timeout=10)
+        info = _parse_latest_json(data)
+        if info is not None:
+            return info if info.version_tuple > parse_version_tuple(APP_VERSION) else None
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            logging.warning("读取 latest.json 失败: %s", e)
+    except Exception as e:
+        logging.warning("读取 latest.json 失败: %s", e)
+
+    try:
+        data = _http_get_json(GITHUB_API_LATEST, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise RuntimeError(f"GitHub 返回 HTTP {e.code}")
+    except Exception as e:
+        raise RuntimeError(f"无法连接 GitHub：{e}")
+
+    info = _parse_release_json(data)
+    if info is None:
+        return None
+    return info if info.version_tuple > parse_version_tuple(APP_VERSION) else None
+
+
+class UpdateChecker(QThread):
+    checked = pyqtSignal(object, str)
+
+    def __init__(self, manual=False, parent=None):
+        super().__init__(parent)
+        self.manual = manual
+
+    def run(self):
+        try:
+            self.checked.emit(fetch_latest_update(), "")
+        except Exception as e:
+            self.checked.emit(None, str(e))
+
+
+class UpdateDownloadWorker(QThread):
+    progress = pyqtSignal(int, str)
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        part_path = ""
+        try:
+            os.makedirs(UPDATE_DIR, exist_ok=True)
+            filename = f"Capture-{self.info.version}.exe"
+            final_path = os.path.join(UPDATE_DIR, filename)
+            part_path = final_path + ".part"
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            if not _is_github_asset_url(self.info.asset_url):
+                raise RuntimeError("下载地址不是 GitHub 官方地址，已拒绝")
+
+            req = urllib.request.Request(self.info.asset_url, headers={
+                "User-Agent": f"Capture/{APP_VERSION}",
+                "Accept": "application/octet-stream",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                final_url = resp.geturl()
+                if not _is_github_asset_url(final_url):
+                    raise RuntimeError("下载跳转到了非 GitHub 地址，已拒绝")
+                total = int(resp.headers.get("Content-Length") or self.info.size or 0)
+                digest = hashlib.sha256()
+                downloaded = 0
+                start = time.time()
+                last_emit = 0.0
+                with open(part_path, "wb") as f:
+                    while True:
+                        if self._cancelled:
+                            raise RuntimeError("已取消下载")
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        digest.update(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_emit >= 0.15:
+                            last_emit = now
+                            pct = int(downloaded * 100 / total) if total > 0 else -1
+                            speed = downloaded / max(0.2, now - start) / 1024 / 1024
+                            if total > 0:
+                                text = f"{downloaded / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB  ·  {speed:.1f} MB/s"
+                            else:
+                                text = f"{downloaded / 1024 / 1024:.1f} MB  ·  {speed:.1f} MB/s"
+                            self.progress.emit(pct, text)
+            if self._cancelled:
+                raise RuntimeError("已取消下载")
+            actual_sha = digest.hexdigest().lower()
+            if self.info.sha256 and actual_sha != self.info.sha256:
+                raise RuntimeError("安装包 SHA256 校验失败，已删除下载文件")
+            if self.info.size and os.path.getsize(part_path) != self.info.size:
+                raise RuntimeError("安装包大小校验失败，已删除下载文件")
+            os.replace(part_path, final_path)
+            part_path = ""
+            self.done.emit(final_path)
+        except Exception as e:
+            if part_path and os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            self.failed.emit(str(e))
+
+
+def _plain_release_notes(text):
+    lines = []
+    for line in (text or "").splitlines():
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*[-*+]\s+", "• ", line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+class UpdateAvailableDialog(QDialog):
+    install_requested = pyqtSignal()
+    skip_requested = pyqtSignal(str)
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self.setWindowTitle("发现新版本")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
+        self.setMinimumWidth(560)
+        self.resize(620, 520)
+        self.setStyleSheet("""
+            QDialog { background: #ffffff; font-family: "Microsoft YaHei UI", "Segoe UI"; }
+            QLabel#updTitle { font-size: 18px; font-weight: 700; color: #0F172A; }
+            QLabel#updSub { font-size: 12px; color: #64748B; }
+            QTextEdit { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;
+                        padding: 8px; color: #334155; font-size: 12px; }
+            QPushButton { border-radius: 6px; padding: 8px 16px; font-size: 13px; }
+            QPushButton#updPrimary { background: #0969DA; color: #FFFFFF; border: 1px solid #085CC0; font-weight: 600; }
+            QPushButton#updPrimary:hover { background: #085CC0; }
+            QPushButton#updSecondary { background: #FFFFFF; color: #334155; border: 1px solid #CBD5E1; }
+            QPushButton#updSecondary:hover { background: #F1F5F9; }
+        """)
+        main = QVBoxLayout(self)
+        main.setContentsMargins(20, 18, 20, 16)
+        main.setSpacing(10)
+
+        title = QLabel(f"发现新版本  v{info.version}")
+        title.setObjectName("updTitle")
+        main.addWidget(title)
+        sub = QLabel(f"当前版本 v{APP_VERSION}   →   最新版本 v{info.version}")
+        sub.setObjectName("updSub")
+        main.addWidget(sub)
+
+        size_text = f"安装包大小：{info.size / 1024 / 1024:.1f} MB" if info.size else "安装包大小：未知"
+        if info.published_at:
+            size_text += f"    发布时间：{info.published_at[:10]}"
+        main.addWidget(QLabel(size_text))
+
+        main.addWidget(QLabel("更新说明："))
+        self.notes = QTextEdit()
+        self.notes.setReadOnly(True)
+        self.notes.setPlainText((_plain_release_notes(info.notes) or "本次更新暂无详细说明。")[:12000])
+        main.addWidget(self.notes, 1)
+
+        buttons = QHBoxLayout()
+        btn_page = QPushButton("打开发布页")
+        btn_page.setObjectName("updSecondary")
+        btn_page.setCursor(Qt.PointingHandCursor)
+        btn_page.clicked.connect(lambda: webbrowser.open(info.page_url))
+        buttons.addWidget(btn_page)
+        buttons.addStretch()
+
+        btn_skip = QPushButton("跳过此版本")
+        btn_skip.setObjectName("updSecondary")
+        btn_skip.setCursor(Qt.PointingHandCursor)
+        btn_skip.clicked.connect(lambda: (self.skip_requested.emit(info.version), self.accept()))
+        buttons.addWidget(btn_skip)
+
+        btn_later = QPushButton("稍后")
+        btn_later.setObjectName("updSecondary")
+        btn_later.setCursor(Qt.PointingHandCursor)
+        btn_later.clicked.connect(self.reject)
+        buttons.addWidget(btn_later)
+
+        btn_install = QPushButton("下载并安装")
+        btn_install.setObjectName("updPrimary")
+        btn_install.setCursor(Qt.PointingHandCursor)
+        btn_install.clicked.connect(lambda: (self.install_requested.emit(), self.accept()))
+        buttons.addWidget(btn_install)
+        main.addLayout(buttons)
+
+
+class UpdateProgressDialog(QDialog):
+    ready = pyqtSignal(str)
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self.worker = None
+        self._closed = False
+        self.setWindowTitle("正在下载更新")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
+        self.setFixedWidth(520)
+        self.setStyleSheet("""
+            QDialog { background: #ffffff; font-family: "Microsoft YaHei UI", "Segoe UI"; }
+            QLabel { color: #334155; font-size: 12px; }
+            QProgressBar { border: 1px solid #E2E8F0; border-radius: 6px; background: #F1F5F9;
+                           height: 16px; text-align: center; color: #334155; }
+            QProgressBar::chunk { background: #0969DA; border-radius: 5px; }
+            QPushButton { background: #FFFFFF; color: #334155; border: 1px solid #CBD5E1;
+                          border-radius: 6px; padding: 7px 18px; }
+            QPushButton:hover { background: #F1F5F9; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(10)
+        self.lbl_title = QLabel(f"正在下载 Capture v{info.version}…")
+        self.lbl_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #0F172A;")
+        layout.addWidget(self.lbl_title)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)
+        layout.addWidget(self.bar)
+        self.lbl_status = QLabel("正在连接 GitHub…")
+        layout.addWidget(self.lbl_status)
+        row = QHBoxLayout()
+        row.addStretch()
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel.clicked.connect(self._cancel)
+        row.addWidget(self.btn_cancel)
+        layout.addLayout(row)
+
+    def start(self):
+        self.worker = UpdateDownloadWorker(self.info, self)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.done.connect(self._on_done)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker.start()
+
+    def _cancel(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.btn_cancel.setEnabled(False)
+            self.lbl_status.setText("正在取消…")
+
+    def _on_progress(self, pct, text):
+        if pct < 0:
+            self.bar.setRange(0, 0)
+        else:
+            self.bar.setRange(0, 100)
+            self.bar.setValue(pct)
+        self.lbl_status.setText(text)
+
+    def _on_done(self, path):
+        self._closed = True
+        self.ready.emit(path)
+        self.accept()
+
+    def _on_failed(self, msg):
+        self._closed = True
+        QMessageBox.warning(self, "更新下载失败", msg)
+        self.reject()
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning() and not self._closed:
+            self._cancel()
+            event.ignore()
+            return
+        event.accept()
+
+
+def find_updater_executable():
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(os.path.join(getattr(sys, "_MEIPASS", ""), "Updater.exe"))
+    candidates.append(os.path.join(BASE_DIR, "Updater.exe"))
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
+def launch_updater_process(new_exe, info):
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("自动更新只支持打包后的 exe")
+    updater = find_updater_executable()
+    if not updater:
+        raise RuntimeError("未找到内置更新器 Updater.exe，请到发布页手动下载")
+    os.makedirs(UPDATE_DIR, exist_ok=True)
+    temp_updater = os.path.join(tempfile.gettempdir(), f"MuriokiCaptureUpdater-{int(time.time())}.exe")
+    shutil.copy2(updater, temp_updater)
+    cmd = [
+        temp_updater,
+        "--pid", str(os.getpid()),
+        "--source", new_exe,
+        "--target", sys.executable,
+        "--sha256", info.sha256 or "",
+        "--log", os.path.join(UPDATE_DIR, "updater.log"),
+        "--restart",
+    ]
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(cmd, cwd=BASE_DIR, close_fds=True, creationflags=flags)
+    return temp_updater
+
+
 class SettingsDialog(QDialog):
     """系统偏好设置面板：快捷键自定义、默认保存目录与画质、智谱 GLM-OCR 及火山方舟豆包配置"""
     def __init__(self, parent=None, hotkey_mgr=None):
@@ -7301,6 +7730,37 @@ class SettingsDialog(QDialog):
         ai_layout.addWidget(self.combo_trans_display, 7, 1)
 
         content_layout.addWidget(ai_group)
+
+        # 4. 软件更新分组
+        update_group = QGroupBox("🔄 软件更新")
+        up_layout = QGridLayout(update_group)
+        up_layout.setContentsMargins(14, 16, 14, 14)
+        up_layout.setSpacing(10)
+        up_layout.addWidget(QLabel(f"当前版本：v{APP_VERSION}"), 0, 0, 1, 2)
+        self.cb_auto_update = QCheckBox("启动时自动检查更新（每 24 小时最多一次）")
+        self.cb_auto_update.setChecked(True)
+        up_layout.addWidget(self.cb_auto_update, 1, 0, 1, 2)
+        up_hint = QLabel("发现新版本后会提示更新说明，可一键下载并自动替换重启。")
+        up_hint.setStyleSheet("color: #64748b; font-size: 12px;")
+        up_hint.setWordWrap(True)
+        up_layout.addWidget(up_hint, 2, 0, 1, 2)
+        up_btn_row = QHBoxLayout()
+        btn_check_update = QPushButton("立即检查更新")
+        btn_check_update.setFixedHeight(32)
+        btn_check_update.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_check_update, active=True)
+        btn_check_update.clicked.connect(self._check_updates_from_settings)
+        up_btn_row.addWidget(btn_check_update)
+        btn_release_page = QPushButton("打开发布页")
+        btn_release_page.setFixedHeight(32)
+        btn_release_page.setCursor(Qt.PointingHandCursor)
+        apply_button_style(btn_release_page)
+        btn_release_page.clicked.connect(lambda: webbrowser.open(GITHUB_RELEASES_PAGE))
+        up_btn_row.addWidget(btn_release_page)
+        up_btn_row.addStretch()
+        up_layout.addLayout(up_btn_row, 3, 0, 1, 2)
+
+        content_layout.addWidget(update_group)
         content_layout.addStretch(1)
 
         scroll_area.setWidget(content_widget)
@@ -7346,6 +7806,7 @@ class SettingsDialog(QDialog):
         self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
         self.cb_auto_save.setChecked(s.get("auto_save_enabled", False))
         self.cb_show_mode_hints.setChecked(s.get("show_mode_hints", True))
+        self.cb_auto_update.setChecked(s.get("auto_check_update", True))
 
         fmt = s.get("save_format", "png").lower()
         if "jp" in fmt: self.combo_format.setCurrentIndex(1)
@@ -7384,6 +7845,13 @@ class SettingsDialog(QDialog):
         if chosen:
             self.input_save_dir.setText(chosen)
 
+    def _check_updates_from_settings(self):
+        save_settings({"auto_check_update": self.cb_auto_update.isChecked()})
+        parent = self.parent()
+        self.accept()
+        if parent is not None and hasattr(parent, "check_for_updates"):
+            QTimer.singleShot(150, lambda: parent.check_for_updates(manual=True))
+
     def save_and_apply(self):
         fmt_idx = self.combo_format.currentIndex()
         fmt_str = "png" if fmt_idx == 0 else ("jpg" if fmt_idx == 1 else "webp")
@@ -7409,6 +7877,7 @@ class SettingsDialog(QDialog):
             "use_ai_translation": self.cb_ai_trans.isChecked(),
             "use_ai_ocr": self.cb_ai_ocr.isChecked(),
             "translation_display_mode": self.combo_trans_display.currentData(),
+            "auto_check_update": self.cb_auto_update.isChecked(),
         }
         save_settings(new_settings)
         if self.hotkey_mgr:
@@ -8717,6 +9186,9 @@ class ScreenshotTool(QWidget):
         self._retired_overlays = []
         self._translate_worker = None
         self._active_translation_window = None
+        self._update_thread = None
+        self._update_dialog = None
+        self._update_progress = None
         self._ocr_running = False
         self._ocr_generation = 0
         self._ocr_waiters = []
@@ -8757,6 +9229,7 @@ class ScreenshotTool(QWidget):
         self.color_timer.timeout.connect(self.update_color_picker_from_cursor)
         
         self.setup_toolbar()
+        QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
 
     def save_state(self):
         state = {
@@ -11481,6 +11954,120 @@ class ScreenshotTool(QWidget):
             logging.error("打开历史窗口失败: %s", e, exc_info=True)
             QMessageBox.warning(self, "截图历史", f"无法打开截图历史:\n{e}")
 
+    def _shutdown_update_workers(self):
+        thread = self._update_thread
+        if thread is not None and thread.isRunning():
+            try:
+                thread.wait(1500)
+            except Exception:
+                pass
+        progress = self._update_progress
+        worker = getattr(progress, "worker", None)
+        if worker is not None and worker.isRunning():
+            try:
+                worker.cancel()
+                worker.wait(1500)
+            except Exception:
+                pass
+
+    def check_for_updates(self, manual=False):
+        if self._update_thread is not None and self._update_thread.isRunning():
+            if manual:
+                QMessageBox.information(None, "检查更新", "正在检查更新，请稍候…")
+            return
+
+        settings = load_settings()
+        if not manual:
+            if not settings.get("auto_check_update", True):
+                return
+            try:
+                last = float(settings.get("last_update_check", 0) or 0)
+            except (TypeError, ValueError):
+                last = 0
+            if time.time() - last < 24 * 3600:
+                return
+
+        # 记录检查时间，网络失败也不会每次启动都重试
+        save_settings({"last_update_check": time.time()})
+        self._update_thread = UpdateChecker(manual=manual)
+        self._update_thread.checked.connect(
+            lambda info, err, m=manual: self._on_update_checked(info, err, m)
+        )
+        self._update_thread.finished.connect(self._on_update_thread_finished)
+        self._update_thread.start()
+        if manual:
+            QToolTip.showText(QCursor.pos(), "正在检查更新…", None, QRect(), 3000)
+
+    def _on_update_thread_finished(self):
+        thread = self._update_thread
+        self._update_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def _on_update_checked(self, info, error, manual):
+        if error:
+            logging.warning("检查更新失败: %s", error)
+            if manual:
+                QMessageBox.warning(None, "检查更新失败", f"无法检查更新：\n{error}")
+            return
+        if info is None:
+            if manual:
+                QMessageBox.information(None, "检查更新", f"当前已是最新版本 v{APP_VERSION}。")
+            return
+        if not manual and load_settings().get("skipped_version", "") == info.version:
+            return
+        self._show_update_dialog(info)
+
+    def _show_update_dialog(self, info):
+        if self._update_dialog is not None:
+            try:
+                self._update_dialog.close()
+            except RuntimeError:
+                pass
+        dlg = UpdateAvailableDialog(info, None)
+        dlg.install_requested.connect(lambda: self._start_update_download(info))
+        dlg.skip_requested.connect(lambda version: save_settings({"skipped_version": version}))
+        dlg.finished.connect(lambda _result: setattr(self, "_update_dialog", None))
+        self._update_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _start_update_download(self, info):
+        dlg = UpdateProgressDialog(info, None)
+        self._update_progress = dlg
+        dlg.ready.connect(lambda path: QTimer.singleShot(120, lambda: self._install_update(path, info)))
+        dlg.finished.connect(lambda _result: setattr(self, "_update_progress", None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.start()
+
+    def _install_update(self, path, info):
+        answer = QMessageBox.question(
+            None, "更新已下载",
+            f"Capture v{info.version} 已下载完成。\n\n"
+            "是否立即关闭应用并自动安装？\n安装完成后会自动重新启动。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        if answer != QMessageBox.Yes:
+            QMessageBox.information(
+                None, "更新已下载",
+                f"安装包已保存到：\n{path}\n\n下次可以重新检查更新。"
+            )
+            return
+        try:
+            launch_updater_process(path, info)
+        except Exception as e:
+            logging.error("启动更新器失败: %s", e)
+            QMessageBox.critical(
+                None, "无法自动更新",
+                f"{e}\n\n请到发布页手动下载：\n{info.page_url}"
+            )
+            webbrowser.open(info.page_url)
+            return
+        QTimer.singleShot(250, QApplication.quit)
+
     def show_settings_dialog(self):
         try:
             dlg = SettingsDialog(self, hotkey_mgr=getattr(self, 'hotkey_listener', None))
@@ -11647,7 +12234,7 @@ class AppTrayIcon(QSystemTrayIcon):
             painter.end()
             self.setIcon(QIcon(pixmap))
         
-        self.setToolTip("Capture (F1 截图 | F2 识图翻译 | F4 录屏 | F3 贴图)")
+        self.setToolTip(f"Capture v{APP_VERSION} (F1 截图 | F2 识图翻译 | F4 录屏 | F3 贴图)")
         
         menu = QMenu()
         snip_action = QAction("✂ 开始截图", menu)
@@ -11673,6 +12260,9 @@ class AppTrayIcon(QSystemTrayIcon):
         history_action = QAction("📜 截图历史 (History)", menu)
         history_action.triggered.connect(self.main_app.show_history_dialog)
         menu.addAction(history_action)
+        update_action = QAction("🔄 检查更新", menu)
+        update_action.triggered.connect(lambda: self.main_app.check_for_updates(manual=True))
+        menu.addAction(update_action)
         settings_action = QAction("⚙ 系统设置 (Settings)", menu)
         settings_action.triggered.connect(self.main_app.show_settings_dialog)
         menu.addAction(settings_action)
@@ -11761,6 +12351,7 @@ if __name__ == '__main__':
         hotkey_mgr.install(app)
 
         ex = ScreenshotTool(hotkey_listener=hotkey_mgr)
+        app.aboutToQuit.connect(ex._shutdown_update_workers)
         tray = AppTrayIcon(ex, hotkey_listener=hotkey_mgr)
         tray.show()
 

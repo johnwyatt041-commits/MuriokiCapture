@@ -74,3 +74,39 @@ pyinstaller Capture.spec
 ## 📄 License
 
 MIT License
+
+
+## 🔄 自动更新（v1.3.0+）
+
+- 设置页「🔄 软件更新」和托盘菜单都可以手动「检查更新」。
+- 启动后 3 秒自动检查一次，24 小时内最多检查一次；发现新版本会弹出更新说明。
+- 点击「下载并安装」后，程序会从 GitHub Releases 下载 `Capture.exe`，校验 SHA256，然后启动内置的 `Updater.exe`：
+  1. 等待旧进程退出；
+  2. 备份旧版为 `Capture.exe.old`；
+  3. 替换并重启；
+  4. 失败时自动回滚旧版。
+- 保持绿色版：更新只替换当前目录下的 `Capture.exe`，不写注册表、不安装服务；目录需要有写权限。
+- `Updater.exe` 已内置在 `Capture.exe` 中，不需要单独下载。
+
+发布新版本时：
+1. 修改 `capture.py` 顶部的 `APP_VERSION`（例如 `1.3.1`）；
+2. 先打包 `Updater.spec`，把 `dist/Updater.exe` 放到仓库根目录；
+3. 再打包 `Capture.spec`，得到新的 `dist/Capture.exe`；
+4. 在 GitHub 创建 tag `v1.3.1` 和 Release，上传 `Capture.exe`；
+5. 可选：上传 `latest.json`（应用优先读取它，读不到再走 GitHub API）。
+
+`latest.json` 示例：
+
+```json
+{
+  "version": "1.3.1",
+  "tag": "v1.3.1",
+  "notes": "修复若干问题",
+  "asset_url": "https://github.com/johnwyatt041-commits/MuriokiCapture/releases/download/v1.3.1/Capture.exe",
+  "sha256": "安装包的 sha256",
+  "size": 104000000,
+  "page_url": "https://github.com/johnwyatt041-commits/MuriokiCapture/releases/tag/v1.3.1"
+}
+```
+
+> v1.2.0 没有内置更新逻辑，所以第一个带更新功能的版本需要手动安装一次；之后即可应用内自动更新。

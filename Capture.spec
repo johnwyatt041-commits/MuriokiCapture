@@ -7,6 +7,7 @@ block_cipher = None
 datas = [
     ('app_icon.ico', '.'),
     ('app_icon.png', '.'),
+    ('Updater.exe', '.'),
 ]
 binaries = []
 hiddenimports = [
