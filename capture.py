@@ -117,7 +117,7 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "capture_settings.json")
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
