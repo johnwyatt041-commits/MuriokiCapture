@@ -117,7 +117,7 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "capture_settings.json")
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -7161,32 +7161,33 @@ def _parse_release_json(data):
 
 
 def fetch_latest_update():
-    # 优先读取与 Release 一起发布的 latest.json（稳定 URL，不限流）；没有则回退 GitHub API
+    # GitHub API 通常 1 秒内返回；先走 API，失败/限流再回退 latest.json 资产
+    api_error = None
     try:
-        data = _http_get_json(GITHUB_LATEST_JSON, timeout=10)
-        info = _parse_latest_json(data)
-        if info is not None:
-            return info if info.version_tuple > parse_version_tuple(APP_VERSION) else None
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            logging.warning("读取 latest.json 失败: %s", e)
-    except Exception as e:
-        logging.warning("读取 latest.json 失败: %s", e)
-
-    try:
-        data = _http_get_json(GITHUB_API_LATEST, timeout=10)
+        data = _http_get_json(GITHUB_API_LATEST, timeout=6)
+        info = _parse_release_json(data)
+        if info is None:
+            return None
+        return info if info.version_tuple > parse_version_tuple(APP_VERSION) else None
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
-        raise RuntimeError(f"GitHub 返回 HTTP {e.code}")
+        api_error = f"HTTP {e.code}"
     except Exception as e:
-        raise RuntimeError(f"无法连接 GitHub：{e}")
+        api_error = str(e)
 
-    info = _parse_release_json(data)
-    if info is None:
-        return None
-    return info if info.version_tuple > parse_version_tuple(APP_VERSION) else None
+    logging.warning("GitHub API 检查失败，尝试 latest.json: %s", api_error)
+    try:
+        data = _http_get_json(GITHUB_LATEST_JSON, timeout=4)
+        info = _parse_latest_json(data)
+        if info is not None:
+            return info if info.version_tuple > parse_version_tuple(APP_VERSION) else None
+    except Exception as e:
+        logging.warning("读取 latest.json 失败: %s", e)
 
+    if api_error:
+        raise RuntimeError(f"无法检查更新：{api_error}")
+    return None
 
 class UpdateChecker(QThread):
     checked = pyqtSignal(object, str)
@@ -9187,6 +9188,11 @@ class ScreenshotTool(QWidget):
         self._translate_worker = None
         self._active_translation_window = None
         self._update_thread = None
+        self._manual_check_pending = False
+        self._update_watchdog = QTimer(self)
+        self._update_watchdog.setSingleShot(True)
+        self._update_watchdog.timeout.connect(self._on_update_timeout)
+        self._retired_update_threads = []
         self._update_dialog = None
         self._update_progress = None
         self._ocr_running = False
@@ -11961,6 +11967,12 @@ class ScreenshotTool(QWidget):
                 thread.wait(1500)
             except Exception:
                 pass
+        for retired in list(getattr(self, "_retired_update_threads", [])):
+            if retired.isRunning():
+                try:
+                    retired.wait(1000)
+                except Exception:
+                    pass
         progress = self._update_progress
         worker = getattr(progress, "worker", None)
         if worker is not None and worker.isRunning():
@@ -11973,7 +11985,8 @@ class ScreenshotTool(QWidget):
     def check_for_updates(self, manual=False):
         if self._update_thread is not None and self._update_thread.isRunning():
             if manual:
-                QMessageBox.information(None, "检查更新", "正在检查更新，请稍候…")
+                self._manual_check_pending = True
+                QToolTip.showText(QCursor.pos(), "正在检查更新，请稍候…", None, QRect(), 1500)
             return
 
         settings = load_settings()
@@ -11989,22 +12002,57 @@ class ScreenshotTool(QWidget):
 
         # 记录检查时间，网络失败也不会每次启动都重试
         save_settings({"last_update_check": time.time()})
+        logging.info("检查更新开始 (manual=%s)", manual)
         self._update_thread = UpdateChecker(manual=manual)
         self._update_thread.checked.connect(
             lambda info, err, m=manual: self._on_update_checked(info, err, m)
         )
         self._update_thread.finished.connect(self._on_update_thread_finished)
         self._update_thread.start()
+        self._update_watchdog.start(15000)
         if manual:
             QToolTip.showText(QCursor.pos(), "正在检查更新…", None, QRect(), 3000)
 
+    def _on_update_timeout(self):
+        thread = self._update_thread
+        if thread is None:
+            return
+        logging.warning("检查更新超时（15 秒）")
+        try:
+            thread.checked.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            thread.finished.disconnect(self._on_update_thread_finished)
+        except (TypeError, RuntimeError):
+            pass
+        self._update_thread = None
+        self._retired_update_threads.append(thread)
+        thread.finished.connect(lambda t=thread: self._retire_update_thread(t))
+        manual = self._manual_check_pending
+        self._manual_check_pending = False
+        if manual:
+            QMessageBox.warning(None, "检查更新超时", "连接 GitHub 超时，请检查网络后重试。")
+
+    def _retire_update_thread(self, thread):
+        try:
+            self._retired_update_threads.remove(thread)
+        except ValueError:
+            pass
+        thread.deleteLater()
+
     def _on_update_thread_finished(self):
+        self._update_watchdog.stop()
         thread = self._update_thread
         self._update_thread = None
         if thread is not None:
             thread.deleteLater()
 
     def _on_update_checked(self, info, error, manual):
+        self._update_watchdog.stop()
+        manual = manual or self._manual_check_pending
+        self._manual_check_pending = False
+        logging.info("检查更新完成: info=%s error=%s", info.version if info else None, error or "")
         if error:
             logging.warning("检查更新失败: %s", error)
             if manual:
