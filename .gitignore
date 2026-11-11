@@ -20,6 +20,7 @@ dist/
 temp_scroll_frames/
 temp_screen_recording/
 capture_history/
+capture_drawer/
 *.lnk
 *.bak
 
@@ -30,5 +31,7 @@ capture_history/
 Thumbs.db
 Desktop.ini
 
-# Exe (too large for git)
+# Exe & Archives (too large for git / generated release assets)
 *.exe
+*.zip
+latest.json

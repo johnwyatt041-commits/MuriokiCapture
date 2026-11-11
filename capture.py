@@ -113,11 +113,12 @@ REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 # AI 翻译与多模态识别配置 (智谱 GLM-OCR & 火山方舟豆包翻译)
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "capture_settings.json")
+from pin_drawer import PinDrawerWindow
 
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -151,6 +152,8 @@ def load_settings():
         "hotkey_scroll": "",
         "hotkey_history": "",
         "hotkey_settings": "",
+        "hotkey_drawer": "Ctrl+1",
+        "drawer_hover_enabled": True,
         "default_save_dir": os.path.join(os.path.expanduser("~"), "Pictures"),
         "auto_save_enabled": False,
         "save_format": "png",
@@ -5367,8 +5370,9 @@ class InlineTextEditor(QWidget):
 class PinnedWindow(QWidget):
     def __init__(self, pixmap, main_app_ref=None, initial_pos=None, zoom_factor=1.0):
         super().__init__()
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.pixmap = pixmap
         self.main_app_ref = main_app_ref
 
@@ -5427,6 +5431,11 @@ class PinnedWindow(QWidget):
             super().mouseDoubleClickEvent(event)
 
     def closeEvent(self, event):
+        if getattr(self, '_dropped_to_drawer', False):
+            if self.main_app_ref is not None and self in self.main_app_ref.pinned_windows:
+                self.main_app_ref.pinned_windows.remove(self)
+            super().closeEvent(event)
+            return
         if self.main_app_ref is not None:
             try:
                 self.main_app_ref.on_pin_closed(self)
@@ -5436,11 +5445,45 @@ class PinnedWindow(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        # 直接利用 QPainter 变换绘制原图至当前控件矩形，零中间大图内存拷贝，避免频繁重绘导致内存暴涨闪退
-        painter.drawPixmap(self.rect(), self.pixmap)
+        # 拖向储藏柜时自动呈现 macOS 冰晶毛玻璃圆角迷你卡片（四周 100% 透明无直角边）
+        if getattr(self, '_is_mini_for_drawer', False):
+            for i, alpha in enumerate([6, 12, 20]):
+                sr = QRectF(self.rect()).adjusted(2 + i, 2 + i, -2 - i, -2 - i)
+                sp = QPainterPath()
+                sp.addRoundedRect(sr, 14 - i, 14 - i)
+                painter.fillPath(sp, QBrush(QColor(15, 23, 42, alpha)))
+
+            r = QRectF(self.rect()).adjusted(5, 5, -5, -5)
+            path = QPainterPath()
+            path.addRoundedRect(r, 12, 12)
+            painter.fillPath(path, QBrush(QColor(250, 252, 255, 235)))
+            painter.setPen(QPen(QColor(56, 189, 248, 230), 2.0))
+            painter.drawPath(path)
+
+            scaled = self.pixmap.scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            tw, th = scaled.width(), scaled.height()
+            tx = r.x() + (r.width() - tw) / 2.0
+            ty = r.y() + (r.height() - th) / 2.0
+            img_rect = QRectF(tx, ty, tw, th)
+
+            painter.save()
+            clip_p = QPainterPath()
+            clip_p.addRoundedRect(img_rect, 6, 6)
+            painter.setClipPath(clip_p)
+            painter.drawPixmap(int(tx), int(ty), scaled)
+            painter.restore()
+
+            painter.setPen(QPen(QColor(15, 23, 42, 30), 1.0))
+            painter.drawRoundedRect(img_rect, 6, 6)
+        else:
+            painter.drawPixmap(self.rect(), self.pixmap)
 
     def wheelEvent(self, event: QWheelEvent):
+        if getattr(self, '_is_mini_for_drawer', False):
+            event.accept()
+            return
         step = 0.05 if self.zoom_factor < 0.5 else 0.1
         if event.angleDelta().y() > 0:
             new_zoom = min(10.0, self.zoom_factor + step)
@@ -5460,22 +5503,74 @@ class PinnedWindow(QWidget):
         self.update()
         event.accept()
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton: 
-            self.move(event.globalPos() - self.drag_position)
-
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.setFocus()
             self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+            self._normal_size = self.size()
+            self._normal_zoom = getattr(self, 'zoom_factor', 1.0)
+            self._is_mini_for_drawer = False
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            gpos = event.globalPos()
+            is_near_drawer = False
+            if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
+                drawer = self.main_app_ref.pin_drawer
+                is_near_drawer = drawer.check_proximity(gpos)
+                drawer.on_external_pin_drag(self, gpos)
+
+            # 靠近或移入抽屉区域时：瞬间智能缩小为 100x100 迷你卡片，清晰看到插入位
+            if is_near_drawer:
+                if not getattr(self, '_is_mini_for_drawer', False):
+                    self._is_mini_for_drawer = True
+                    self._normal_size = self.size()
+                    self._normal_zoom = getattr(self, 'zoom_factor', 1.0)
+                    self.resize(100, 100)
+                    self.drag_position = QPoint(50, 50)
+                    self.update()
+            else:
+                # 拖离抽屉重返桌面时：即刻恢复原图原始尺寸
+                if getattr(self, '_is_mini_for_drawer', False):
+                    self._is_mini_for_drawer = False
+                    self.resize(self._normal_size)
+                    self.zoom_factor = self._normal_zoom
+                    self.drag_position = QPoint(self._normal_size.width() // 2, self._normal_size.height() // 2)
+                    self.update()
+
+            self.move(gpos - self.drag_position)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            gpos = event.globalPos()
+            handled = False
+            if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
+                handled = self.main_app_ref.pin_drawer.on_external_pin_released(self, gpos)
+            if handled:
+                event.accept()
+                return
+
+            # 未存入抽屉且松手在桌面：恢复完整大小并居中落位
+            if getattr(self, '_is_mini_for_drawer', False):
+                self._is_mini_for_drawer = False
+                self.resize(self._normal_size)
+                self.zoom_factor = self._normal_zoom
+                self.move(max(0, gpos.x() - self._normal_size.width() // 2),
+                          max(0, gpos.y() - self._normal_size.height() // 2))
+                self.update()
+        super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        drawer_action = menu.addAction("🗄️ 存入抽屉 (Drawer)")
         ocr_action = menu.addAction("🔤 OCR & Translate (F2)")
         edit_action = menu.addAction("🛠 Edit") 
         close_action = menu.addAction("❌ Close")
         action = menu.exec_(self.mapToGlobal(event.pos()))
-        if action == ocr_action:
+        if action == drawer_action:
+            if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
+                self.main_app_ref.pin_drawer.add_pin_directly(self)
+        elif action == ocr_action:
             self.trigger_ocr()
         elif action == edit_action and self.main_app_ref:
             pinned_before = set(self.main_app_ref.pinned_windows)
@@ -7594,12 +7689,17 @@ class SettingsDialog(QDialog):
         self.input_hk_settings = HotkeyRecorderWidget("未绑定 (点击录制)")
         hk_layout.addWidget(self.input_hk_settings, 7, 1)
 
+        # 8: 贴图储藏柜
+        hk_layout.addWidget(QLabel("贴图储藏柜:"), 8, 0)
+        self.input_hk_drawer = HotkeyRecorderWidget("未绑定 (默认 Ctrl+1)")
+        hk_layout.addWidget(self.input_hk_drawer, 8, 1)
+
         btn_reset_hk = QPushButton("恢复默认快捷键 (仅基础功能 F1~F4)")
         btn_reset_hk.setFixedHeight(30)
         btn_reset_hk.setCursor(Qt.PointingHandCursor)
         apply_button_style(btn_reset_hk)
         btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
-        hk_layout.addWidget(btn_reset_hk, 8, 1, Qt.AlignRight)
+        hk_layout.addWidget(btn_reset_hk, 9, 1, Qt.AlignRight)
 
         content_layout.addWidget(hk_group)
 
@@ -7645,6 +7745,9 @@ class SettingsDialog(QDialog):
 
         self.cb_show_mode_hints = QCheckBox("显示快捷识图/录屏操作指引条 (支持智能上下避让与拖拽隐藏)")
         save_layout.addWidget(self.cb_show_mode_hints, 4, 0, 1, 2)
+
+        self.cb_drawer_hover = QCheckBox("开启贴图储藏柜功能 (可随时按 Ctrl+1 彻底开关此功能，防误唤醒)")
+        save_layout.addWidget(self.cb_drawer_hover, 5, 0, 1, 2)
 
         content_layout.addWidget(save_group)
 
@@ -7803,10 +7906,12 @@ class SettingsDialog(QDialog):
         self.input_hk_scroll.setText(s.get("hotkey_scroll", ""))
         self.input_hk_history.setText(s.get("hotkey_history", ""))
         self.input_hk_settings.setText(s.get("hotkey_settings", ""))
+        self.input_hk_drawer.setText(s.get("hotkey_drawer", "Ctrl+1"))
 
         self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
         self.cb_auto_save.setChecked(s.get("auto_save_enabled", False))
         self.cb_show_mode_hints.setChecked(s.get("show_mode_hints", True))
+        self.cb_drawer_hover.setChecked(s.get("drawer_hover_enabled", True))
         self.cb_auto_update.setChecked(s.get("auto_check_update", True))
 
         fmt = s.get("save_format", "png").lower()
@@ -7840,6 +7945,7 @@ class SettingsDialog(QDialog):
         self.input_hk_scroll.setText("")
         self.input_hk_history.setText("")
         self.input_hk_settings.setText("")
+        self.input_hk_drawer.setText("Ctrl+1")
 
     def _browse_save_dir(self):
         chosen = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.input_save_dir.text())
@@ -7866,9 +7972,11 @@ class SettingsDialog(QDialog):
             "hotkey_scroll": self.input_hk_scroll.text().strip(),
             "hotkey_history": self.input_hk_history.text().strip(),
             "hotkey_settings": self.input_hk_settings.text().strip(),
+            "hotkey_drawer": self.input_hk_drawer.text().strip() or "Ctrl+1",
             "default_save_dir": self.input_save_dir.text().strip(),
             "auto_save_enabled": self.cb_auto_save.isChecked(),
             "show_mode_hints": self.cb_show_mode_hints.isChecked(),
+            "drawer_hover_enabled": self.cb_drawer_hover.isChecked(),
             "save_format": fmt_str,
             "save_quality": self.slider_quality.value(),
             "zhipu_api_key": self.input_zhipu_key.text().strip(),
@@ -7881,6 +7989,8 @@ class SettingsDialog(QDialog):
             "auto_check_update": self.cb_auto_update.isChecked(),
         }
         save_settings(new_settings)
+        if hasattr(self.parent(), "pin_drawer") and self.parent().pin_drawer:
+            self.parent().pin_drawer.set_feature_enabled(self.cb_drawer_hover.isChecked())
         if self.hotkey_mgr:
             self.hotkey_mgr.reload_hotkeys()
         QMessageBox.information(self, "设置已保存", "偏好设置已成功保存并立即生效！")
@@ -8871,6 +8981,7 @@ class GlobalHotkeyManager(QObject):
     on_scroll_pressed = pyqtSignal()   # 滚动长截图
     on_history_pressed = pyqtSignal()  # 截图历史
     on_settings_pressed = pyqtSignal() # 打开系统设置
+    on_drawer_pressed = pyqtSignal()   # 贴图储藏柜 (默认 Ctrl+1)
 
     HOTKEY_F1_ID = 101
     HOTKEY_F3_ID = 102
@@ -8882,6 +8993,7 @@ class GlobalHotkeyManager(QObject):
     HOTKEY_SCROLL_ID = 108
     HOTKEY_HISTORY_ID = 109
     HOTKEY_SETTINGS_ID = 110
+    HOTKEY_DRAWER_ID = 111
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -8934,6 +9046,7 @@ class GlobalHotkeyManager(QObject):
         hk_scroll = settings.get("hotkey_scroll", "")
         hk_hist = settings.get("hotkey_history", "")
         hk_sett = settings.get("hotkey_settings", "")
+        hk_drawer = settings.get("hotkey_drawer", "Ctrl+1")
 
         self._register_one_hotkey(self.HOTKEY_F1_ID, hk_snip, self.trigger_snip)
         self._register_one_hotkey(self.HOTKEY_F2_ID, hk_ocr, self.trigger_ocr)
@@ -8943,6 +9056,7 @@ class GlobalHotkeyManager(QObject):
         self._register_one_hotkey(self.HOTKEY_SCROLL_ID, hk_scroll, self.trigger_scroll)
         self._register_one_hotkey(self.HOTKEY_HISTORY_ID, hk_hist, self.trigger_history)
         self._register_one_hotkey(self.HOTKEY_SETTINGS_ID, hk_sett, self.trigger_settings)
+        self._register_one_hotkey(self.HOTKEY_DRAWER_ID, hk_drawer, self.trigger_drawer)
 
     def reload_hotkeys(self):
         for hid in list(self._registered_native_ids):
@@ -9025,6 +9139,8 @@ class GlobalHotkeyManager(QObject):
             self.trigger_history()
         elif hotkey_id == self.HOTKEY_SETTINGS_ID:
             self.trigger_settings()
+        elif hotkey_id == self.HOTKEY_DRAWER_ID:
+            self.trigger_drawer()
         elif hotkey_id == self.HOTKEY_SPACE_ID:
             self.trigger_space()
         elif hotkey_id == self.HOTKEY_ESC_ID:
@@ -9085,6 +9201,13 @@ class GlobalHotkeyManager(QObject):
             self.on_settings_pressed.emit()
         except Exception as e:
             logging.error("系统设置热键触发异常: %s", e)
+
+    def trigger_drawer(self):
+        try:
+            logging.info("触发贴图抽屉热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_drawer_pressed.emit()
+        except Exception as e:
+            logging.error("贴图抽屉热键触发异常: %s", e)
 
     def trigger_space(self):
         try:
@@ -9222,6 +9345,8 @@ class ScreenshotTool(QWidget):
         
         self.capture_history = [] 
         self.pinned_windows = [] 
+        self.pin_drawer = PinDrawerWindow(main_app=self)
+        self.pin_drawer.set_feature_enabled(load_settings().get("drawer_hover_enabled", True)) 
         
         self.inline_editor = InlineTextEditor(self)
         self.crop_toolbar = CropToolbar(self)
@@ -9236,6 +9361,18 @@ class ScreenshotTool(QWidget):
         
         self.setup_toolbar()
         QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
+
+    def toggle_drawer(self):
+        """Ctrl+1 快捷键：彻底开启或关闭贴图储藏柜功能"""
+        if hasattr(self, 'pin_drawer') and self.pin_drawer:
+            enabled = self.pin_drawer.toggle()
+            save_settings({"drawer_hover_enabled": enabled})
+            try:
+                msg = "🗄️ 贴图抽屉功能已开启" if enabled else "🚫 贴图抽屉功能已关闭 (按 Ctrl+1 开启)"
+                self._drawer_toast = PinToast(msg, pinned=enabled)
+                self._drawer_toast.show()
+            except Exception:
+                pass
 
     def save_state(self):
         state = {
@@ -12297,6 +12434,9 @@ class AppTrayIcon(QSystemTrayIcon):
         pin_action = QAction("📌 贴图置顶", menu)
         pin_action.triggered.connect(self.main_app.hotkey_pin)
         menu.addAction(pin_action)
+        drawer_action = QAction("🗄️ 贴图抽屉 (Ctrl+1)", menu)
+        drawer_action.triggered.connect(self.main_app.toggle_drawer)
+        menu.addAction(drawer_action)
         menu.addSeparator()
         win_pin_action = QAction("📌 窗口置顶 (DeskPin)", menu)
         win_pin_action.triggered.connect(self.main_app.activate_window_pin)
@@ -12330,6 +12470,11 @@ class AppTrayIcon(QSystemTrayIcon):
             clean_orphan_temp_files()
         except Exception:
             pass
+        if hasattr(self.main_app, 'pin_drawer') and self.main_app.pin_drawer:
+            try:
+                self.main_app.pin_drawer.close()
+            except Exception:
+                pass
         if hasattr(self.main_app, '_cleanup_recording_ui'):
             self.main_app._cleanup_recording_ui()
         if hasattr(self.main_app, 'recording_thread') and self.main_app.recording_thread:
@@ -12413,6 +12558,7 @@ if __name__ == '__main__':
         hotkey_mgr.on_scroll_pressed.connect(ex.activate_scroll_capture)
         hotkey_mgr.on_history_pressed.connect(ex.show_history_dialog)
         hotkey_mgr.on_settings_pressed.connect(ex.show_settings_dialog)
+        hotkey_mgr.on_drawer_pressed.connect(ex.toggle_drawer)
 
         sys.exit(app.exec_())
     except Exception as e:

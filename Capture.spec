@@ -23,6 +23,7 @@ hiddenimports = [
     'psutil',
     'numpy',
     'keyboard',
+    'pin_drawer',
 ]
 
 tmp_ret_rapid = collect_all('rapidocr_onnxruntime')
