@@ -17,6 +17,7 @@ except Exception:
 
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+os.environ.setdefault("QT_QPA_PLATFORM", "windows:fontengine=freetype")
 
 # 优先加载 Windows 系统核心最新的 MSVC 运行时库，避免 PyQt5 自带旧版 MSVCP140.dll 产生符号与内存冲突
 for _dll_name in ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll']:
@@ -77,10 +78,13 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QHBoxLayout, QV
                              QColorDialog, QFontDialog, QTextEdit, QMenu, QComboBox, QSpinBox,
                              QSystemTrayIcon, QAction, QFrame, QSlider, QProgressBar, QToolTip,
                              QGraphicsDropShadowEffect, QGroupBox, QGridLayout, QLineEdit, QCheckBox,
-                             QStackedWidget, QSizePolicy)
-from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QSharedMemory, QTimer, QAbstractNativeEventFilter, QObject, QUrl, QMimeData, QPointF, QRectF
-from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QBrush, QWheelEvent,
-                         QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QFontMetricsF, QRegion)
+                             QStackedWidget, QSizePolicy, QAbstractButton, QButtonGroup, QShortcut)
+from PyQt5.QtCore import (Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QSharedMemory, QTimer,
+                          QAbstractNativeEventFilter, QObject, QUrl, QMimeData, QPointF, QRectF,
+                          QPropertyAnimation, QEasingCurve, pyqtProperty, QEvent, QEventLoop)
+from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QFontDatabase, QBrush, QWheelEvent,
+                         QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QFontMetricsF, QRegion,
+                         QKeySequence)
 
 # ==========================================
 # ENVIRONMENT & OCR SETUP
@@ -113,12 +117,20 @@ REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
 # AI 翻译与多模态识别配置 (智谱 GLM-OCR & 火山方舟豆包翻译)
 # ==========================================
 SETTINGS_FILE = os.path.join(BASE_DIR, "capture_settings.json")
-from pin_drawer import PinDrawerWindow
+from pin_drawer import (
+    PinDrawerWindow,
+    DrawerHoverPreview,
+    start_pixmap_file_drag,
+    run_toggleable_drag,
+    copy_pixmap_as_clipboard_file,
+    _extract_pixmaps_from_mimedata,
+)
+from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -153,6 +165,9 @@ def load_settings():
         "hotkey_history": "",
         "hotkey_settings": "",
         "hotkey_drawer": "Ctrl+1",
+        "hotkey_toggle_pins": "Ctrl+Alt+H",
+        "hotkey_paste_pin": "Ctrl+Alt+V",
+        "hotkey_restore_click_through": "Ctrl+Alt+T",
         "drawer_hover_enabled": True,
         "default_save_dir": os.path.join(os.path.expanduser("~"), "Pictures"),
         "auto_save_enabled": False,
@@ -360,6 +375,35 @@ _user32.SetForegroundWindow.restype = wintypes.BOOL
 HWND_TOPMOST = wintypes.HWND(-1)
 HWND_NOTOPMOST = wintypes.HWND(-2)
 WS_EX_TOPMOST = 0x00000008
+
+
+def _force_activate_window(widget):
+    """在外部拖拽或子窗口关闭后可靠恢复窗口前台焦点，避免热键/Esc 失效。"""
+    if widget is None:
+        return
+    try:
+        hwnd = int(widget.winId())
+        if sys.platform == "win32" and hwnd:
+            fg = _user32.GetForegroundWindow()
+            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            fg_tid = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            attached = False
+            if fg_tid and fg_tid != cur_tid:
+                attached = bool(_user32.AttachThreadInput(fg_tid, cur_tid, True))
+            try:
+                _user32.BringWindowToTop(hwnd)
+                _user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    _user32.AttachThreadInput(fg_tid, cur_tid, False)
+    except Exception:
+        pass
+    try:
+        widget.raise_()
+        widget.activateWindow()
+        widget.setFocus(Qt.ActiveWindowFocusReason)
+    except Exception:
+        pass
 
 try:
     _user32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
@@ -637,6 +681,521 @@ def create_deskpin_cursor():
     return QCursor(pix, 3, 3)
 
 
+CODEX_FONT_FAMILY = '"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif'
+CODEX_MONO_FAMILY = '"Cascadia Mono", "Cascadia Code", "Consolas", "Microsoft YaHei UI", monospace'
+
+_UI_PRIMARY_FAMILY = "Segoe UI Variable Text"
+_UI_MONO_FAMILY = "Cascadia Mono"
+_UI_CJK_FAMILY = "Microsoft YaHei UI"
+_FONTS_CONFIGURED = False
+
+
+def _configure_ui_font_system():
+    """探测系统可用现代字体族并注册一次全局回退链，确保 FreeType 下西文、中文与 Emoji 无缝混排。"""
+    global _UI_PRIMARY_FAMILY, _UI_MONO_FAMILY, _UI_CJK_FAMILY, _FONTS_CONFIGURED
+    if _FONTS_CONFIGURED or not QApplication.instance():
+        return
+    families = set(QFontDatabase().families())
+    _UI_PRIMARY_FAMILY = (
+        "Segoe UI Variable Text" if "Segoe UI Variable Text" in families
+        else ("Segoe UI" if "Segoe UI" in families else "Microsoft YaHei UI")
+    )
+    if "Cascadia Mono" in families:
+        _UI_MONO_FAMILY = "Cascadia Mono"
+    elif "Cascadia Code" in families:
+        _UI_MONO_FAMILY = "Cascadia Code"
+    else:
+        _UI_MONO_FAMILY = "Consolas"
+    _UI_CJK_FAMILY = "Microsoft YaHei UI" if "Microsoft YaHei UI" in families else "Microsoft YaHei"
+
+    def _uniq(seq, exclude=None):
+        seen = {exclude} if exclude else set()
+        out = []
+        for item in seq:
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    cjk_chain = [_UI_CJK_FAMILY, "Microsoft YaHei", "Segoe UI Emoji"]
+    QFont.insertSubstitutions(
+        "Segoe UI Variable Text",
+        _uniq(["Segoe UI"] + cjk_chain, exclude="Segoe UI Variable Text"),
+    )
+    QFont.insertSubstitutions("Segoe UI", _uniq(cjk_chain, exclude="Segoe UI"))
+    QFont.insertSubstitutions("Microsoft YaHei UI", _uniq(["Segoe UI Emoji"], exclude="Microsoft YaHei UI"))
+    QFont.insertSubstitutions("Microsoft YaHei", _uniq(["Segoe UI Emoji"], exclude="Microsoft YaHei"))
+    QFont.insertSubstitutions(
+        _UI_MONO_FAMILY,
+        _uniq(["Cascadia Mono", "Cascadia Code", "Consolas"] + cjk_chain, exclude=_UI_MONO_FAMILY),
+    )
+    QFont.insertSubstitutions("Consolas", _uniq([_UI_MONO_FAMILY] + cjk_chain, exclude="Consolas"))
+    _FONTS_CONFIGURED = True
+
+
+def make_ui_font(pt_size=9, weight=QFont.Normal, mono=False, pixel_size=None):
+    """构造统一的现代无衬线/等宽 QFont，关闭 FreeType 强制网格对齐并启用高质量灰度抗锯齿。"""
+    _configure_ui_font_system()
+    family = _UI_MONO_FAMILY if mono else _UI_PRIMARY_FAMILY
+    font = QFont(family, -1 if pixel_size is not None else pt_size, weight)
+    if pixel_size is not None:
+        font.setPixelSize(max(1, int(pixel_size)))
+    font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+    font.setHintingPreference(QFont.PreferNoHinting)
+    return font
+
+
+CODEX_DIALOG_BASE_QSS = f"""
+    QDialog {{
+        background-color: #FCFCFD;
+        color: #0D0D0D;
+        font-family: {CODEX_FONT_FAMILY};
+    }}
+    QWidget#codexTopBar {{
+        background-color: #F7F7F8;
+        border-bottom: 1px solid #ECECEF;
+    }}
+    QWidget#codexBottomBar {{
+        background-color: #F7F7F8;
+        border-top: 1px solid #ECECEF;
+    }}
+    QFrame#codexCard {{
+        background-color: #FFFFFF;
+        border: 1px solid #E4E4E7;
+        border-radius: 10px;
+    }}
+    QLabel#codexTitle {{
+        font-size: 14.5px;
+        font-weight: 600;
+        color: #0D0D0D;
+        background: transparent;
+    }}
+    QLabel#codexSubtitle {{
+        font-size: 12px;
+        color: #71717A;
+        background: transparent;
+    }}
+    QLabel#codexSectionLabel {{
+        font-size: 11.5px;
+        font-weight: 600;
+        color: #71717A;
+        background: transparent;
+    }}
+    QLabel#codexPill {{
+        background-color: #FFFFFF;
+        color: #52525B;
+        border: 1px solid #E4E4E7;
+        border-radius: 6px;
+        padding: 3px 9px;
+        font-size: 11.5px;
+        font-weight: 400;
+    }}
+    QComboBox {{
+        background-color: #FFFFFF;
+        color: #18181B;
+        border: 1px solid #E4E4E7;
+        border-radius: 7px;
+        padding: 5px 26px 5px 10px;
+        font-size: 12.5px;
+        min-height: 20px;
+    }}
+    QComboBox:hover {{
+        border-color: #D4D4D8;
+        background-color: #FAFAFA;
+    }}
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: top right;
+        width: 24px;
+        border: none;
+        background: transparent;
+    }}
+    QComboBox::down-arrow {{
+        width: 0px;
+        height: 0px;
+        border: none;
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: #FFFFFF;
+        color: #0D0D0D;
+        border: 1px solid #E4E4E7;
+        border-radius: 8px;
+        padding: 4px;
+        selection-background-color: #F4F4F5;
+        selection-color: #0D0D0D;
+        outline: none;
+    }}
+    QLineEdit {{
+        background-color: #FFFFFF;
+        color: #0D0D0D;
+        border: 1px solid #E4E4E7;
+        border-radius: 7px;
+        padding: 6px 10px;
+        font-size: 12.5px;
+        selection-background-color: #0D0D0D;
+        selection-color: #FFFFFF;
+    }}
+    QLineEdit:focus {{
+        border-color: #0D0D0D;
+    }}
+    QPushButton#codexPrimaryBtn {{
+        background-color: #0D0D0D;
+        color: #FFFFFF;
+        border: 1px solid #0D0D0D;
+        border-radius: 7px;
+        padding: 6px 14px;
+        font-size: 12.5px;
+        font-weight: 600;
+    }}
+    QPushButton#codexPrimaryBtn:hover {{
+        background-color: #27272A;
+        border-color: #27272A;
+    }}
+    QPushButton#codexPrimaryBtn:pressed {{
+        background-color: #3F3F46;
+    }}
+    QPushButton#codexPrimaryBtn:disabled {{
+        background-color: #E4E4E7;
+        color: #A1A1AA;
+        border-color: #E4E4E7;
+    }}
+    QPushButton#codexSecondaryBtn {{
+        background-color: #FFFFFF;
+        color: #18181B;
+        border: 1px solid #E4E4E7;
+        border-radius: 7px;
+        padding: 6px 12px;
+        font-size: 12.5px;
+        font-weight: 400;
+    }}
+    QPushButton#codexSecondaryBtn:hover {{
+        background-color: #F4F4F5;
+        border-color: #D4D4D8;
+        color: #0D0D0D;
+    }}
+    QPushButton#codexSecondaryBtn:disabled {{
+        background-color: #FAFAFA;
+        color: #A1A1AA;
+        border-color: #ECECEF;
+    }}
+    QPushButton#codexGhostBtn {{
+        background-color: transparent;
+        color: #52525B;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 5px 10px;
+        font-size: 12px;
+        font-weight: 400;
+    }}
+    QPushButton#codexGhostBtn:hover {{
+        background-color: #F4F4F5;
+        color: #0D0D0D;
+    }}
+    QPushButton#codexDangerBtn {{
+        background-color: #FFFFFF;
+        color: #DC2626;
+        border: 1px solid #FECACA;
+        border-radius: 7px;
+        padding: 6px 12px;
+        font-size: 12.5px;
+        font-weight: 400;
+    }}
+    QPushButton#codexDangerBtn:hover {{
+        background-color: #FEF2F2;
+        border-color: #FCA5A5;
+    }}
+    QScrollArea {{
+        border: none;
+        background: transparent;
+    }}
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 6px;
+        margin: 2px 1px;
+    }}
+    QScrollBar::handle:vertical {{
+        background: #D4D4D8;
+        border-radius: 3px;
+        min-height: 28px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: #A1A1AA;
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        background: transparent;
+        height: 0px;
+    }}
+    QScrollBar:horizontal {{
+        background: transparent;
+        height: 6px;
+        margin: 1px 2px;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: #D4D4D8;
+        border-radius: 3px;
+        min-width: 28px;
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background: #A1A1AA;
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+        background: transparent;
+        width: 0px;
+    }}
+"""
+
+
+def _create_codex_icon(name, color="#52525B", size=16):
+    """绘制 Codex 风格高分屏极简 1.5px 线性矢量图标"""
+    dpr = 2
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.setDevicePixelRatio(float(dpr))
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    if size != 16:
+        p.scale(size / 16.0, size / 16.0)
+    pen = QPen(QColor(color), 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+
+    if name == "brand":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#0D0D0D"))
+        p.drawRoundedRect(QRectF(0.5, 0.5, 15.0, 15.0), 4.0, 4.0)
+        p.setPen(QPen(QColor("#FFFFFF"), 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        # 极简取景框四角
+        p.drawPolyline(QPointF(3.8, 6.2), QPointF(3.8, 3.8), QPointF(6.2, 3.8))
+        p.drawPolyline(QPointF(9.8, 3.8), QPointF(12.2, 3.8), QPointF(12.2, 6.2))
+        p.drawPolyline(QPointF(12.2, 9.8), QPointF(12.2, 12.2), QPointF(9.8, 12.2))
+        p.drawPolyline(QPointF(6.2, 12.2), QPointF(3.8, 12.2), QPointF(3.8, 9.8))
+        p.drawEllipse(QPointF(8.0, 8.0), 1.7, 1.7)
+    elif name == "shortcuts":
+        # Command ⌘ 极简对称符号
+        p.drawRect(QRectF(5.8, 5.8, 4.4, 4.4))
+        p.drawRoundedRect(QRectF(2.2, 2.2, 3.6, 3.6), 1.8, 1.8)
+        p.drawRoundedRect(QRectF(10.2, 2.2, 3.6, 3.6), 1.8, 1.8)
+        p.drawRoundedRect(QRectF(2.2, 10.2, 3.6, 3.6), 1.8, 1.8)
+        p.drawRoundedRect(QRectF(10.2, 10.2, 3.6, 3.6), 1.8, 1.8)
+    elif name == "general":
+        # 极简调节滑块三横线
+        p.drawLine(QPointF(2.5, 4.0), QPointF(13.5, 4.0))
+        p.drawLine(QPointF(2.5, 8.0), QPointF(13.5, 8.0))
+        p.drawLine(QPointF(2.5, 12.0), QPointF(13.5, 12.0))
+        p.setBrush(QColor("#F7F7F8"))
+        p.drawEllipse(QPointF(5.5, 4.0), 1.6, 1.6)
+        p.drawEllipse(QPointF(10.5, 8.0), 1.6, 1.6)
+        p.drawEllipse(QPointF(6.5, 12.0), 1.6, 1.6)
+    elif name == "ai":
+        # OpenAI / AI 星芒轮廓
+        star = QPainterPath()
+        star.moveTo(7.5, 1.8)
+        star.quadTo(8.0, 7.2, 13.4, 7.7)
+        star.quadTo(8.0, 8.2, 7.5, 13.6)
+        star.quadTo(7.0, 8.2, 1.6, 7.7)
+        star.quadTo(7.0, 7.2, 7.5, 1.8)
+        p.drawPath(star)
+        p.drawLine(QPointF(12.8, 2.2), QPointF(12.8, 4.6))
+        p.drawLine(QPointF(11.6, 3.4), QPointF(14.0, 3.4))
+    elif name == "update":
+        # 循环刷新箭头
+        arc_path = QPainterPath()
+        arc_path.arcMoveTo(QRectF(2.5, 2.5, 11.0, 11.0), 35)
+        arc_path.arcTo(QRectF(2.5, 2.5, 11.0, 11.0), 35, 285)
+        p.drawPath(arc_path)
+        p.drawPolyline(QPointF(10.5, 2.6), QPointF(12.8, 4.3), QPointF(10.4, 5.8))
+    elif name == "eye":
+        eye = QPainterPath()
+        eye.moveTo(1.8, 8.0)
+        eye.quadTo(8.0, 2.5, 14.2, 8.0)
+        eye.quadTo(8.0, 13.5, 1.8, 8.0)
+        p.drawPath(eye)
+        p.drawEllipse(QPointF(8.0, 8.0), 2.1, 2.1)
+    elif name == "eye_off":
+        eye = QPainterPath()
+        eye.moveTo(1.8, 8.0)
+        eye.quadTo(8.0, 2.8, 14.2, 8.0)
+        eye.quadTo(8.0, 13.2, 1.8, 8.0)
+        p.drawPath(eye)
+        p.drawLine(QPointF(2.6, 13.0), QPointF(13.4, 3.0))
+
+    p.end()
+    return QIcon(pm)
+
+
+class CodexSwitch(QAbstractButton):
+    """Codex 极简黑白胶囊开关控件，无缝兼容 QCheckBox 的 isChecked/setChecked 接口"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFixedSize(38, 22)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.TabFocus)
+        self._knob_pos = 0.0
+        self._anim = QPropertyAnimation(self, b"knobPos", self)
+        self._anim.setDuration(130)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(self._on_toggled)
+
+    @pyqtProperty(float)
+    def knobPos(self):
+        return self._knob_pos
+
+    @knobPos.setter
+    def knobPos(self, val):
+        self._knob_pos = float(val)
+        self.update()
+
+    def _on_toggled(self, checked):
+        target = 1.0 if checked else 0.0
+        if self.isVisible():
+            self._anim.stop()
+            self._anim.setStartValue(self._knob_pos)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._anim.stop()
+            self._knob_pos = target
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        checked = self.isChecked()
+        hovered = self.underMouse()
+
+        if checked:
+            track_color = QColor("#27272A") if hovered else QColor("#0D0D0D")
+        else:
+            track_color = QColor("#A1A1AA") if hovered else QColor("#D4D4D8")
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(track_color)
+        p.drawRoundedRect(QRectF(0.0, 1.0, 38.0, 20.0), 10.0, 10.0)
+
+        # 白色滑块圆点
+        knob_d = 16.0
+        knob_x = 2.0 + self._knob_pos * 18.0
+        knob_y = 3.0
+        p.setBrush(QColor(0, 0, 0, 24))
+        p.drawEllipse(QRectF(knob_x, knob_y + 0.6, knob_d, knob_d))
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawEllipse(QRectF(knob_x, knob_y, knob_d, knob_d))
+
+
+class CodexComboBox(QComboBox):
+    """Codex 风格下拉选择框，自带高清细线条下箭头"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#71717A"), 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        cx = self.width() - 14.0
+        cy = self.height() / 2.0
+        p.drawPolyline(QPointF(cx - 3.6, cy - 1.6), QPointF(cx, cy + 2.2), QPointF(cx + 3.6, cy - 1.6))
+
+
+class CodexSlider(QSlider):
+    """Codex 风格纯矢量滑动条，彻底消除原生 Windows 样式的方形锯齿滑块"""
+    def __init__(self, orientation=Qt.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setFixedHeight(22)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pad_x = 8.0
+        track_w = max(10.0, float(self.width()) - 2.0 * pad_x)
+        cy = self.height() / 2.0
+
+        # 底层细轨道
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#E4E4E7"))
+        p.drawRoundedRect(QRectF(pad_x, cy - 2.0, track_w, 4.0), 2.0, 2.0)
+
+        span = max(1, self.maximum() - self.minimum())
+        ratio = max(0.0, min(1.0, float(self.value() - self.minimum()) / float(span)))
+        fill_w = ratio * track_w
+
+        # 已激活黑色轨道
+        if fill_w > 0.5:
+            p.setBrush(QColor("#0D0D0D"))
+            p.drawRoundedRect(QRectF(pad_x, cy - 2.0, fill_w, 4.0), 2.0, 2.0)
+
+        # 圆形极简滑块
+        cx = pad_x + fill_w
+        r = 7.0 if not self.underMouse() else 7.6
+        p.setBrush(QColor(0, 0, 0, 28))
+        p.drawEllipse(QPointF(cx, cy + 0.8), r, r)
+        p.setBrush(QColor("#FFFFFF"))
+        p.setPen(QPen(QColor("#0D0D0D"), 2.0))
+        p.drawEllipse(QPointF(cx, cy), r - 1.0, r - 1.0)
+
+
+class CodexCard(QFrame):
+    """Codex 风格分组列表容器：纯白底 + 1px 细边框 + 内部分割线"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("codexCard")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
+        self._row_count = 0
+
+    def add_row(self, title, description="", control=None):
+        if self._row_count > 0:
+            div_wrap = QWidget()
+            div_wrap.setObjectName("codexDivWrap")
+            div_wrap.setStyleSheet("QWidget#codexDivWrap { background: transparent; }")
+            div_lay = QHBoxLayout(div_wrap)
+            div_lay.setContentsMargins(16, 0, 16, 0)
+            div_lay.setSpacing(0)
+            div = QFrame()
+            div.setObjectName("codexDivider")
+            div.setFixedHeight(1)
+            div.setStyleSheet("QFrame#codexDivider { background: #F1F1F5; border: none; }")
+            div_lay.addWidget(div)
+            self._layout.addWidget(div_wrap)
+
+        row = QWidget()
+        row.setObjectName("codexRow")
+        row.setStyleSheet("QWidget#codexRow { background: transparent; }")
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(16, 12, 16, 12)
+        row_lay.setSpacing(16)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet("QLabel { font-size: 13px; font-weight: 400; color: #0D0D0D; background: transparent; }")
+        text_col.addWidget(lbl_title)
+
+        if description:
+            lbl_desc = QLabel(description)
+            lbl_desc.setWordWrap(True)
+            lbl_desc.setStyleSheet("QLabel { font-size: 11.5px; color: #71717A; background: transparent; }")
+            text_col.addWidget(lbl_desc)
+
+        row_lay.addLayout(text_col, 1)
+
+        if control is not None:
+            row_lay.addWidget(control, 0, Qt.AlignVCenter | Qt.AlignRight)
+
+        self._layout.addWidget(row)
+        self._row_count += 1
+        return row
+
+
 class PinToast(QWidget):
     """置顶/取消置顶浮动状态轻量级提示框"""
     def __init__(self, text, pinned=True, parent=None):
@@ -649,16 +1208,18 @@ class PinToast(QWidget):
         layout.setContentsMargins(14, 8, 14, 8)
 
         lbl = QLabel(text)
-        bg = "#10b981" if pinned else "#4b5563"
+        bg = "#0D0D0D" if pinned else "#3F3F46"
+        border = "rgba(255, 255, 255, 0.16)"
         lbl.setStyleSheet(f"""
             QLabel {{
                 background-color: {bg};
-                color: #ffffff;
-                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
-                font-size: 13px;
+                color: #FAFAFA;
+                border: 1px solid {border};
+                font-family: {CODEX_FONT_FAMILY};
+                font-size: 12.5px;
                 font-weight: 600;
-                padding: 8px 18px;
-                border-radius: 8px;
+                padding: 8px 16px;
+                border-radius: 9px;
             }}
         """)
         layout.addWidget(lbl)
@@ -793,8 +1354,8 @@ class WindowPinPicker(QWidget):
             local_tl = self.mapFromGlobal(self.hovered_rect.topLeft())
             draw_rect = QRect(local_tl.x(), local_tl.y(), self.hovered_rect.width(), self.hovered_rect.height())
 
-            border_color = QColor("#ef4444") if self.hovered_is_topmost else QColor("#0ea5e9")
-            bg_fill = QColor(239, 68, 68, 30) if self.hovered_is_topmost else QColor(14, 165, 233, 30)
+            border_color = QColor("#ef4444") if self.hovered_is_topmost else QColor("#C8963E")
+            bg_fill = QColor(239, 68, 68, 30) if self.hovered_is_topmost else QColor(200, 150, 62, 32)
 
             painter.setBrush(QBrush(bg_fill))
             painter.setPen(QPen(border_color, 3))
@@ -804,7 +1365,7 @@ class WindowPinPicker(QWidget):
             disp_title = self.hovered_title[:45] + ("..." if len(self.hovered_title) > 45 else "")
             badge_text = f"{status_text}  |  {disp_title}" if disp_title else status_text
 
-            font = QFont("Microsoft YaHei UI", 9, QFont.Bold)
+            font = make_ui_font(9, QFont.DemiBold)
             painter.setFont(font)
             fm = QFontMetrics(font)
             bw = fm.horizontalAdvance(badge_text) + 24
@@ -824,7 +1385,7 @@ class WindowPinPicker(QWidget):
             painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
 
         # 屏幕顶部操作指引卡片
-        banner_font = QFont("Microsoft YaHei UI", 10, QFont.Bold)
+        banner_font = make_ui_font(10, QFont.DemiBold)
         painter.setFont(banner_font)
         bfm = QFontMetrics(banner_font)
         inst_text = "📌 窗口置顶模式 (DeskPin)：点击任意窗口切换置顶状态  |  右键或 ESC 退出"
@@ -865,9 +1426,9 @@ def draw_viewfinder_corners(painter, rect, color, length=14, width=3):
     painter.drawLine(r, b, r - length, b)
     painter.drawLine(r, b, r, b - length)
 
-def draw_selection_badge(painter, rect, text, border_color=QColor(9, 105, 218), bg_color=QColor(255, 255, 255, 240), text_color=QColor(36, 41, 47)):
+def draw_selection_badge(painter, rect, text, border_color=QColor(168, 118, 40), bg_color=QColor(255, 255, 255, 240), text_color=QColor(29, 29, 31)):
     """在选区边缘绘制清晰的浅色信息胶囊气泡"""
-    font = QFont("Microsoft YaHei", 9, QFont.Bold)
+    font = make_ui_font(9, QFont.DemiBold)
     painter.setFont(font)
     fm = QFontMetrics(font)
     txt_w = fm.horizontalAdvance(text) + 16
@@ -1209,17 +1770,20 @@ class TranslationWorker(QThread):
 # OCR 结果展示与多语言智能翻译弹窗 (现代浅色双栏对照风格)
 # ==========================================
 class OcrResultDialog(QDialog):
-    def __init__(self, text, parent=None, prefill_translation=None, target_lang=None, prefill_error=""):
+    def __init__(self, text, parent=None, prefill_translation=None, target_lang=None, prefill_error="",
+                 detected_codes=None, ocr_doc=None):
         super().__init__(parent)
-        self.setWindowTitle("🔤 文字识别与翻译 (OCR & Translation)")
+        self.setWindowTitle("文字识别与翻译 (OCR & Translation)")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(960, 580)
-        self.setMinimumSize(780, 480)
+        self.resize(980, 620)
+        self.setMinimumSize(800, 500)
 
         self.current_worker = None
         self.detected_lang = "auto"
         self.prefill_translation = prefill_translation
         self.prefill_error = prefill_error
+        self.detected_codes = list(detected_codes or [])
+        self.ocr_doc = ocr_doc
         self.debounce_timer = QTimer(self)
         self.debounce_timer.setSingleShot(True)
         self.debounce_timer.timeout.connect(self.trigger_translation)
@@ -1232,106 +1796,137 @@ class OcrResultDialog(QDialog):
         elif saved_target in valid_codes:
             self.initial_target = saved_target
         else:
-            has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in text)
+            has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in (text or ""))
             self.initial_target = "en" if has_chinese else "zh-CN"
 
-        self._setup_ui(text)
+        self._setup_ui(text or "")
         self._apply_style()
 
         if prefill_translation is not None:
             # 一键翻译入口已经在后台完成翻译，这里仅负责展示，避免重复请求
             self.target_edit.setPlainText(prefill_translation)
             if prefill_error:
-                self.status_lbl.setText("⚠ 翻译失败")
-                self.status_lbl.setStyleSheet("color: #cf222e; font-weight: 500;")
+                self._set_status("翻译失败", "err")
                 self.target_edit.setPlaceholderText(f"翻译失败: {prefill_error}")
             else:
                 use_ai = self.combo_mode.currentData() == "ai"
-                self.status_lbl.setText("✓ AI 翻译完成" if use_ai else "✓ 翻译完成")
-                self.status_lbl.setStyleSheet("color: #1a7f37; font-weight: 500;")
-        else:
+                self._set_status("AI 翻译完成" if use_ai else "翻译完成", "ok")
+        elif (text or "").strip():
             # 普通识别入口：弹窗打开后立即发起初次自动翻译
             QTimer.singleShot(80, self.trigger_translation)
+        else:
+            self._set_status("已解码二维码/条码", "ok")
+
+    def _set_status(self, text, tone="muted"):
+        if not text:
+            self.status_lbl.setVisible(False)
+            self.status_lbl.setText("")
+            return
+        palettes = {
+            "info":  ("#FBF7EE", "#7A5110", "#E5D2AE"),
+            "ok":    ("#F0FDF4", "#15803D", "#BBF7D0"),
+            "warn":  ("#FFFBEB", "#B45309", "#FDE68A"),
+            "err":   ("#FEF2F2", "#DC2626", "#FECACA"),
+            "muted": ("#F4F4F5", "#52525B", "#E4E4E7"),
+        }
+        bg, fg, bd = palettes.get(tone, palettes["muted"])
+        self.status_lbl.setVisible(True)
+        self.status_lbl.setText(text)
+        self.status_lbl.setStyleSheet(
+            f"QLabel#statusLabel {{ background-color: {bg}; color: {fg}; border: 1px solid {bd}; "
+            f"border-radius: 6px; padding: 3px 10px; font-size: 11.5px; font-weight: 600; }}"
+        )
 
     def _setup_ui(self, initial_text):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 18, 20, 18)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # ── 第 1 行：标题 + 状态徽章 ──
+        # ── 顶部 Codex 工具头（标题徽章行 + 模式工具栏）──
+        top_bar = QWidget()
+        top_bar.setObjectName("codexTopBar")
+        top_lay = QVBoxLayout(top_bar)
+        top_lay.setContentsMargins(20, 14, 20, 12)
+        top_lay.setSpacing(10)
+
         row1 = QHBoxLayout()
-        row1.setSpacing(12)
+        row1.setSpacing(10)
 
-        title_lbl = QLabel("🔤 文字识别与翻译")
-        title_lbl.setObjectName("dialogTitle")
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_create_codex_icon("ai", "#0D0D0D", 16).pixmap(16, 16))
+        icon_lbl.setFixedSize(18, 18)
 
-        self.lbl_src_detected = QLabel("🌐 源语言: 自动检测")
-        self.lbl_src_detected.setObjectName("badgeLabel")
+        title_lbl = QLabel("文字识别与翻译")
+        title_lbl.setObjectName("codexTitle")
 
-        self.lbl_char_count = QLabel(f"📝 {len(initial_text.strip())} 字符")
-        self.lbl_char_count.setObjectName("badgeLabel")
+        self.lbl_src_detected = QLabel("源语言: 自动检测")
+        self.lbl_src_detected.setObjectName("codexPill")
+
+        self.lbl_char_count = QLabel(f"{len(initial_text.strip())} 字符")
+        self.lbl_char_count.setObjectName("codexPill")
 
         self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("statusLabel")
+        self.status_lbl.setVisible(False)
 
+        row1.addWidget(icon_lbl)
         row1.addWidget(title_lbl)
+        row1.addSpacing(4)
         row1.addWidget(self.lbl_src_detected)
         row1.addWidget(self.lbl_char_count)
         row1.addStretch()
         row1.addWidget(self.status_lbl)
-        main_layout.addLayout(row1)
+        top_lay.addLayout(row1)
 
-        # ── 第 2 行：设置栏（识别模式 | 翻译模式 | 目标语言 | 翻译按钮）──
         row2 = QHBoxLayout()
         row2.setSpacing(8)
-
-        # 从设置文件恢复
         _saved = load_settings()
 
-        # 识别模式
-        lbl_ocr_mode = QLabel("识别:")
+        lbl_ocr_mode = QLabel("识别引擎")
         lbl_ocr_mode.setObjectName("ctrlLabel")
-        self.combo_ocr_mode = QComboBox()
-        self.combo_ocr_mode.addItem("📷 OCR 引擎", "ocr")
-        self.combo_ocr_mode.addItem("🤖 AI 识别", "ai_ocr")
+        self.combo_ocr_mode = CodexComboBox()
+        self.combo_ocr_mode.addItem("OCR 引擎", "ocr")
+        self.combo_ocr_mode.addItem("AI 识别", "ai_ocr")
         if _saved.get("use_ai_ocr", False):
             self.combo_ocr_mode.setCurrentIndex(1)
+        self.combo_ocr_mode.setMinimumWidth(116)
         self.combo_ocr_mode.currentIndexChanged.connect(self._on_ocr_mode_changed)
 
-        # 分隔线
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.VLine)
         sep1.setObjectName("sepLine")
+        sep1.setFixedHeight(16)
 
-        # 翻译模式
-        lbl_mode = QLabel("翻译:")
+        lbl_mode = QLabel("翻译方式")
         lbl_mode.setObjectName("ctrlLabel")
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItem("🌐 普通翻译", "normal")
-        self.combo_mode.addItem("🤖 AI 翻译", "ai")
+        self.combo_mode = CodexComboBox()
+        self.combo_mode.addItem("普通翻译", "normal")
+        self.combo_mode.addItem("AI 翻译", "ai")
         if _saved.get("use_ai_translation", False):
             self.combo_mode.setCurrentIndex(1)
+        self.combo_mode.setMinimumWidth(116)
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
 
-        # 分隔线
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.VLine)
         sep2.setObjectName("sepLine")
+        sep2.setFixedHeight(16)
 
-        # 目标语言
-        lbl_target = QLabel("目标:")
+        lbl_target = QLabel("目标语言")
         lbl_target.setObjectName("ctrlLabel")
-        self.combo_target = QComboBox()
+        self.combo_target = CodexComboBox()
         for code, label in SUPPORTED_LANGUAGES:
             self.combo_target.addItem(label, code)
         idx = self.combo_target.findData(self.initial_target)
         if idx >= 0:
             self.combo_target.setCurrentIndex(idx)
+        self.combo_target.setMinimumWidth(134)
         self.combo_target.currentIndexChanged.connect(self._on_target_changed)
 
-        # 翻译按钮
-        self.btn_translate = QPushButton("🔄 翻译")
-        self.btn_translate.setObjectName("toolBtn")
+        self.btn_translate = QPushButton("立即翻译")
+        self.btn_translate.setObjectName("codexPrimaryBtn")
+        self.btn_translate.setIcon(_create_codex_icon("update", "#FFFFFF", 13))
+        self.btn_translate.setIconSize(QSize(13, 13))
         self.btn_translate.setCursor(Qt.PointingHandCursor)
         self.btn_translate.clicked.connect(self.trigger_translation)
 
@@ -1345,81 +1940,155 @@ class OcrResultDialog(QDialog):
         row2.addWidget(self.combo_target)
         row2.addStretch()
         row2.addWidget(self.btn_translate)
-        main_layout.addLayout(row2)
+        top_lay.addLayout(row2)
+        main_layout.addWidget(top_bar)
 
-        # ── 第 3 行：双栏对照卡片区 ──
+        # ── 中央双栏编辑卡片区 ──
+        body_wrap = QWidget()
+        body_wrap.setObjectName("codexBody")
+        body_lay = QVBoxLayout(body_wrap)
+        body_lay.setContentsMargins(20, 16, 20, 16)
+        body_lay.setSpacing(12)
+
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(14)
 
-        # 左栏：原文卡片
         left_card = QFrame()
-        left_card.setObjectName("cardFrame")
+        left_card.setObjectName("codexCard")
         left_layout = QVBoxLayout(left_card)
-        left_layout.setContentsMargins(14, 12, 14, 12)
-        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
 
-        left_header = QHBoxLayout()
-        left_title = QLabel("📄 原文  (可直接编辑)")
+        left_header_w = QWidget()
+        left_header_w.setObjectName("cardHeader")
+        left_header = QHBoxLayout(left_header_w)
+        left_header.setContentsMargins(14, 9, 10, 9)
+        left_header.setSpacing(8)
+        left_title = QLabel("原文")
         left_title.setObjectName("cardTitle")
-        self.btn_copy_source = QPushButton("📋 复制原文")
-        self.btn_copy_source.setObjectName("cardActionBtn")
+        left_hint = QLabel("支持直接编辑")
+        left_hint.setObjectName("cardHint")
+        self.btn_copy_source = QPushButton("复制原文")
+        self.btn_copy_source.setObjectName("codexGhostBtn")
         self.btn_copy_source.setCursor(Qt.PointingHandCursor)
         self.btn_copy_source.clicked.connect(self.copy_source)
+        self.btn_copy_table = QPushButton("复制为表格 (Excel)")
+        self.btn_copy_table.setObjectName("codexGhostBtn")
+        self.btn_copy_table.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_table.setToolTip("按识别坐标或分隔符重建行列（制表符 TSV），可直接粘贴进 Excel / WPS 分列")
+        self.btn_copy_table.clicked.connect(self.copy_as_table)
         left_header.addWidget(left_title)
+        left_header.addWidget(left_hint)
         left_header.addStretch()
+        left_header.addWidget(self.btn_copy_table)
         left_header.addWidget(self.btn_copy_source)
-        left_layout.addLayout(left_header)
+        left_layout.addWidget(left_header_w)
 
         self.source_edit = QTextEdit()
         self.source_edit.setObjectName("editorText")
         self.source_edit.setPlainText(initial_text)
+        if not initial_text.strip() and self.detected_codes:
+            self.source_edit.setPlaceholderText("（画面未包含正文文本，上方已提取出二维码 / 条形码结果）")
         self.source_edit.textChanged.connect(self._on_source_text_changed)
-        left_layout.addWidget(self.source_edit)
+        left_layout.addWidget(self.source_edit, 1)
 
-        # 右栏：译文卡片
         right_card = QFrame()
-        right_card.setObjectName("cardFrame")
+        right_card.setObjectName("codexCard")
         right_layout = QVBoxLayout(right_card)
-        right_layout.setContentsMargins(14, 12, 14, 12)
-        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
 
-        right_header = QHBoxLayout()
-        right_title = QLabel("🌐 译文")
+        right_header_w = QWidget()
+        right_header_w.setObjectName("cardHeader")
+        right_header = QHBoxLayout(right_header_w)
+        right_header.setContentsMargins(14, 9, 10, 9)
+        right_header.setSpacing(8)
+        right_title = QLabel("译文")
         right_title.setObjectName("cardTitle")
-        self.btn_copy_target = QPushButton("📋 复制译文")
-        self.btn_copy_target.setObjectName("cardActionBtn")
+        self.btn_copy_target = QPushButton("复制译文")
+        self.btn_copy_target.setObjectName("codexGhostBtn")
         self.btn_copy_target.setCursor(Qt.PointingHandCursor)
         self.btn_copy_target.clicked.connect(self.copy_target)
         right_header.addWidget(right_title)
         right_header.addStretch()
         right_header.addWidget(self.btn_copy_target)
-        right_layout.addLayout(right_header)
+        right_layout.addWidget(right_header_w)
 
         self.target_edit = QTextEdit()
         self.target_edit.setObjectName("editorText")
         self.target_edit.setPlaceholderText("等待翻译...")
-        right_layout.addWidget(self.target_edit)
+        right_layout.addWidget(self.target_edit, 1)
+
+        if self.detected_codes:
+            codes_card = QFrame()
+            codes_card.setObjectName("codesCard")
+            codes_card.setStyleSheet(
+                "QFrame#codesCard { background-color: #FFFFFF; border: 1px solid #E5D2AE; border-radius: 10px; }"
+            )
+            codes_lay = QVBoxLayout(codes_card)
+            codes_lay.setContentsMargins(14, 10, 14, 10)
+            codes_lay.setSpacing(6)
+            for idx_c, code_info in enumerate(self.detected_codes[:5]):
+                c_row = QHBoxLayout()
+                c_row.setSpacing(8)
+                badge = QLabel(code_info.get("type", "CODE"))
+                badge.setStyleSheet(
+                    "background-color: #FBF7EE; color: #7A5110; border: 1px solid #E5D2AE; "
+                    "border-radius: 5px; padding: 2px 7px; font-size: 11px; font-weight: 600;"
+                )
+                val_txt = code_info.get("text", "")
+                val_edit = QLineEdit(val_txt)
+                val_edit.setReadOnly(True)
+                val_edit.setStyleSheet(
+                    f"QLineEdit {{ font-family: {CODEX_MONO_FAMILY}; font-size: 12px; color: #0F172A; "
+                    "background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 3px 8px; }}"
+                )
+                btn_copy_code = QPushButton("复制")
+                btn_copy_code.setObjectName("codexGhostBtn")
+                btn_copy_code.setCursor(Qt.PointingHandCursor)
+
+                def _copy_this(_=False, t=val_txt, b=btn_copy_code):
+                    QApplication.clipboard().setText(t)
+                    b.setText("已复制")
+                    QTimer.singleShot(1400, lambda: b.setText("复制"))
+
+                btn_copy_code.clicked.connect(_copy_this)
+                c_row.addWidget(badge)
+                c_row.addWidget(val_edit, 1)
+                c_row.addWidget(btn_copy_code)
+                if code_info.get("is_url"):
+                    btn_open = QPushButton("打开链接")
+                    btn_open.setObjectName("codexGhostBtn")
+                    btn_open.setCursor(Qt.PointingHandCursor)
+                    btn_open.clicked.connect(lambda _=False, u=val_txt: webbrowser.open(u))
+                    c_row.addWidget(btn_open)
+                codes_lay.addLayout(c_row)
+            body_lay.addWidget(codes_card)
 
         cards_layout.addWidget(left_card, 1)
         cards_layout.addWidget(right_card, 1)
-        main_layout.addLayout(cards_layout, 1)
+        body_lay.addLayout(cards_layout, 1)
+        main_layout.addWidget(body_wrap, 1)
 
-        # ── 第 4 行：底部快捷操作栏 ──
-        bottom_bar = QHBoxLayout()
+        # ── 底部操作栏 ──
+        bottom_bar_w = QWidget()
+        bottom_bar_w.setObjectName("codexBottomBar")
+        bottom_bar = QHBoxLayout(bottom_bar_w)
+        bottom_bar.setContentsMargins(20, 11, 20, 11)
         bottom_bar.setSpacing(10)
 
-        self.btn_copy_both = QPushButton("📑 复制双语对照")
-        self.btn_copy_both.setObjectName("secondaryBtn")
+        self.btn_copy_both = QPushButton("复制双语对照")
+        self.btn_copy_both.setObjectName("codexSecondaryBtn")
         self.btn_copy_both.setCursor(Qt.PointingHandCursor)
         self.btn_copy_both.clicked.connect(self.copy_bilingual)
 
-        self.btn_primary_copy = QPushButton("📋 复制译文")
-        self.btn_primary_copy.setObjectName("primaryBtn")
+        self.btn_primary_copy = QPushButton("复制译文")
+        self.btn_primary_copy.setObjectName("codexPrimaryBtn")
         self.btn_primary_copy.setCursor(Qt.PointingHandCursor)
         self.btn_primary_copy.clicked.connect(self.copy_target)
 
         self.btn_close = QPushButton("关闭")
-        self.btn_close.setObjectName("secondaryBtn")
+        self.btn_close.setObjectName("codexSecondaryBtn")
         self.btn_close.setCursor(Qt.PointingHandCursor)
         self.btn_close.clicked.connect(self.accept)
 
@@ -1427,153 +2096,60 @@ class OcrResultDialog(QDialog):
         bottom_bar.addStretch()
         bottom_bar.addWidget(self.btn_primary_copy)
         bottom_bar.addWidget(self.btn_close)
-        main_layout.addLayout(bottom_bar)
+        main_layout.addWidget(bottom_bar_w)
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #f6f8fa;
-                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
-                font-size: 13px;
-            }
-            QLabel#dialogTitle {
-                font-size: 16px;
-                font-weight: 700;
-                color: #0f172a;
-                padding: 2px 0;
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QWidget#codexBody {
+                background-color: #FCFCFD;
             }
             QLabel#ctrlLabel {
-                font-size: 13px;
-                font-weight: 600;
-                color: #334155;
-                padding: 0 2px;
-            }
-            QLabel#cardTitle {
-                font-size: 13px;
-                font-weight: 600;
-                color: #1e293b;
-            }
-            QLabel#badgeLabel {
-                background-color: #e2e8f0;
-                color: #475569;
                 font-size: 12px;
-                font-weight: 500;
-                border-radius: 8px;
-                padding: 4px 10px;
-            }
-            QLabel#statusLabel {
-                font-size: 13px;
-                font-weight: 600;
-                color: #0969da;
-                padding: 0 6px;
+                font-weight: 400;
+                color: #71717A;
+                background: transparent;
             }
             QFrame#sepLine {
-                color: #cbd5e1;
+                background-color: #E4E4E7;
                 max-width: 1px;
-                margin: 2px 4px;
+                min-width: 1px;
+                border: none;
+                margin: 0 4px;
             }
-            QFrame#cardFrame {
-                background-color: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 10px;
+            QWidget#cardHeader {
+                background-color: #FAFAFA;
+                border-bottom: 1px solid #F1F1F5;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+            }
+            QLabel#cardTitle {
+                font-size: 12.5px;
+                font-weight: 600;
+                color: #0D0D0D;
+                background: transparent;
+            }
+            QLabel#cardHint {
+                font-size: 11px;
+                color: #A1A1AA;
+                background: transparent;
             }
             QTextEdit#editorText {
-                background-color: #ffffff;
-                color: #0f172a;
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                padding: 10px;
-                font-family: "Cascadia Code", "Consolas", "Microsoft YaHei UI", monospace;
-                font-size: 13px;
-                line-height: 1.6;
-            }
-            QTextEdit#editorText:focus {
-                border: 1.5px solid #0969da;
-            }
-            QComboBox {
-                background-color: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 5px 10px;
-                font-size: 13px;
-                font-weight: 500;
-                min-width: 120px;
-            }
-            QComboBox:hover {
-                border-color: #0969da;
-            }
-            QComboBox::drop-down {
+                background-color: #FFFFFF;
+                color: #18181B;
                 border: none;
-                width: 22px;
-            }
-            QComboBox QAbstractItemView {
-                font-size: 13px;
-                padding: 4px;
-            }
-            QPushButton#toolBtn {
-                background-color: #0969da;
-                color: #ffffff;
-                border: 1px solid #085cc0;
-                border-radius: 6px;
-                padding: 6px 16px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QPushButton#toolBtn:hover {
-                background-color: #085cc0;
-            }
-            QPushButton#toolBtn:disabled {
-                background-color: #94a3b8;
-                border-color: #94a3b8;
-            }
-            QPushButton#cardActionBtn {
-                background: transparent;
-                color: #0969da;
-                border: 1px solid transparent;
-                border-radius: 4px;
-                font-size: 12px;
-                font-weight: 500;
-                padding: 3px 8px;
-            }
-            QPushButton#cardActionBtn:hover {
-                background-color: #f1f5f9;
-                border-color: #cbd5e1;
-            }
-            QPushButton#primaryBtn {
-                background-color: #0969da;
-                color: #ffffff;
-                border: 1px solid #085cc0;
-                border-radius: 6px;
-                padding: 8px 20px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QPushButton#primaryBtn:hover {
-                background-color: #085cc0;
-            }
-            QPushButton#primaryBtn:pressed {
-                background-color: #074da3;
-            }
-            QPushButton#secondaryBtn {
-                background-color: #ffffff;
-                color: #334155;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 8px 18px;
-                font-size: 13px;
-                font-weight: 500;
-            }
-            QPushButton#secondaryBtn:hover {
-                background-color: #f1f5f9;
-                color: #0f172a;
-                border-color: #94a3b8;
+                border-bottom-left-radius: 10px;
+                border-bottom-right-radius: 10px;
+                padding: 12px 14px;
+                font-family: """ + CODEX_FONT_FAMILY + """;
+                font-size: 13.5px;
+                selection-background-color: #0D0D0D;
+                selection-color: #FFFFFF;
             }
         """)
 
     def _on_source_text_changed(self):
         text = self.source_edit.toPlainText().strip()
-        self.lbl_char_count.setText(f"📝 {len(text)} 字符")
+        self.lbl_char_count.setText(f"{len(text)} 字符")
         self.debounce_timer.start(800)
 
     def _on_mode_changed(self):
@@ -1598,17 +2174,13 @@ class OcrResultDialog(QDialog):
         text = self.source_edit.toPlainText().strip()
         if not text:
             self.target_edit.clear()
-            self.status_lbl.setText("")
+            self._set_status("")
             return
 
         target_lang = self.combo_target.currentData()
         use_ai = self.combo_mode.currentData() == "ai"
 
-        if use_ai:
-            self.status_lbl.setText("⏳ AI 正在翻译...")
-        else:
-            self.status_lbl.setText("⏳ 正在翻译...")
-        self.status_lbl.setStyleSheet("color: #0969da; font-weight: 500;")
+        self._set_status("AI 正在翻译..." if use_ai else "正在翻译...", "info")
         self.btn_translate.setEnabled(False)
 
         if self.current_worker and self.current_worker.isRunning():
@@ -1628,42 +2200,41 @@ class OcrResultDialog(QDialog):
         self.btn_translate.setEnabled(True)
         self.target_edit.setPlainText(result)
         use_ai = self.combo_mode.currentData() == "ai"
-        if use_ai:
-            self.status_lbl.setText("✓ AI 翻译完成")
-        else:
-            self.status_lbl.setText("✓ 翻译完成")
-        self.status_lbl.setStyleSheet("color: #1a7f37; font-weight: 500;")
-        
+        self._set_status("AI 翻译完成" if use_ai else "翻译完成", "ok")
+
         # 更新识别到的源语言标签
         lang_name = LANG_NAME_MAP.get(detected_src, detected_src)
-        self.lbl_src_detected.setText(f"🌐 源语言: {lang_name}")
+        self.lbl_src_detected.setText(f"源语言: {lang_name}")
 
     def _on_translation_error(self, err):
         self.btn_translate.setEnabled(True)
         use_ai = self.combo_mode.currentData() == "ai"
-        if use_ai:
-            self.status_lbl.setText("⚠ AI 翻译失败")
-        else:
-            self.status_lbl.setText("⚠ 翻译失败")
-        self.status_lbl.setStyleSheet("color: #cf222e; font-weight: 500;")
+        self._set_status("AI 翻译失败" if use_ai else "翻译失败", "err")
         self.target_edit.setPlaceholderText(f"翻译失败: {err}")
 
     def copy_source(self):
         src = self.source_edit.toPlainText().strip()
         if src:
             QApplication.clipboard().setText(src)
-            self.btn_copy_source.setText("✓ 已复制！")
-            QTimer.singleShot(1500, lambda: self.btn_copy_source.setText("📋 复制原文"))
+            self.btn_copy_source.setText("已复制")
+            QTimer.singleShot(1500, lambda: self.btn_copy_source.setText("复制原文"))
+
+    def copy_as_table(self):
+        tsv = extract_table_tsv(self.ocr_doc, self.source_edit.toPlainText())
+        if tsv.strip():
+            QApplication.clipboard().setText(tsv)
+            self.btn_copy_table.setText("已复制表格")
+            QTimer.singleShot(1500, lambda: self.btn_copy_table.setText("复制为表格 (Excel)"))
 
     def copy_target(self):
         tgt = self.target_edit.toPlainText().strip()
         if tgt:
             QApplication.clipboard().setText(tgt)
-            self.btn_copy_target.setText("✓ 已复制！")
-            self.btn_primary_copy.setText("✓ 译文已复制！")
+            self.btn_copy_target.setText("已复制")
+            self.btn_primary_copy.setText("已复制译文")
             QTimer.singleShot(1500, lambda: (
-                self.btn_copy_target.setText("📋 复制译文"),
-                self.btn_primary_copy.setText("📋 复制译文")
+                self.btn_copy_target.setText("复制译文"),
+                self.btn_primary_copy.setText("复制译文")
             ))
 
     def copy_bilingual(self):
@@ -1673,8 +2244,8 @@ class OcrResultDialog(QDialog):
             return
         bilingual = f"{src}\n\n【译文】\n{tgt}"
         QApplication.clipboard().setText(bilingual)
-        self.btn_copy_both.setText("✓ 双语已复制！")
-        QTimer.singleShot(1500, lambda: self.btn_copy_both.setText("📑 复制双语对照"))
+        self.btn_copy_both.setText("双语已复制")
+        QTimer.singleShot(1500, lambda: self.btn_copy_both.setText("复制双语对照"))
 
 # ==========================================
 # AI 文字识别 (智谱 AI GLM-OCR 专业多模态模型)
@@ -1763,6 +2334,180 @@ def ai_ocr_recognize(image: QImage, timeout=30):
 # ==========================================
 # OCR 版面数据 (保留文字块的几何坐标，供图上取字 / 译文覆盖使用)
 # ==========================================
+# ==========================================
+# 二维码 / 条形码自动检测与表格 TSV 结构重建
+# ==========================================
+def _qimage_to_rgb_array(image: QImage):
+    """将 QImage 安全转换为连续 RGB ndarray (H, W, 3)。"""
+    if image is None or image.isNull():
+        return None
+    img_rgb = image.convertToFormat(QImage.Format_RGB888)
+    width, height = img_rgb.width(), img_rgb.height()
+    if width <= 0 or height <= 0:
+        return None
+    bpl = img_rgb.bytesPerLine()
+    ptr = img_rgb.bits()
+    ptr.setsize(img_rgb.byteCount())
+    raw = np.frombuffer(ptr, np.uint8).reshape((height, bpl))
+    if bpl > width * 3:
+        return np.ascontiguousarray(raw[:, :width * 3].reshape((height, width, 3)))
+    return np.ascontiguousarray(raw.reshape((height, width, 3)))
+
+
+def detect_codes_in_image(img_source):
+    """识别图像中的二维码与一维条形码（基于 OpenCV QRCodeDetector / BarcodeDetector）。"""
+    arr_rgb = None
+    if isinstance(img_source, QPixmap):
+        if img_source.isNull():
+            return []
+        arr_rgb = _qimage_to_rgb_array(img_source.toImage())
+    elif isinstance(img_source, QImage):
+        arr_rgb = _qimage_to_rgb_array(img_source)
+    elif isinstance(img_source, np.ndarray):
+        if img_source.ndim == 3 and img_source.shape[2] >= 3:
+            arr_rgb = np.ascontiguousarray(img_source[:, :, :3])
+    if arr_rgb is None or arr_rgb.size == 0:
+        return []
+
+    bgr = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR)
+    results = []
+    seen = set()
+
+    def _add(code_type, text):
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return
+        key = (code_type, cleaned)
+        if key in seen:
+            return
+        seen.add(key)
+        low = cleaned.lower()
+        results.append({
+            "type": code_type,
+            "text": cleaned,
+            "is_url": low.startswith(("http://", "https://")),
+        })
+
+    def _scan_bgr(mat):
+        # 1. QR 码检测 (标准 + Aruco 补充低质量小码)
+        try:
+            qd = cv2.QRCodeDetector()
+            ok, infos, _pts, _ = qd.detectAndDecodeMulti(mat)
+            if ok and infos:
+                for txt in infos:
+                    if txt:
+                        _add("QR 码", txt)
+            else:
+                txt, _p, _ = qd.detectAndDecode(mat)
+                if txt:
+                    _add("QR 码", txt)
+        except Exception:
+            pass
+
+        if not results and hasattr(cv2, "QRCodeDetectorAruco"):
+            try:
+                qa = cv2.QRCodeDetectorAruco()
+                ok, infos, _pts, _ = qa.detectAndDecodeMulti(mat)
+                if ok and infos:
+                    for txt in infos:
+                        if txt:
+                            _add("QR 码", txt)
+            except Exception:
+                pass
+
+        # 2. 一维条形码检测 (EAN-13, EAN-8, UPC-A, Code-128 等)
+        if hasattr(cv2, "barcode") and hasattr(cv2.barcode, "BarcodeDetector"):
+            try:
+                bd = cv2.barcode.BarcodeDetector()
+                ok, infos, types, _pts = bd.detectAndDecodeWithType(mat)
+                if ok and infos:
+                    for idx_b, txt in enumerate(infos):
+                        if txt:
+                            tname = str(types[idx_b]).strip() if types and idx_b < len(types) else ""
+                            _add(tname or "条形码", txt)
+            except Exception:
+                pass
+
+    # 为紧贴边缘裁剪的二维码/条码增加安静区白边，大幅提高识别率
+    padded = cv2.copyMakeBorder(bgr, 24, 24, 24, 24, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    _scan_bgr(padded)
+
+    # 小尺寸条码放大重试一次
+    if not results and min(bgr.shape[0], bgr.shape[1]) < 280:
+        up = cv2.resize(padded, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        _scan_bgr(up)
+
+    return results
+
+
+def extract_table_tsv(doc=None, fallback_text=""):
+    """根据 OCR 版面坐标（或分隔符回退）将识别结果重建为制表符分隔 (TSV) 文本，可直接粘贴进 Excel / WPS。"""
+    if doc is not None and getattr(doc, "rows", None):
+        valid_rows = [r for r in doc.rows if r.text.strip() and r.rect.isValid()]
+        if valid_rows:
+            # 将垂直坐标在同一行高度范围内的单元格聚合为视觉表格行
+            sorted_cells = sorted(valid_rows, key=lambda r: (r.rect.center().y(), r.rect.left()))
+            visual_rows = []
+            for cell in sorted_cells:
+                cy = cell.rect.center().y()
+                ch = max(1, cell.rect.height())
+                placed = False
+                for vr in visual_rows:
+                    anchor_y = vr["cy"]
+                    anchor_h = vr["h"]
+                    if abs(cy - anchor_y) <= max(8.0, max(ch, anchor_h) * 0.65):
+                        vr["cells"].append(cell)
+                        vr["cy"] = sum(c.rect.center().y() for c in vr["cells"]) / len(vr["cells"])
+                        vr["h"] = max(anchor_h, ch)
+                        placed = True
+                        break
+                if not placed:
+                    visual_rows.append({"cy": float(cy), "h": float(ch), "cells": [cell]})
+
+            for vr in visual_rows:
+                vr["cells"].sort(key=lambda c: c.rect.left())
+
+            has_multi_col = any(len(vr["cells"]) >= 2 for vr in visual_rows)
+            if has_multi_col:
+                # 统计中位行高，用于聚齐每一列左边界 X 坐标（保留空白列对齐）
+                heights = sorted(max(8, c.rect.height()) for c in valid_rows)
+                med_h = heights[len(heights) // 2]
+                col_tol = max(24.0, med_h * 1.4)
+                multi_cells = [c for vr in visual_rows if len(vr["cells"]) >= 2 for c in vr["cells"]]
+                x_buckets = []
+                for left_x in sorted(c.rect.left() for c in multi_cells):
+                    if not x_buckets or abs(left_x - x_buckets[-1]) > col_tol:
+                        x_buckets.append(float(left_x))
+                    else:
+                        x_buckets[-1] = (x_buckets[-1] + left_x) / 2.0
+
+                if len(x_buckets) >= 2:
+                    tsv_lines = []
+                    for vr in visual_rows:
+                        row_vals = [""] * len(x_buckets)
+                        for c in vr["cells"]:
+                            # 归入最近列桶；若差距过大仍放到最接近列中
+                            best_col = min(range(len(x_buckets)), key=lambda idx_b: abs(c.rect.left() - x_buckets[idx_b]))
+                            row_vals[best_col] = (
+                                f"{row_vals[best_col]} {c.text.strip()}".strip()
+                                if row_vals[best_col] else c.text.strip()
+                            )
+                        while len(row_vals) > 1 and row_vals[-1] == "":
+                            row_vals.pop()
+                        tsv_lines.append("\t".join(row_vals))
+                    return "\n".join(tsv_lines)
+
+    # 回退方案：按多空格、制表符或竖线分割普通文本
+    lines = []
+    for raw_line in (fallback_text or "").splitlines():
+        s = raw_line.strip()
+        if not s:
+            continue
+        cols = [c.strip() for c in re.split(r'\t+|\s{2,}|\s*\|\s*', s) if c.strip()]
+        lines.append("\t".join(cols) if cols else s)
+    return "\n".join(lines)
+
+
 class OcrRow:
     """一行文字：包含整行文本、包围盒，以及逐字符的近似矩形。"""
 
@@ -1988,6 +2733,7 @@ def tesseract_ocr_lines(image_rgb, lang_str=None, min_conf=5):
 class OcrWorker(QThread):
     finished = pyqtSignal(str)
     doc_ready = pyqtSignal(object)
+    codes_ready = pyqtSignal(list)
 
     def __init__(self, image: QImage, use_ai=False, fast=False):
         super().__init__()
@@ -1996,26 +2742,32 @@ class OcrWorker(QThread):
         self.use_ai = use_ai
         # fast=True 时仅跑本地 RapidOCR 并直接返回版面文本，跳过耗时的 Tesseract 融合
         self.fast = fast
+        self.detected_codes = []
+        self.ocr_doc = None
 
     def run(self):
         try:
+            arr = _qimage_to_rgb_array(self.image)
+
+            # 同步扫描二维码与一维条码，纯码截图也能直接解码
+            if not self.fast:
+                try:
+                    self.detected_codes = detect_codes_in_image(arr if arr is not None else self.image)
+                    if self.detected_codes:
+                        self.codes_ready.emit(self.detected_codes)
+                except Exception as ex_c:
+                    logging.warning("QR/Barcode 识别异常: %s", ex_c)
+
             # AI 识别模式
             if self.use_ai:
                 result = ai_ocr_recognize(self.image)
                 self.finished.emit(result if result else "")
                 return
 
-            # 传统 OCR 模式
-            img_rgb = self.image.convertToFormat(QImage.Format_RGB888)
-            width, height = img_rgb.width(), img_rgb.height()
-            bpl = img_rgb.bytesPerLine()
-            ptr = img_rgb.bits()
-            ptr.setsize(img_rgb.byteCount())
-            raw = np.frombuffer(ptr, np.uint8).reshape((height, bpl))
-            if bpl > width * 3:
-                arr = np.ascontiguousarray(raw[:, :width * 3].reshape((height, width, 3)))
-            else:
-                arr = raw.reshape((height, width, 3))
+            if arr is None:
+                self.finished.emit("")
+                return
+            width, height = int(arr.shape[1]), int(arr.shape[0])
 
             def _preprocess_for_tess(img_arr):
                 gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
@@ -2062,6 +2814,7 @@ class OcrWorker(QThread):
                 try:
                     doc = build_ocr_doc(rapid_lines, self.image.size())
                     if doc is not None and not doc.is_empty():
+                        self.ocr_doc = doc
                         self.doc_ready.emit(doc)
                         if self.fast:
                             # 取字/一键翻译只需要版面文本，跳过 Tesseract 融合以降低延迟
@@ -2218,8 +2971,8 @@ class TextSelectLayer(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         if self._selected:
-            fill = QColor(55, 138, 221, 88)
-            border = QColor(24, 95, 165, 70)
+            fill = QColor(196, 146, 62, 78)
+            border = QColor(148, 102, 32, 95)
             painter.setPen(QPen(border, 1))
             for ri, row in enumerate(self.doc.rows):
                 idxs = sorted(ci for (r, ci) in self._selected if r == ri and ci < len(row.char_rects))
@@ -2244,8 +2997,8 @@ class TextSelectLayer(QWidget):
                     painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
         if self._dragging and not self._sel_rect.isNull():
-            painter.setPen(QPen(QColor(24, 95, 165, 180), 1, Qt.DashLine))
-            painter.setBrush(QColor(55, 138, 221, 20))
+            painter.setPen(QPen(QColor(148, 102, 32, 185), 1, Qt.DashLine))
+            painter.setBrush(QColor(196, 146, 62, 24))
             painter.drawRect(self._sel_rect.normalized())
             painter.setBrush(Qt.NoBrush)
 
@@ -2256,8 +3009,7 @@ class TextSelectLayer(QWidget):
         painter.end()
 
     def _draw_pill(self, painter, text, center=False):
-        font = QFont("Microsoft YaHei UI")
-        font.setPixelSize(12)
+        font = make_ui_font(pixel_size=12)
         painter.setFont(font)
         fm = QFontMetrics(font)
         tw = fm.horizontalAdvance(text)
@@ -2577,9 +3329,7 @@ def _render_translation_sheet(base_pixmap, blocks, translations, scale=1.0):
             continue
         col = 0 if block.rect.center().x() < width // 2 else 1
         size = int((12 if block.rect.height() >= 34 else 11) * scale)
-        family = "Segoe UI" if all(ord(c) < 128 for c in trans) else "Microsoft YaHei UI"
-        font = QFont(family)
-        font.setPixelSize(max(7, size))
+        font = make_ui_font(pixel_size=max(7, size))
         inner_w = max(40, col_w - int(12 * scale))
         bound = QFontMetrics(font).boundingRect(QRect(0, 0, inner_w, 10000), Qt.TextWordWrap, trans)
         h = max(int(28 * scale), bound.height() + int(12 * scale))
@@ -2698,15 +3448,13 @@ def render_translated_pixmap(base_pixmap, blocks, translations):
         font = None
         bound = None
         for size in range(start_size, min_size - 1, -1):
-            f = QFont(family)
-            f.setPixelSize(size)
+            f = make_ui_font(pixel_size=size)
             br = QFontMetrics(f).boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, trans)
             if br.height() <= max_h and br.width() <= max_w:
                 font, bound = f, br
                 break
         if font is None:
-            font = QFont(family)
-            font.setPixelSize(min_size)
+            font = make_ui_font(pixel_size=min_size)
             bound = QFontMetrics(font).boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, trans)
 
         pad = max(1, int(3 * scale))
@@ -2741,7 +3489,7 @@ class TranslationResultWindow(QDialog):
 
     def __init__(self, original_pixmap, doc, target_lang, use_ai=False, mode="compare", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("🌐 翻译结果")
+        self.setWindowTitle("翻译结果")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self.setObjectName("transResultDialog")
 
@@ -2764,68 +3512,97 @@ class TranslationResultWindow(QDialog):
         screen = QApplication.primaryScreen().availableGeometry()
         pw, ph = self._original_pm.width(), self._original_pm.height()
         if self.mode == "compare":
-            content_w = max(760, pw * 1.9 + 80)
-            content_h = max(480, ph * 1.15 + 100)
+            content_w = max(820, pw * 1.9 + 96)
+            content_h = max(520, ph * 1.15 + 128)
         else:
-            content_w = max(540, pw * 1.35 + 40)
-            content_h = max(400, ph * 1.2 + 80)
+            content_w = max(560, pw * 1.35 + 64)
+            content_h = max(440, ph * 1.2 + 112)
         self.resize(min(int(screen.width() * 0.92), int(content_w)),
                     min(int(screen.height() * 0.88), int(content_h)))
-        self.setMinimumSize(540, 380)
+        self.setMinimumSize(560, 400)
 
         self._setup_ui()
         self._apply_style()
         QTimer.singleShot(40, self._start_translation)
 
+    def _set_status(self, text, tone="info"):
+        palettes = {
+            "info": ("#FBF7EE", "#7A5110", "#E5D2AE"),
+            "ok":   ("#F0FDF4", "#15803D", "#BBF7D0"),
+            "warn": ("#FFFBEB", "#B45309", "#FDE68A"),
+            "err":  ("#FEF2F2", "#DC2626", "#FECACA"),
+        }
+        bg, fg, bd = palettes.get(tone, palettes["info"])
+        self.lbl_status.setText(text)
+        self.lbl_status.setStyleSheet(
+            f"QLabel#transStatus {{ background-color: {bg}; color: {fg}; border: 1px solid {bd}; "
+            f"border-radius: 6px; padding: 3px 10px; font-size: 11.5px; font-weight: 600; }}"
+        )
+
     def _setup_ui(self):
         main = QVBoxLayout(self)
-        main.setContentsMargins(16, 14, 16, 14)
-        main.setSpacing(10)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
 
-        bar = QHBoxLayout()
+        top_bar = QWidget()
+        top_bar.setObjectName("codexTopBar")
+        bar = QHBoxLayout(top_bar)
+        bar.setContentsMargins(18, 12, 18, 12)
         bar.setSpacing(10)
-        title = QLabel("🔎 双栏对照" if self.mode == "compare" else "🖼️ 覆盖翻译")
-        title.setObjectName("transTitle")
+
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_create_codex_icon("ai", "#0D0D0D", 16).pixmap(16, 16))
+        icon_lbl.setFixedSize(18, 18)
+        bar.addWidget(icon_lbl)
+
+        title = QLabel("双栏对照" if self.mode == "compare" else "覆盖翻译")
+        title.setObjectName("codexTitle")
         self.lbl_status = QLabel("正在翻译…")
         self.lbl_status.setObjectName("transStatus")
+        self._set_status("正在翻译…", "info")
 
         bar.addWidget(title)
         bar.addWidget(self.lbl_status)
         bar.addStretch()
 
-        bar.addWidget(QLabel("目标语言:"))
-        self.combo_lang = QComboBox()
+        lbl_lang = QLabel("目标语言")
+        lbl_lang.setObjectName("codexSubtitle")
+        bar.addWidget(lbl_lang)
+
+        self.combo_lang = CodexComboBox()
         for code, label in SUPPORTED_LANGUAGES:
             self.combo_lang.addItem(label, code)
         idx = self.combo_lang.findData(self.target_lang)
         if idx >= 0:
             self.combo_lang.setCurrentIndex(idx)
         self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
+        self.combo_lang.setMinimumWidth(164)
         bar.addWidget(self.combo_lang)
 
         self.btn_copy = QPushButton("复制译文图")
-        self.btn_copy.setObjectName("transSecondary")
+        self.btn_copy.setObjectName("codexSecondaryBtn")
         self.btn_copy.setCursor(Qt.PointingHandCursor)
         self.btn_copy.clicked.connect(self._copy_image)
         bar.addWidget(self.btn_copy)
 
         self.btn_save = QPushButton("保存译文图")
-        self.btn_save.setObjectName("transSecondary")
+        self.btn_save.setObjectName("codexSecondaryBtn")
         self.btn_save.setCursor(Qt.PointingHandCursor)
         self.btn_save.clicked.connect(self._save_image)
         bar.addWidget(self.btn_save)
 
         btn_close = QPushButton("关闭")
-        btn_close.setObjectName("transPrimary")
+        btn_close.setObjectName("codexPrimaryBtn")
         btn_close.setCursor(Qt.PointingHandCursor)
         btn_close.clicked.connect(self.close)
         bar.addWidget(btn_close)
-        main.addLayout(bar)
+        main.addWidget(top_bar)
 
         self.content = QWidget()
+        self.content.setObjectName("transBody")
         content_layout = QHBoxLayout(self.content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(18, 16, 18, 16)
+        content_layout.setSpacing(14)
 
         self.lbl_original = None
         self.lbl_translated = None
@@ -2842,80 +3619,60 @@ class TranslationResultWindow(QDialog):
 
     def _make_card(self, title_text):
         card = QFrame()
-        card.setObjectName("transCard")
+        card.setObjectName("codexCard")
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(10, 8, 10, 10)
-        lay.setSpacing(6)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        head = QWidget()
+        head.setObjectName("transCardHead")
+        head_lay = QHBoxLayout(head)
+        head_lay.setContentsMargins(14, 9, 14, 9)
         title = QLabel(title_text)
         title.setObjectName("transCardTitle")
-        lay.addWidget(title)
+        head_lay.addWidget(title)
+        head_lay.addStretch()
+        lay.addWidget(head)
+
+        stage = QWidget()
+        stage.setObjectName("transStageWrap")
+        stage_lay = QVBoxLayout(stage)
+        stage_lay.setContentsMargins(10, 10, 10, 10)
         label = QLabel()
+        label.setObjectName("transStage")
         label.setAlignment(Qt.AlignCenter)
         label.setMinimumSize(240, 180)
         label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        label.setStyleSheet("background: #FFFFFF;")
-        lay.addWidget(label, 1)
+        stage_lay.addWidget(label, 1)
+        lay.addWidget(stage, 1)
         return card, label
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QDialog#transResultDialog {
-                background-color: #F6F8FA;
-                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
-                font-size: 13px;
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QWidget#transBody {
+                background-color: #FCFCFD;
             }
-            QLabel#transTitle {
-                font-size: 16px;
-                font-weight: 700;
-                color: #0F172A;
-            }
-            QLabel#transStatus {
-                font-size: 12px;
-                font-weight: 600;
-                color: #0969DA;
-                padding: 0 6px;
+            QWidget#transCardHead {
+                background-color: #FAFAFA;
+                border-bottom: 1px solid #F1F1F5;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
             }
             QLabel#transCardTitle {
-                font-size: 13px;
+                font-size: 12.5px;
                 font-weight: 600;
-                color: #334155;
-                padding: 2px 4px;
+                color: #0D0D0D;
+                background: transparent;
             }
-            QFrame#transCard {
-                background: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 10px;
+            QWidget#transStageWrap {
+                background-color: #FFFFFF;
+                border-bottom-left-radius: 10px;
+                border-bottom-right-radius: 10px;
             }
-            QComboBox {
-                background: #FFFFFF;
-                color: #0F172A;
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-                padding: 5px 10px;
-                min-width: 110px;
-            }
-            QPushButton#transSecondary {
-                background: #FFFFFF;
-                color: #334155;
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-                padding: 7px 14px;
-                font-weight: 500;
-            }
-            QPushButton#transSecondary:hover {
-                background: #F1F5F9;
-                border-color: #94A3B8;
-            }
-            QPushButton#transPrimary {
-                background: #0969DA;
-                color: #FFFFFF;
-                border: 1px solid #085CC0;
-                border-radius: 6px;
-                padding: 7px 18px;
-                font-weight: 600;
-            }
-            QPushButton#transPrimary:hover {
-                background: #085CC0;
+            QLabel#transStage {
+                background-color: #F4F4F5;
+                border: 1px solid #ECECEF;
+                border-radius: 7px;
             }
         """)
 
@@ -2930,10 +3687,10 @@ class TranslationResultWindow(QDialog):
     def _update_display(self):
         if self.content is None or self.lbl_translated is None:
             return
-        avail_w = max(120, self.content.width() - 12)
-        avail_h = max(100, self.content.height() - 40)
+        avail_w = max(120, self.content.width() - 80)
+        avail_h = max(100, self.content.height() - 100)
         if self.mode == "compare":
-            col_w = max(120, (avail_w - 12) // 2)
+            col_w = max(120, (avail_w - 14) // 2)
             common_h = min(avail_h, max(self._original_pm.height(), self._translated_pm.height()))
             self._set_scaled_height(self.lbl_original, self._original_pm, col_w, common_h)
             self._set_scaled_height(self.lbl_translated, self._translated_pm, col_w, common_h)
@@ -2962,8 +3719,7 @@ class TranslationResultWindow(QDialog):
             return
         self.translations = ["" for _ in self.blocks]
         self._translated_pm = QPixmap(self._original_pm)
-        self.lbl_status.setText("正在翻译…")
-        self.lbl_status.setStyleSheet("color: #0969DA;")
+        self._set_status("正在翻译…", "info")
         self.btn_copy.setEnabled(False)
         self.btn_save.setEnabled(False)
         self._update_display()
@@ -3016,14 +3772,11 @@ class TranslationResultWindow(QDialog):
         self._translated_pm = render_translated_pixmap(self._original_pm, self.blocks, self.translations)
         self._update_display()
         if not self.translations:
-            self.lbl_status.setText("未识别到可翻译文字")
-            self.lbl_status.setStyleSheet("color: #CF222E;")
+            self._set_status("未识别到可翻译文字", "err")
         elif not ok:
-            self.lbl_status.setText("⚠ 部分内容翻译失败，已保留原文")
-            self.lbl_status.setStyleSheet("color: #9A6700;")
+            self._set_status("部分内容翻译失败，已保留原文", "warn")
         else:
-            self.lbl_status.setText("✓ 翻译完成")
-            self.lbl_status.setStyleSheet("color: #1A7F37;")
+            self._set_status("翻译完成", "ok")
         self.btn_copy.setEnabled(True)
         self.btn_save.setEnabled(True)
 
@@ -3040,8 +3793,7 @@ class TranslationResultWindow(QDialog):
         if self._translated_pm is None or self._translated_pm.isNull():
             return
         QApplication.clipboard().setPixmap(self._translated_pm)
-        self.lbl_status.setText("✓ 译文图已复制")
-        self.lbl_status.setStyleSheet("color: #1A7F37;")
+        self._set_status("译文图已复制", "ok")
 
     def _save_image(self):
         if self._translated_pm is None or self._translated_pm.isNull():
@@ -3104,53 +3856,77 @@ class TranslationOverlay(QWidget):
     def _build_bar(self):
         self.bar = QWidget(self)
         self.bar.setObjectName("transOverlayBar")
-        self.bar.setStyleSheet("""
-            QWidget#transOverlayBar {
+        self.bar.setStyleSheet(f"""
+            QWidget#transOverlayBar {{
                 background: #FFFFFF;
-                border: 1px solid #DCDCDC;
-                border-radius: 7px;
-            }
-            QLabel#transStatus {
-                color: #0969da;
+                border: 1px solid #E4E4E7;
+                border-radius: 8px;
+                font-family: {CODEX_FONT_FAMILY};
+            }}
+            QLabel#transStatus {{
+                color: #7A5110;
                 font-size: 12px;
                 font-weight: 600;
                 padding: 0 6px;
-            }
-            QComboBox {
+            }}
+            QComboBox {{
                 background: #FFFFFF;
-                color: #0f172a;
-                border: 1px solid #CBD5E1;
-                border-radius: 5px;
-                padding: 3px 8px;
+                color: #18181B;
+                border: 1px solid #E4E4E7;
+                border-radius: 6px;
+                padding: 3px 22px 3px 8px;
                 font-size: 12px;
-                min-width: 86px;
-            }
-            QPushButton {
+                min-width: 88px;
+            }}
+            QComboBox:hover {{
+                border-color: #D4D4D8;
+                background: #FAFAFA;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
                 background: transparent;
-                color: #334155;
+            }}
+            QComboBox::down-arrow {{
+                width: 0px;
+                height: 0px;
+                border: none;
+            }}
+            QComboBox QAbstractItemView {{
+                background: #FFFFFF;
+                color: #0D0D0D;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                selection-background-color: #F4F4F5;
+                selection-color: #0D0D0D;
+            }}
+            QPushButton {{
+                background: transparent;
+                color: #3F3F46;
                 border: 1px solid transparent;
-                border-radius: 5px;
-                padding: 4px 8px;
+                border-radius: 6px;
+                padding: 4px 9px;
                 font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #F1F5F9;
-                border-color: #CBD5E1;
-            }
-            QPushButton#transClose {
-                color: #64748B;
+                font-weight: 400;
+            }}
+            QPushButton:hover {{
+                background: #F4F4F5;
+                color: #0D0D0D;
+            }}
+            QPushButton#transClose {{
+                color: #71717A;
                 font-weight: 600;
-            }
+            }}
         """)
         lay = QHBoxLayout(self.bar)
-        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setContentsMargins(8, 5, 8, 5)
         lay.setSpacing(6)
 
         self.lbl_status = QLabel("正在翻译…")
         self.lbl_status.setObjectName("transStatus")
         lay.addWidget(self.lbl_status)
 
-        self.combo_lang = QComboBox()
+        self.combo_lang = CodexComboBox()
         for code, label in SUPPORTED_LANGUAGES:
             self.combo_lang.addItem(label, code)
         idx = self.combo_lang.findData(self.target_lang)
@@ -3160,15 +3936,18 @@ class TranslationOverlay(QWidget):
         lay.addWidget(self.combo_lang)
 
         self.btn_toggle = QPushButton("显示原文")
+        self.btn_toggle.setCursor(Qt.PointingHandCursor)
         self.btn_toggle.clicked.connect(self._toggle_view)
         lay.addWidget(self.btn_toggle)
 
         self.btn_copy = QPushButton("复制译文")
+        self.btn_copy.setCursor(Qt.PointingHandCursor)
         self.btn_copy.clicked.connect(self._copy_all)
         lay.addWidget(self.btn_copy)
 
         btn_close = QPushButton("✕")
         btn_close.setObjectName("transClose")
+        btn_close.setCursor(Qt.PointingHandCursor)
         btn_close.setFixedWidth(26)
         btn_close.clicked.connect(self.close_overlay)
         lay.addWidget(btn_close)
@@ -3341,8 +4120,7 @@ class TranslationOverlay(QWidget):
         chosen_font = None
         chosen_rect = None
         for size in range(base_size, 7, -1):
-            font = QFont("Microsoft YaHei UI")
-            font.setPixelSize(size)
+            font = make_ui_font(pixel_size=size)
             fm = QFontMetrics(font)
             bound = fm.boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, text)
             if bound.height() <= max(rect.height(), int(rect.height() * 2.2)) and bound.width() <= max_w + 2:
@@ -3350,8 +4128,7 @@ class TranslationOverlay(QWidget):
                 chosen_rect = bound
                 break
         if chosen_font is None:
-            chosen_font = QFont("Microsoft YaHei UI")
-            chosen_font.setPixelSize(8)
+            chosen_font = make_ui_font(pixel_size=8)
             fm = QFontMetrics(chosen_font)
             chosen_rect = fm.boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, text)
 
@@ -3717,7 +4494,7 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 painter.drawEllipse(pos, radius, radius)
                 text_color = Qt.white if edit['color'].lightness() < 165 else Qt.black
                 painter.setPen(QPen(text_color))
-                f = QFont("Microsoft YaHei UI", max(8, int(radius * 0.95)), QFont.Bold)
+                f = make_ui_font(max(8, int(radius * 0.95)), QFont.DemiBold)
                 painter.setFont(f)
                 text_rect = QRect(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
                 painter.drawText(text_rect, Qt.AlignCenter, num_str)
@@ -4138,12 +4915,13 @@ def send_mouse_wheel(delta):
         logging.warning("自动滚动事件发送失败", exc_info=True)
 
 
-TOOLBAR_STYLE = """
-QWidget#mainToolbar, QWidget#editorToolbar, QWidget#cropToolbar {
+TOOLBAR_STYLE = f"""
+QWidget#mainToolbar, QWidget#editorToolbar, QWidget#cropToolbar {{
     background-color: #ffffff;
     border: 1px solid #d0d7de;
     border-radius: 10px;
-}
+    font-family: {CODEX_FONT_FAMILY};
+}}
 """
 
 BUTTON_STYLE = """
@@ -4153,18 +4931,18 @@ QPushButton {
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 5px 9px;
-    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
     font-size: 12px;
-    font-weight: 500;
+    font-weight: 400;
 }
 QPushButton:hover {
-    background: #f3f4f6;
-    border: 1px solid #d0d7de;
-    color: #0969da;
+    background: #f5f3ef;
+    border: 1px solid #d6d0c4;
+    color: #7A5110;
 }
 QPushButton:pressed {
-    background: #e5e7eb;
-    border: 1px solid #afb8c1;
+    background: #eae6de;
+    border: 1px solid #b8b0a0;
 }
 QPushButton:disabled {
     color: #8c959f;
@@ -4175,20 +4953,20 @@ QPushButton:disabled {
 
 ACTIVE_BUTTON_STYLE = """
 QPushButton {
-    background-color: #0969da;
-    color: #ffffff;
-    border: 1px solid #085cc0;
+    background-color: #1D1D1F;
+    color: #FFFFFF;
+    border: 1px solid #1D1D1F;
     border-radius: 6px;
     padding: 5px 9px;
-    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
     font-size: 12px;
     font-weight: 600;
 }
 QPushButton:hover {
-    background-color: #085cc0;
+    background-color: #2C2C2E;
 }
 QPushButton:pressed {
-    background-color: #074da3;
+    background-color: #000000;
 }
 """
 
@@ -4199,9 +4977,9 @@ QPushButton {
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 5px 9px;
-    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
     font-size: 12px;
-    font-weight: 500;
+    font-weight: 400;
 }
 QPushButton:hover {
     background: #ffebe9;
@@ -4225,13 +5003,11 @@ def add_drop_shadow(widget, blur=18, y_offset=4, alpha=40):
         pass
 
 def ensure_high_dpi_and_fonts():
-    """注入全局现代系统字体族与 ClearType 亚像素抗锯齿微调"""
+    """探测系统可用现代字体并注册全局回退链，开启 FreeType 无边缘彩边平滑渲染"""
     app = QApplication.instance()
     if app:
-        font = QFont("Microsoft YaHei UI", 9)
-        font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
-        font.setHintingPreference(QFont.PreferFullHinting)
-        app.setFont(font)
+        _configure_ui_font_system()
+        app.setFont(make_ui_font(9, QFont.Normal))
 
 def apply_button_style(button, active=False, danger=False):
     if danger:
@@ -4245,10 +5021,10 @@ def apply_button_style(button, active=False, danger=False):
 # CUSTOM DIALOGS & WIDGETS
 # ==========================================
 class VectorIconFactory:
-    """纯矢量 QPainter 绘制 Snipaste 风格 27x27 线框图标，保证任意高分屏 DPI 下极致细腻锐利"""
+    """纯矢量 QPainter 绘制 Apple SF Symbols 质感 27x27 线框图标，保证任意高分屏 DPI 下极致细腻锐利"""
 
     @staticmethod
-    def create_pixmap(name, color=QColor("#2F2F2F"), size=44, stroke=2.8):
+    def create_pixmap(name, color=QColor("#1D1D1F"), size=44, stroke=2.15):
         pm = QPixmap(size, size)
         pm.fill(Qt.transparent)
         p = QPainter(pm)
@@ -4260,28 +5036,34 @@ class VectorIconFactory:
         p.setBrush(Qt.NoBrush)
 
         if name == 'rect_ellipse':
-            p.drawRoundedRect(QRectF(3.5, 3.5, 12.5, 12.5), 2.5, 2.5)
-            p.drawEllipse(QRectF(11.0, 11.0, 12.5, 12.5))
+            p.drawRoundedRect(QRectF(3.5, 4.0, 12.2, 12.2), 2.8, 2.8)
+            p.drawEllipse(QRectF(11.2, 11.2, 12.2, 12.2))
+        elif name == 'rect':
+            p.drawRoundedRect(QRectF(4.2, 5.5, 18.6, 16.0), 3.0, 3.0)
+        elif name == 'ellipse':
+            p.drawEllipse(QRectF(4.2, 5.5, 18.6, 16.0))
+        elif name == 'line':
+            p.drawLine(QPointF(5.5, 21.5), QPointF(21.5, 5.5))
         elif name == 'arrow':
             path = QPainterPath()
-            path.moveTo(5.0, 21.5)
-            path.quadTo(12.0, 18.0, 21.0, 6.0)
+            path.moveTo(5.0, 21.2)
+            path.quadTo(11.8, 17.8, 21.0, 6.2)
             p.drawPath(path)
             head = QPainterPath()
-            head.moveTo(12.5, 6.0)
-            head.lineTo(21.0, 6.0)
-            head.lineTo(21.0, 14.5)
+            head.moveTo(13.2, 6.0)
+            head.lineTo(21.2, 6.0)
+            head.lineTo(21.2, 14.0)
             p.drawPath(head)
         elif name == 'pen':
             p.save()
             p.translate(13.5, 13.5)
             p.rotate(-45)
             p.translate(-13.5, -13.5)
-            p.drawRect(QRectF(10.5, 6.0, 6.0, 11.0))
+            p.drawRoundedRect(QRectF(10.8, 5.2, 5.4, 11.6), 1.4, 1.4)
             nib = QPainterPath()
-            nib.moveTo(10.5, 17.0)
-            nib.lineTo(13.5, 22.5)
-            nib.lineTo(16.5, 17.0)
+            nib.moveTo(10.8, 16.8)
+            nib.lineTo(13.5, 22.4)
+            nib.lineTo(16.2, 16.8)
             p.drawPath(nib)
             p.restore()
         elif name == 'marker':
@@ -4289,157 +5071,178 @@ class VectorIconFactory:
             p.translate(13.5, 13.5)
             p.rotate(-45)
             p.translate(-13.5, -13.5)
-            p.drawRoundedRect(QRectF(9.5, 5.0, 8.0, 10.0), 1.5, 1.5)
+            p.drawRoundedRect(QRectF(9.6, 4.8, 7.8, 10.4), 1.8, 1.8)
             chisel = QPainterPath()
-            chisel.moveTo(10.5, 15.0)
-            chisel.lineTo(11.0, 21.0)
-            chisel.lineTo(16.0, 18.0)
-            chisel.lineTo(16.5, 15.0)
+            chisel.moveTo(10.6, 15.2)
+            chisel.lineTo(11.2, 21.2)
+            chisel.lineTo(15.8, 18.6)
+            chisel.lineTo(16.4, 15.2)
             p.drawPath(chisel)
             p.restore()
         elif name == 'mosaic_blur':
-            p.drawRect(QRectF(4.0, 4.0, 19.0, 19.0))
-            p.fillRect(QRectF(4.0, 4.0, 9.5, 9.5), color)
-            p.fillRect(QRectF(13.5, 13.5, 9.5, 9.5), color)
+            outer = QRectF(4.2, 4.2, 18.6, 18.6)
+            p.save()
+            clip_p = QPainterPath()
+            clip_p.addRoundedRect(outer, 3.0, 3.0)
+            p.setClipPath(clip_p)
+            p.fillRect(QRectF(4.2, 4.2, 9.3, 9.3), color)
+            p.fillRect(QRectF(13.5, 13.5, 9.3, 9.3), color)
+            p.restore()
+            p.drawRoundedRect(outer, 3.0, 3.0)
         elif name == 'text':
-            p.drawLine(QPointF(4.5, 6.0), QPointF(22.5, 6.0))
-            p.drawLine(QPointF(4.5, 6.0), QPointF(4.5, 9.0))
-            p.drawLine(QPointF(22.5, 6.0), QPointF(22.5, 9.0))
+            p.drawLine(QPointF(5.0, 6.0), QPointF(22.0, 6.0))
+            p.drawLine(QPointF(5.0, 6.0), QPointF(5.0, 8.8))
+            p.drawLine(QPointF(22.0, 6.0), QPointF(22.0, 8.8))
             p.drawLine(QPointF(13.5, 6.0), QPointF(13.5, 21.0))
-            p.drawLine(QPointF(9.5, 21.0), QPointF(17.5, 21.0))
+            p.drawLine(QPointF(9.8, 21.0), QPointF(17.2, 21.0))
         elif name == 'eraser':
             p.save()
             p.translate(13.5, 13.5)
             p.rotate(-40)
             p.translate(-13.5, -13.5)
-            p.drawRoundedRect(QRectF(8.0, 5.0, 11.0, 17.0), 2.5, 2.5)
-            p.drawLine(QPointF(8.0, 14.0), QPointF(19.0, 14.0))
+            p.drawRoundedRect(QRectF(8.2, 5.0, 10.6, 16.8), 2.8, 2.8)
+            p.drawLine(QPointF(8.2, 13.8), QPointF(18.8, 13.8))
             p.restore()
         elif name == 'undo':
             path = QPainterPath()
-            path.arcMoveTo(QRectF(6.0, 6.0, 15.0, 15.0), 220)
-            path.arcTo(QRectF(6.0, 6.0, 15.0, 15.0), 220, -210)
+            path.arcMoveTo(QRectF(6.2, 6.2, 14.8, 14.8), 215)
+            path.arcTo(QRectF(6.2, 6.2, 14.8, 14.8), 215, -210)
             p.drawPath(path)
             head = QPainterPath()
-            head.moveTo(7.0, 10.0)
-            head.lineTo(6.0, 16.5)
+            head.moveTo(7.2, 10.2)
+            head.lineTo(6.2, 16.5)
             head.lineTo(12.5, 17.0)
             p.drawPath(head)
         elif name == 'redo':
             path = QPainterPath()
-            path.arcMoveTo(QRectF(6.0, 6.0, 15.0, 15.0), -40)
-            path.arcTo(QRectF(6.0, 6.0, 15.0, 15.0), -40, 210)
+            path.arcMoveTo(QRectF(6.0, 6.2, 14.8, 14.8), -35)
+            path.arcTo(QRectF(6.0, 6.2, 14.8, 14.8), -35, 210)
             p.drawPath(path)
             head = QPainterPath()
-            head.moveTo(20.0, 10.0)
-            head.lineTo(21.0, 16.5)
+            head.moveTo(19.8, 10.2)
+            head.lineTo(20.8, 16.5)
             head.lineTo(14.5, 17.0)
             p.drawPath(head)
         elif name == 'close':
-            p.drawLine(QPointF(7.0, 7.0), QPointF(20.0, 20.0))
-            p.drawLine(QPointF(20.0, 7.0), QPointF(7.0, 20.0))
+            p.drawLine(QPointF(7.5, 7.5), QPointF(19.5, 19.5))
+            p.drawLine(QPointF(19.5, 7.5), QPointF(7.5, 19.5))
         elif name == 'pin':
             p.save()
             p.translate(13.5, 13.5)
             p.rotate(-45)
             p.translate(-13.5, -13.5)
-            p.drawRoundedRect(QRectF(9.0, 4.0, 9.0, 4.0), 1.0, 1.0)
-            p.drawRoundedRect(QRectF(11.0, 8.0, 5.0, 8.0), 1.0, 1.0)
-            p.drawLine(QPointF(7.0, 16.0), QPointF(20.0, 16.0))
-            p.drawLine(QPointF(13.5, 16.0), QPointF(13.5, 23.0))
+            p.drawRoundedRect(QRectF(9.4, 4.4, 8.2, 3.6), 1.4, 1.4)
+            p.drawRoundedRect(QRectF(11.2, 8.0, 4.6, 7.6), 1.0, 1.0)
+            p.drawLine(QPointF(7.5, 15.8), QPointF(19.5, 15.8))
+            p.drawLine(QPointF(13.5, 15.8), QPointF(13.5, 22.8))
             p.restore()
         elif name == 'save':
             body = QPainterPath()
-            body.moveTo(4.5, 4.5)
+            body.moveTo(6.0, 4.5)
             body.lineTo(18.5, 4.5)
             body.lineTo(22.5, 8.5)
-            body.lineTo(22.5, 22.5)
-            body.lineTo(4.5, 22.5)
-            body.closeSubpath()
+            body.lineTo(22.5, 20.5)
+            body.quadTo(22.5, 22.5, 20.5, 22.5)
+            body.lineTo(6.5, 22.5)
+            body.quadTo(4.5, 22.5, 4.5, 20.5)
+            body.lineTo(4.5, 6.5)
+            body.quadTo(4.5, 4.5, 6.5, 4.5)
             p.drawPath(body)
-            p.drawRect(QRectF(8.0, 4.5, 8.0, 6.5))
-            p.drawRect(QRectF(7.0, 14.5, 13.0, 8.0))
+            p.drawRoundedRect(QRectF(8.2, 4.5, 7.6, 5.8), 1.0, 1.0)
+            p.drawRoundedRect(QRectF(7.5, 14.5, 12.0, 8.0), 1.6, 1.6)
         elif name == 'copy':
-            p.drawRoundedRect(QRectF(9.0, 4.5, 13.5, 13.5), 2.5, 2.5)
-            p.fillRect(QRectF(4.5, 9.0, 13.5, 13.5), QBrush(Qt.white))
-            p.drawRoundedRect(QRectF(4.5, 9.0, 13.5, 13.5), 2.5, 2.5)
+            # SF Symbols doc.on.doc 风格：无实心白块遮挡，通透玻璃上完美融合
+            back = QPainterPath()
+            back.moveTo(9.0, 9.0)
+            back.lineTo(9.0, 6.8)
+            back.quadTo(9.0, 4.5, 11.3, 4.5)
+            back.lineTo(20.2, 4.5)
+            back.quadTo(22.5, 4.5, 22.5, 6.8)
+            back.lineTo(22.5, 15.7)
+            back.quadTo(22.5, 18.0, 20.2, 18.0)
+            back.lineTo(18.0, 18.0)
+            p.drawPath(back)
+            p.drawRoundedRect(QRectF(4.5, 9.0, 13.5, 13.5), 2.8, 2.8)
         elif name == 'crop':
-            p.drawLine(QPointF(5.0, 9.0), QPointF(20.5, 9.0))
-            p.drawLine(QPointF(9.0, 5.0), QPointF(9.0, 20.5))
-            p.drawLine(QPointF(6.5, 18.0), QPointF(22.0, 18.0))
-            p.drawLine(QPointF(18.0, 6.5), QPointF(18.0, 22.0))
+            p.drawLine(QPointF(5.0, 8.8), QPointF(18.2, 8.8))
+            p.drawLine(QPointF(18.2, 8.8), QPointF(18.2, 22.0))
+            p.drawLine(QPointF(8.8, 5.0), QPointF(8.8, 18.2))
+            p.drawLine(QPointF(8.8, 18.2), QPointF(22.0, 18.2))
         elif name == 'ocr':
-            p.drawLine(QPointF(4.5, 9.0), QPointF(4.5, 4.5))
-            p.drawLine(QPointF(4.5, 4.5), QPointF(9.0, 4.5))
-            p.drawLine(QPointF(18.0, 4.5), QPointF(22.5, 4.5))
-            p.drawLine(QPointF(22.5, 4.5), QPointF(22.5, 9.0))
-            p.drawLine(QPointF(4.5, 18.0), QPointF(4.5, 22.5))
-            p.drawLine(QPointF(4.5, 22.5), QPointF(9.0, 22.5))
-            p.drawLine(QPointF(18.0, 22.5), QPointF(22.5, 22.5))
-            p.drawLine(QPointF(22.5, 22.5), QPointF(22.5, 18.0))
+            # Viewfinder 圆角取景角标 + 'A' 识图符
+            tl = QPainterPath()
+            tl.moveTo(4.5, 9.2); tl.lineTo(4.5, 6.8); tl.quadTo(4.5, 4.5, 6.8, 4.5); tl.lineTo(9.2, 4.5)
+            p.drawPath(tl)
+            tr = QPainterPath()
+            tr.moveTo(17.8, 4.5); tr.lineTo(20.2, 4.5); tr.quadTo(22.5, 4.5, 22.5, 6.8); tr.lineTo(22.5, 9.2)
+            p.drawPath(tr)
+            bl = QPainterPath()
+            bl.moveTo(4.5, 17.8); bl.lineTo(4.5, 20.2); bl.quadTo(4.5, 22.5, 6.8, 22.5); bl.lineTo(9.2, 22.5)
+            p.drawPath(bl)
+            br = QPainterPath()
+            br.moveTo(17.8, 22.5); br.lineTo(20.2, 22.5); br.quadTo(22.5, 22.5, 22.5, 20.2); br.lineTo(22.5, 17.8)
+            p.drawPath(br)
             a_path = QPainterPath()
-            a_path.moveTo(8.5, 19.0)
-            a_path.lineTo(13.5, 8.0)
-            a_path.lineTo(18.5, 19.0)
+            a_path.moveTo(8.8, 18.6)
+            a_path.lineTo(13.5, 8.4)
+            a_path.lineTo(18.2, 18.6)
             p.drawPath(a_path)
-            p.drawLine(QPointF(10.2, 15.5), QPointF(16.8, 15.5))
+            p.drawLine(QPointF(10.4, 15.2), QPointF(16.6, 15.2))
         elif name == 'text_pick':
-            # I 形文字光标 + 右侧文本行
-            p.drawLine(QPointF(6.5, 5.0), QPointF(10.5, 5.0))
-            p.drawLine(QPointF(8.5, 5.0), QPointF(8.5, 22.0))
-            p.drawLine(QPointF(6.5, 22.0), QPointF(10.5, 22.0))
-            p.drawLine(QPointF(14.0, 8.0), QPointF(22.0, 8.0))
-            p.drawLine(QPointF(14.0, 13.5), QPointF(22.0, 13.5))
-            p.drawLine(QPointF(14.0, 19.0), QPointF(19.5, 19.0))
+            p.drawLine(QPointF(6.5, 5.2), QPointF(10.5, 5.2))
+            p.drawLine(QPointF(8.5, 5.2), QPointF(8.5, 21.8))
+            p.drawLine(QPointF(6.5, 21.8), QPointF(10.5, 21.8))
+            p.drawLine(QPointF(14.0, 8.2), QPointF(21.8, 8.2))
+            p.drawLine(QPointF(14.0, 13.5), QPointF(21.8, 13.5))
+            p.drawLine(QPointF(14.0, 18.8), QPointF(19.2, 18.8))
         elif name == 'translate':
-            # 原文卡片 -> 译文卡片
-            p.drawRoundedRect(QRectF(3.5, 6.0, 9.0, 11.0), 1.5, 1.5)
-            p.drawRoundedRect(QRectF(14.5, 10.0, 9.0, 11.0), 1.5, 1.5)
-            p.drawLine(QPointF(6.0, 9.5), QPointF(10.0, 9.5))
-            p.drawLine(QPointF(6.0, 12.5), QPointF(10.0, 12.5))
-            p.drawLine(QPointF(17.0, 13.5), QPointF(21.0, 13.5))
-            p.drawLine(QPointF(17.0, 16.5), QPointF(21.0, 16.5))
+            p.drawRoundedRect(QRectF(3.6, 6.0, 9.0, 10.8), 2.0, 2.0)
+            p.drawRoundedRect(QRectF(14.4, 10.2, 9.0, 10.8), 2.0, 2.0)
+            p.drawLine(QPointF(6.0, 9.5), QPointF(10.2, 9.5))
+            p.drawLine(QPointF(6.0, 12.5), QPointF(10.2, 12.5))
+            p.drawLine(QPointF(16.8, 13.8), QPointF(21.0, 13.8))
+            p.drawLine(QPointF(16.8, 16.8), QPointF(21.0, 16.8))
             arrow = QPainterPath()
-            arrow.moveTo(12.0, 7.5)
-            arrow.lineTo(15.0, 10.5)
-            arrow.lineTo(12.0, 13.5)
+            arrow.moveTo(12.2, 7.2)
+            arrow.lineTo(15.0, 10.0)
+            arrow.lineTo(12.2, 12.8)
             p.drawPath(arrow)
         elif name == 'scroll':
-            p.drawRoundedRect(QRectF(5.0, 4.0, 17.0, 19.0), 2.5, 2.5)
-            p.drawLine(QPointF(13.5, 8.0), QPointF(13.5, 18.0))
+            p.drawRoundedRect(QRectF(5.0, 4.2, 17.0, 18.6), 3.0, 3.0)
+            p.drawLine(QPointF(13.5, 8.2), QPointF(13.5, 18.0))
             arrow = QPainterPath()
-            arrow.moveTo(9.5, 14.5)
-            arrow.lineTo(13.5, 18.5)
-            arrow.lineTo(17.5, 14.5)
+            arrow.moveTo(9.8, 14.5)
+            arrow.lineTo(13.5, 18.4)
+            arrow.lineTo(17.2, 14.5)
             p.drawPath(arrow)
         elif name == 'record':
-            p.drawRoundedRect(QRectF(4.0, 6.5, 12.0, 14.0), 2.0, 2.0)
+            p.drawRoundedRect(QRectF(4.0, 6.5, 12.0, 14.0), 2.6, 2.6)
             lens = QPainterPath()
-            lens.moveTo(16.0, 10.5)
-            lens.lineTo(22.5, 7.0)
-            lens.lineTo(22.5, 20.0)
-            lens.lineTo(16.0, 16.5)
+            lens.moveTo(16.0, 10.6)
+            lens.lineTo(22.4, 7.2)
+            lens.lineTo(22.4, 19.8)
+            lens.lineTo(16.0, 16.4)
             lens.closeSubpath()
             p.drawPath(lens)
             p.setBrush(QBrush(color))
-            p.drawEllipse(QRectF(8.5, 12.0, 3.0, 3.0))
+            p.drawEllipse(QRectF(8.6, 12.1, 2.8, 2.8))
             p.setBrush(Qt.NoBrush)
         elif name == 'history':
             p.drawEllipse(QRectF(4.5, 4.5, 18.0, 18.0))
-            p.drawLine(QPointF(13.5, 13.5), QPointF(13.5, 8.5))
-            p.drawLine(QPointF(13.5, 13.5), QPointF(17.5, 13.5))
+            p.drawLine(QPointF(13.5, 13.5), QPointF(13.5, 8.2))
+            p.drawLine(QPointF(13.5, 13.5), QPointF(17.4, 15.2))
         elif name == 'window_pin':
-            p.drawRoundedRect(QRectF(4.0, 5.0, 19.0, 17.0), 2.0, 2.0)
-            p.drawLine(QPointF(4.0, 9.5), QPointF(23.0, 9.5))
+            p.drawRoundedRect(QRectF(4.0, 5.0, 19.0, 17.0), 2.6, 2.6)
+            p.drawLine(QPointF(4.0, 9.6), QPointF(23.0, 9.6))
             p.setBrush(QBrush(color))
-            p.drawEllipse(QRectF(6.5, 6.8, 1.5, 1.5))
-            p.drawEllipse(QRectF(9.5, 6.8, 1.5, 1.5))
+            p.drawEllipse(QRectF(6.5, 6.8, 1.4, 1.4))
+            p.drawEllipse(QRectF(9.5, 6.8, 1.4, 1.4))
             p.setBrush(Qt.NoBrush)
-            p.drawLine(QPointF(13.5, 19.5), QPointF(13.5, 12.0))
+            p.drawLine(QPointF(13.5, 19.5), QPointF(13.5, 12.2))
             arr = QPainterPath()
-            arr.moveTo(10.0, 15.0)
-            arr.lineTo(13.5, 11.5)
-            arr.lineTo(17.0, 15.0)
+            arr.moveTo(10.2, 15.2)
+            arr.lineTo(13.5, 11.8)
+            arr.lineTo(16.8, 15.2)
             p.drawPath(arr)
 
         p.end()
@@ -4448,9 +5251,9 @@ class VectorIconFactory:
     @staticmethod
     def get_icon(name):
         icon = QIcon()
-        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#2F2F2F")), QIcon.Normal, QIcon.Off)
-        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#B0B0B0")), QIcon.Disabled, QIcon.Off)
-        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#2563EB")), QIcon.Normal, QIcon.On)
+        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#1D1D1F")), QIcon.Normal, QIcon.Off)
+        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#78787D")), QIcon.Disabled, QIcon.Off)
+        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#9E6B1E")), QIcon.Normal, QIcon.On)
         return icon
 
 
@@ -4462,21 +5265,23 @@ class SegmentedButton(QPushButton):
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet("""
             QPushButton {
-                background: #F6F8FA;
-                color: #24292F;
-                border: 1px solid #D0D7DE;
-                border-radius: 4px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.78), stop:1 rgba(248, 245, 239, 0.62));
+                color: #1D1D1F;
+                border: 1px solid rgba(142, 142, 147, 0.45);
+                border-radius: 5px;
                 padding: 1px 6px;
-                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
                 font-size: 11px;
             }
             QPushButton:hover {
-                background: #ECECEC;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.96), stop:1 rgba(250, 244, 232, 0.88));
+                border: 1.2px solid rgba(182, 134, 58, 0.82);
+                color: #7A5110;
             }
             QPushButton:checked {
-                background: #D7E5FB;
-                color: #0969DA;
-                border: 1px solid #3B82F6;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(250, 241, 222, 0.95), stop:1 rgba(240, 224, 190, 0.88));
+                color: #7A5110;
+                border: 1.5px solid #B6863A;
                 font-weight: 600;
             }
         """)
@@ -4528,7 +5333,7 @@ class ColorPaletteWidget(QWidget):
             }
             QPushButton:hover {
                 background: #ECECEC;
-                border-color: #3B82F6;
+                border-color: #B6863A;
             }
         """)
         self.btn_custom.clicked.connect(self._pick_custom)
@@ -4551,7 +5356,7 @@ class ColorPaletteWidget(QWidget):
         cur_hex = self.current_color.name().upper()
         for btn, hex_col in self.buttons:
             is_active = (cur_hex == hex_col.upper())
-            border = "border: 2px solid #3B82F6;" if is_active else ("border: 1px solid #DCDCDC;" if hex_col.upper() == "#FFFFFF" else "border: 1px solid transparent;")
+            border = "border: 2px solid #1D1D1F;" if is_active else ("border: 1px solid #DCDCDC;" if hex_col.upper() == "#FFFFFF" else "border: 1px solid transparent;")
             btn.setStyleSheet(f"""
                 QPushButton {{
                     background-color: {hex_col};
@@ -4559,39 +5364,39 @@ class ColorPaletteWidget(QWidget):
                     {border}
                 }}
                 QPushButton:hover {{
-                    border: 2px solid #3B82F6;
+                    border: 2px solid #B6863A;
                 }}
             """)
 
 
-class SnipasteToolbar(QWidget):
+class SnipasteToolbar(FrostedBarWidget):
     tool_triggered = pyqtSignal(str)   # 'RECT_ELLIPSE', 'ARROW', 'PEN', 'MARKER', 'MOSAIC_BLUR', 'TEXT', 'ERASER'
     action_triggered = pyqtSignal(str) # 'UNDO', 'REDO', 'CROP', 'OCR', 'TRANSLATE', 'SCROLL', 'RECORD', 'HISTORY', 'CLOSE', 'PIN', 'SAVE', 'COPY'
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("snipasteToolbar")
-        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("""
             QWidget#snipasteToolbar {
-                background: #FFFFFF;
-                border: 1px solid #DCDCDC;
-                border-radius: 7px;
+                background: transparent;
             }
             QPushButton {
                 background: transparent;
                 border: none;
-                border-radius: 5px;
+                border-radius: 6px;
                 padding: 0px;
             }
             QPushButton:hover {
-                background: #ECECEC;
+                background: rgba(255, 255, 255, 0.78);
+                border: 1px solid rgba(182, 134, 58, 0.55);
             }
             QPushButton:pressed {
-                background: #DEDEDE;
+                background: rgba(248, 238, 214, 0.90);
+                border: 1px solid rgba(182, 134, 58, 0.85);
             }
             QPushButton:checked {
-                background: #D7E5FB;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(250, 241, 222, 0.95), stop:1 rgba(240, 224, 190, 0.90));
+                border: 1.5px solid #B6863A;
             }
             QPushButton:disabled {
                 background: transparent;
@@ -4599,7 +5404,7 @@ class SnipasteToolbar(QWidget):
         """)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setContentsMargins(self.SHADOW_PAD + 6, self.SHADOW_PAD + 3, self.SHADOW_PAD + 6, self.SHADOW_PAD + 3)
         layout.setSpacing(2)
 
         self.tool_buttons = {}
@@ -4733,14 +5538,6 @@ class SnipasteToolbar(QWidget):
                 btn.setChecked(False)
         self.tool_triggered.emit(tool_name)
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.setPen(QPen(QColor("#DCDCDC"), 1))
-        painter.drawRoundedRect(rect, 7.0, 7.0)
-
     def _create_btn(self, icon_name, tooltip, checkable=False):
         btn = QPushButton()
         btn.setFixedSize(32, 32)
@@ -4755,7 +5552,7 @@ class SnipasteToolbar(QWidget):
     def _create_divider(self):
         sep = QFrame()
         sep.setFixedSize(1, 20)
-        sep.setStyleSheet("background: #D4D4D4; border: none; margin: 0 1px;")
+        sep.setStyleSheet("background: rgba(148, 163, 184, 0.35); border: none; margin: 0 1px;")
         return sep
 
     def set_active_tool(self, tool_name):
@@ -4767,46 +5564,53 @@ class SnipasteToolbar(QWidget):
         self.btn_redo.setEnabled(can_redo)
 
 
-class ToolOptionsBar(QWidget):
+class ToolOptionsBar(FrostedBarWidget):
     options_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("toolOptionsBar")
-        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("""
             QWidget#toolOptionsBar {
-                background: #FFFFFF;
-                border: 1px solid #DCDCDC;
-                border-radius: 7px;
+                background: transparent;
             }
             QLabel {
-                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
                 font-size: 11px;
-                color: #57606A;
+                font-weight: 400;
+                color: #1E293B;
+                background: transparent;
             }
             QSpinBox {
-                background: #FFFFFF;
-                color: #24292F;
-                border: 1px solid #D0D7DE;
-                border-radius: 4px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.90), stop:1 rgba(248, 245, 239, 0.75));
+                color: #1D1D1F;
+                border: 1px solid rgba(142, 142, 147, 0.45);
+                border-radius: 5px;
                 padding: 1px 3px;
                 font-size: 11px;
                 height: 20px;
             }
-            QComboBox {
+            QSpinBox:focus {
+                border: 1.5px solid #B6863A;
                 background: #FFFFFF;
-                color: #24292F;
-                border: 1px solid #D0D7DE;
-                border-radius: 4px;
+            }
+            QComboBox {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.90), stop:1 rgba(248, 245, 239, 0.75));
+                color: #1D1D1F;
+                border: 1px solid rgba(142, 142, 147, 0.45);
+                border-radius: 5px;
                 padding: 1px 5px;
                 font-size: 11px;
                 height: 20px;
             }
+            QComboBox:focus {
+                border: 1.5px solid #B6863A;
+                background: #FFFFFF;
+            }
         """)
 
         self.main_layout = QHBoxLayout(self)
-        self.main_layout.setContentsMargins(6, 3, 6, 3)
+        self.main_layout.setContentsMargins(self.SHADOW_PAD + 6, self.SHADOW_PAD + 3, self.SHADOW_PAD + 6, self.SHADOW_PAD + 3)
         self.main_layout.setSpacing(5)
 
         self.stack = QStackedWidget(self)
@@ -4823,18 +5627,10 @@ class ToolOptionsBar(QWidget):
 
         self.current_tool_name = None
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.setPen(QPen(QColor("#DCDCDC"), 1))
-        painter.drawRoundedRect(rect, 7.0, 7.0)
-
     def _add_divider(self, layout):
         sep = QFrame()
         sep.setFixedSize(1, 16)
-        sep.setStyleSheet("background: #E1E4E8; border: none; margin: 0 2px;")
+        sep.setStyleSheet("background: rgba(148, 163, 184, 0.35); border: none; margin: 0 2px;")
         layout.addWidget(sep)
 
     # 1. 矩形 / 椭圆面板
@@ -5295,7 +6091,7 @@ class InlineTextEditor(QWidget):
             self.text_edit.setStyleSheet(
                 f"background: rgba(255, 255, 255, 0.94); "
                 f"color: {self.current_color.name()}; "
-                f"border: 1.5px dashed #3B82F6; "
+                f"border: 1.5px dashed #B6863A; "
                 f"border-radius: 4px; "
                 f"padding: 2px;"
             )
@@ -5367,6 +6163,57 @@ class InlineTextEditor(QWidget):
 
 
 
+class _ClickThroughUnlockHandle(QWidget):
+    """鼠标穿透模式下悬浮在贴图左上角的小型可点击解锁胶囊（仅该胶囊拦截鼠标，图片其余区域 100% 穿透）"""
+    def __init__(self, pin_win):
+        super().__init__(None)
+        self._pin_win = pin_win
+        self._hovered = False
+        self.setWindowFlags(
+            Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setToolTip("点击退出鼠标穿透模式（或按全局快捷键 Ctrl+Alt+T）")
+        self.resize(96, 24)
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.LeftButton, Qt.RightButton):
+            event.accept()
+            if self._pin_win is not None:
+                self._pin_win.set_click_through(False)
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 7, 7)
+        bg = QColor(138, 94, 28, 242) if self._hovered else QColor(168, 118, 40, 232)
+        painter.fillPath(path, QBrush(bg))
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1.0))
+        painter.drawPath(path)
+        painter.setFont(make_ui_font(8, QFont.Bold))
+        painter.setPen(QColor(255, 255, 255))
+        label = "🔓 取消穿透" if self._hovered else "👻 穿透中 ×"
+        painter.drawText(r, Qt.AlignCenter, label)
+
+
 class PinnedWindow(QWidget):
     def __init__(self, pixmap, main_app_ref=None, initial_pos=None, zoom_factor=1.0):
         super().__init__()
@@ -5401,7 +6248,24 @@ class PinnedWindow(QWidget):
         target_h = min(MAX_PIN_DIM, max(20, int(self.pixmap.height() * self.zoom_factor)))
         self.resize(target_w, target_h)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
         self.drag_position = QPoint()
+        self._press_global_pos = QPoint()
+        self._left_dragging = False
+        self._file_drag_armed = False
+        self._suppress_next_context_menu = False
+        self._expand_btn_pressed = False
+        self._hover_expand_btn = False
+        self._opacity = 1.0
+        self._click_through = False
+        self._ct_handle = None
+        self._is_collapsed = False
+        self._expanded_size = None
+        self._expanded_zoom = self.zoom_factor
+        self._hud_text = ""
+        self._hud_timer = QTimer(self)
+        self._hud_timer.setSingleShot(True)
+        self._hud_timer.timeout.connect(self._clear_hud)
 
         if initial_pos is not None:
             x = initial_pos.x()
@@ -5423,14 +6287,199 @@ class PinnedWindow(QWidget):
         self.move(x, y)
         self.show()
 
+    def _clear_hud(self):
+        self._hud_text = ""
+        self.update()
+
+    def _show_hud(self, text, ms=900):
+        self._hud_text = str(text or "")
+        if self._hud_text:
+            self._hud_timer.start(ms)
+        else:
+            self._hud_timer.stop()
+        self.update()
+
+    def _sync_click_through_handle(self):
+        handle = getattr(self, "_ct_handle", None)
+        should_show = (
+            bool(getattr(self, "_click_through", False))
+            and self.isVisible()
+            and not getattr(self, "_is_mini_for_drawer", False)
+        )
+        if not should_show:
+            if handle is not None:
+                try:
+                    handle.hide()
+                except Exception:
+                    pass
+            return
+        if handle is None:
+            handle = _ClickThroughUnlockHandle(self)
+            self._ct_handle = handle
+        if self.height() >= 36 and self.width() >= 106:
+            hx, hy = self.x() + 6, self.y() + 6
+        else:
+            hx, hy = self.x(), max(0, self.y() - handle.height() - 4)
+        handle.move(hx, hy)
+        if not handle.isVisible():
+            handle.show()
+        handle.raise_()
+
+    def _collapsed_expand_rect(self):
+        return QRect(max(36, self.width() - 50), 6, 42, max(16, self.height() - 12))
+
+    def set_click_through(self, enabled: bool):
+        """开启/关闭鼠标穿透模式（点击穿过贴图直达底层窗口），可点击左上角解锁胶囊、按 Ctrl+Alt+T 或托盘菜单随时恢复"""
+        self._click_through = bool(enabled)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, self._click_through)
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if self._click_through:
+                ex |= WS_EX_TRANSPARENT
+            else:
+                ex &= ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+            )
+        except Exception as e:
+            logging.warning("切换鼠标穿透状态失败: %s", e)
+        self.show()
+        self.update()
+        self._sync_click_through_handle()
+        if self._click_through:
+            try:
+                self._ct_toast = PinToast("👻 已开启鼠标穿透 · 点击左上角「穿透中 ×」或按 Ctrl+Alt+T 解除", pinned=True)
+                self._ct_toast.show()
+            except Exception:
+                pass
+        else:
+            if getattr(self, "_ct_handle", None) is not None:
+                try:
+                    self._ct_handle.close()
+                except Exception:
+                    pass
+                self._ct_handle = None
+            self._show_hud("已恢复鼠标交互")
+
+    def toggle_collapse(self):
+        """将桌面贴图折叠为紧凑迷你标签条或还原展开"""
+        if not self._is_collapsed:
+            self._expanded_size = self.size()
+            self._expanded_zoom = getattr(self, "zoom_factor", 1.0)
+            self._is_collapsed = True
+            self._hover_expand_btn = False
+            self.resize(176, 36)
+        else:
+            self._is_collapsed = False
+            self._hover_expand_btn = False
+            self.setCursor(Qt.ArrowCursor)
+            self.zoom_factor = self._expanded_zoom or getattr(self, "zoom_factor", 1.0)
+            if self._expanded_size is not None and self._expanded_size.isValid():
+                self.resize(self._expanded_size)
+            else:
+                self.resize(max(20, int(self.pixmap.width() * self.zoom_factor)),
+                            max(20, int(self.pixmap.height() * self.zoom_factor)))
+        self.update()
+        self._sync_click_through_handle()
+
+    def reset_transform(self):
+        """恢复贴图 1:1 原始大小与 100% 不透明度"""
+        self._is_collapsed = False
+        self._expanded_size = None
+        self.zoom_factor = 1.0
+        self._opacity = 1.0
+        self.setWindowOpacity(1.0)
+        if self.pixmap and not self.pixmap.isNull():
+            self.resize(max(20, self.pixmap.width()), max(20, self.pixmap.height()))
+        self._show_hud("1:1 原始大小")
+
+    def copy_as_file(self):
+        if copy_pixmap_as_clipboard_file(self.pixmap):
+            self._show_hud("📄 已复制为 PNG 文件")
+
+    def save_as(self):
+        if not self.pixmap or self.pixmap.isNull():
+            return
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "另存贴图", f"pin_{time.strftime('%Y%m%d_%H%M%S')}.png",
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;WebP (*.webp);;BMP (*.bmp)"
+        )
+        if fn:
+            self.pixmap.save(fn)
+            self._show_hud("已保存文件")
+
+    def silent_ocr_copy(self):
+        """静默识别贴图文字（若无文字则尝试识别二维码/条码）并直接复制进剪贴板，不打断操作"""
+        try:
+            QToolTip.showText(QCursor.pos(), "⚡ 正在静默识别文字...", None, QRect(), 2500)
+            ocr_img = self.pixmap.toImage()
+            worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
+
+            def _on_done(text):
+                QToolTip.hideText()
+                codes = getattr(worker, "detected_codes", [])
+                clean = (text or "").strip()
+                if clean:
+                    QApplication.clipboard().setText(clean)
+                    self._show_hud(f"⚡ 已复制 {len(clean)} 字")
+                elif codes:
+                    first_code = codes[0]["text"]
+                    QApplication.clipboard().setText(first_code)
+                    self._show_hud(f"🔲 已复制 {codes[0]['type']}")
+                else:
+                    self._show_hud("未识别到文字或条码")
+
+            worker.finished.connect(_on_done)
+            worker.start()
+            self._silent_ocr_worker = worker
+        except Exception as e:
+            logging.warning("静默识别异常: %s", e)
+
+    def scan_codes(self):
+        """专门扫描贴图中的二维码与一维条码"""
+        codes = detect_codes_in_image(self.pixmap)
+        if not codes:
+            QMessageBox.information(None, "二维码 / 条码识别", "未在当前贴图中检测到可解码的二维码或条形码。")
+            return
+        QApplication.clipboard().setText(codes[0]["text"])
+        dlg = OcrResultDialog("", None, detected_codes=codes)
+        dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self._temp_ocr_dialog = dlg
+        dlg.exec_()
+
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if getattr(self, '_is_collapsed', False):
+                self.toggle_collapse()
+                event.accept()
+                return
+            if event.modifiers() & Qt.AltModifier:
+                self.toggle_collapse()
+                event.accept()
+                return
             self.close()
             event.accept()
         else:
             super().mouseDoubleClickEvent(event)
 
     def closeEvent(self, event):
+        if getattr(self, "_ct_handle", None) is not None:
+            try:
+                self._ct_handle.close()
+            except Exception:
+                pass
+            self._ct_handle = None
         if getattr(self, '_dropped_to_drawer', False):
             if self.main_app_ref is not None and self in self.main_app_ref.pinned_windows:
                 self.main_app_ref.pinned_windows.remove(self)
@@ -5443,12 +6492,33 @@ class PinnedWindow(QWidget):
                 logging.error("关闭贴图并同步历史失败: %s", e, exc_info=True)
         super().closeEvent(event)
 
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._sync_click_through_handle()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_click_through_handle()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_click_through_handle()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._sync_click_through_handle()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        # 拖向储藏柜时自动呈现 macOS 冰晶毛玻璃圆角迷你卡片（四周 100% 透明无直角边）
+        # 拖向储藏柜时自动呈现 macOS 冰晶毛玻璃圆角迷你卡片（四周 100% 透明无直角边，绝无任何溢出）
         if getattr(self, '_is_mini_for_drawer', False):
+            painter.save()
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.fillRect(self.rect(), Qt.transparent)
+            painter.restore()
+
             for i, alpha in enumerate([6, 12, 20]):
                 sr = QRectF(self.rect()).adjusted(2 + i, 2 + i, -2 - i, -2 - i)
                 sp = QPainterPath()
@@ -5458,14 +6528,15 @@ class PinnedWindow(QWidget):
             r = QRectF(self.rect()).adjusted(5, 5, -5, -5)
             path = QPainterPath()
             path.addRoundedRect(r, 12, 12)
-            painter.fillPath(path, QBrush(QColor(250, 252, 255, 235)))
-            painter.setPen(QPen(QColor(56, 189, 248, 230), 2.0))
+            painter.fillPath(path, QBrush(QColor(250, 248, 243, 242)))
+            painter.setPen(QPen(QColor(182, 134, 58, 230), 2.0))
             painter.drawPath(path)
 
-            scaled = self.pixmap.scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            card_inner = r.adjusted(6, 6, -6, -6)
+            scaled = self.pixmap.scaled(int(card_inner.width()), int(card_inner.height()), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             tw, th = scaled.width(), scaled.height()
-            tx = r.x() + (r.width() - tw) / 2.0
-            ty = r.y() + (r.height() - th) / 2.0
+            tx = card_inner.x() + (card_inner.width() - tw) / 2.0
+            ty = card_inner.y() + (card_inner.height() - th) / 2.0
             img_rect = QRectF(tx, ty, tw, th)
 
             painter.save()
@@ -5475,13 +6546,102 @@ class PinnedWindow(QWidget):
             painter.drawPixmap(int(tx), int(ty), scaled)
             painter.restore()
 
-            painter.setPen(QPen(QColor(15, 23, 42, 30), 1.0))
+            painter.setPen(QPen(QColor(15, 23, 42, 35), 1.0))
             painter.drawRoundedRect(img_rect, 6, 6)
+        elif getattr(self, '_is_collapsed', False):
+            painter.save()
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.fillRect(self.rect(), Qt.transparent)
+            painter.restore()
+
+            pill = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+            p_path = QPainterPath()
+            p_path.addRoundedRect(pill, 10, 10)
+            painter.fillPath(p_path, QBrush(QColor(255, 255, 255, 242)))
+            painter.setPen(QPen(QColor(24, 24, 27, 45), 1.2))
+            painter.drawPath(p_path)
+
+            thumb = self.pixmap.scaled(22, 22, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            tx = pill.left() + 7 + (22 - thumb.width()) / 2.0
+            ty = pill.top() + (pill.height() - thumb.height()) / 2.0
+            painter.drawPixmap(int(tx), int(ty), thumb)
+
+            painter.setFont(make_ui_font(9, QFont.DemiBold))
+            painter.setPen(QColor(24, 24, 27))
+            res_txt = f"{self.pixmap.width()}×{self.pixmap.height()}"
+            painter.drawText(QRectF(pill.left() + 34, pill.top(), pill.width() - 86, pill.height()),
+                             Qt.AlignLeft | Qt.AlignVCenter, res_txt)
+
+            exp_rect = QRectF(self._collapsed_expand_rect())
+            is_hover = bool(getattr(self, "_hover_expand_btn", False))
+            is_pressed = bool(getattr(self, "_expand_btn_pressed", False))
+            exp_path = QPainterPath()
+            exp_path.addRoundedRect(exp_rect, 6, 6)
+            if is_pressed:
+                exp_fill = QColor(182, 134, 58, 62)
+                exp_border = QColor(182, 134, 58, 165)
+                exp_fg = QColor(122, 81, 16)
+            elif is_hover:
+                exp_fill = QColor(182, 134, 58, 36)
+                exp_border = QColor(182, 134, 58, 125)
+                exp_fg = QColor(122, 81, 16)
+            else:
+                exp_fill = QColor(244, 244, 245, 230)
+                exp_border = QColor(212, 212, 216, 200)
+                exp_fg = QColor(63, 63, 70)
+            painter.fillPath(exp_path, QBrush(exp_fill))
+            painter.setPen(QPen(exp_border, 1.0))
+            painter.drawPath(exp_path)
+            painter.setFont(make_ui_font(8, QFont.DemiBold))
+            painter.setPen(exp_fg)
+            painter.drawText(exp_rect, Qt.AlignCenter, "展开")
         else:
             painter.drawPixmap(self.rect(), self.pixmap)
+            if getattr(self, '_click_through', False):
+                painter.setPen(QPen(QColor(182, 134, 58, 215), 1.6, Qt.DashLine))
+                painter.drawRect(QRectF(self.rect()).adjusted(1, 1, -1, -1))
+                handle = getattr(self, '_ct_handle', None)
+                if not (handle is not None and handle.isVisible()):
+                    badge_r = QRectF(6, 6, 46, 20)
+                    bp = QPainterPath()
+                    bp.addRoundedRect(badge_r, 5, 5)
+                    painter.fillPath(bp, QBrush(QColor(168, 118, 40, 224)))
+                    painter.setFont(make_ui_font(8, QFont.Bold))
+                    painter.setPen(QColor(255, 255, 255))
+                    painter.drawText(badge_r, Qt.AlignCenter, "穿透中")
+
+            hud = getattr(self, '_hud_text', '')
+            if hud and self.width() >= 90 and self.height() >= 34:
+                painter.setFont(make_ui_font(9, QFont.DemiBold))
+                fm = painter.fontMetrics()
+                bw = min(self.width() - 16, fm.horizontalAdvance(hud) + 18)
+                bh = 24
+                bx = (self.width() - bw) / 2.0
+                hud_r = QRectF(bx, 8, bw, bh)
+                hp = QPainterPath()
+                hp.addRoundedRect(hud_r, 7, 7)
+                painter.fillPath(hp, QBrush(QColor(15, 23, 42, 208)))
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(hud_r, Qt.AlignCenter, hud)
 
     def wheelEvent(self, event: QWheelEvent):
         if getattr(self, '_is_mini_for_drawer', False):
+            event.accept()
+            return
+        if event.modifiers() & Qt.ControlModifier:
+            delta_y = event.angleDelta().y()
+            cur_op = getattr(self, '_opacity', 1.0)
+            step = 0.05 if cur_op < 0.45 else 0.10
+            if delta_y > 0:
+                new_op = min(1.0, cur_op + step)
+            else:
+                new_op = max(0.15, cur_op - step)
+            self._opacity = round(new_op, 2)
+            self.setWindowOpacity(self._opacity)
+            self._show_hud(f"透明度 {int(round(self._opacity * 100))}%")
+            event.accept()
+            return
+        if getattr(self, '_is_collapsed', False):
             event.accept()
             return
         step = 0.05 if self.zoom_factor < 0.5 else 0.1
@@ -5500,25 +6660,78 @@ class PinnedWindow(QWidget):
         self.zoom_factor = round(new_zoom, 3)
         if self.width() != target_w or self.height() != target_h:
             self.resize(target_w, target_h)
+        self._show_hud(f"{int(round(self.zoom_factor * 100))}%")
         self.update()
         event.accept()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.setFocus()
+            self._press_global_pos = event.globalPos()
+            if getattr(self, '_is_collapsed', False) and self._collapsed_expand_rect().contains(event.pos()):
+                self._expand_btn_pressed = True
+                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+                self._normal_size = self.size()
+                self._normal_zoom = getattr(self, 'zoom_factor', 1.0)
+                self._is_mini_for_drawer = False
+                self._left_dragging = False
+                self._file_drag_armed = False
+                self._suppress_next_context_menu = False
+                self.update()
+                event.accept()
+                return
+            self._expand_btn_pressed = False
             self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
             self._normal_size = self.size()
             self._normal_zoom = getattr(self, 'zoom_factor', 1.0)
             self._is_mini_for_drawer = False
+            self._left_dragging = True
+            self._file_drag_armed = False
+            self._suppress_next_context_menu = False
+        elif event.button() == Qt.RightButton:
+            if self._left_dragging and (event.buttons() & Qt.LeftButton):
+                self._file_drag_armed = True
+                self._suppress_next_context_menu = True
+                self.update()
+                event.accept()
+                return
+            self._suppress_next_context_menu = False
+
+    def leaveEvent(self, event):
+        if getattr(self, '_hover_expand_btn', False):
+            self._hover_expand_btn = False
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+        super().leaveEvent(event)
 
     def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.NoButton:
+            if getattr(self, '_is_collapsed', False):
+                hovered = self._collapsed_expand_rect().contains(event.pos())
+                if hovered != getattr(self, '_hover_expand_btn', False):
+                    self._hover_expand_btn = hovered
+                    self.setCursor(Qt.PointingHandCursor if hovered else Qt.ArrowCursor)
+                    self.update()
+            elif getattr(self, '_hover_expand_btn', False):
+                self._hover_expand_btn = False
+                self.setCursor(Qt.ArrowCursor)
+                self.update()
+            return
+
         if event.buttons() == Qt.LeftButton:
             gpos = event.globalPos()
+            if getattr(self, '_expand_btn_pressed', False):
+                if (gpos - getattr(self, '_press_global_pos', gpos)).manhattanLength() < QApplication.startDragDistance():
+                    return
+                self._expand_btn_pressed = False
+                self._left_dragging = True
+                self.update()
+
             is_near_drawer = False
+            drawer = None
             if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
                 drawer = self.main_app_ref.pin_drawer
                 is_near_drawer = drawer.check_proximity(gpos)
-                drawer.on_external_pin_drag(self, gpos)
 
             # 靠近或移入抽屉区域时：瞬间智能缩小为 100x100 迷你卡片，清晰看到插入位
             if is_near_drawer:
@@ -5539,9 +6752,41 @@ class PinnedWindow(QWidget):
                     self.update()
 
             self.move(gpos - self.drag_position)
+            if drawer is not None:
+                drawer.on_external_pin_drag(self, gpos)
+                if is_near_drawer:
+                    drawer._keep_dragged_windows_on_top(extra_win=self)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            if getattr(self, '_file_drag_armed', False):
+                self._file_drag_armed = False
+                self._suppress_next_context_menu = True
+                self.update()
+                if getattr(self, '_left_dragging', False) and (event.buttons() & Qt.LeftButton):
+                    QTimer.singleShot(0, self._trigger_os_file_drag)
+                event.accept()
+                return
+
         if event.button() == Qt.LeftButton:
+            if getattr(self, '_expand_btn_pressed', False):
+                self._expand_btn_pressed = False
+                self._left_dragging = False
+                self._file_drag_armed = False
+                gpos = event.globalPos()
+                dist = (gpos - getattr(self, '_press_global_pos', gpos)).manhattanLength()
+                if getattr(self, '_is_collapsed', False) and (
+                    self._collapsed_expand_rect().contains(event.pos())
+                    or dist < QApplication.startDragDistance()
+                ):
+                    self.toggle_collapse()
+                else:
+                    self.update()
+                event.accept()
+                return
+
+            self._left_dragging = False
+            self._file_drag_armed = False
             gpos = event.globalPos()
             handled = False
             if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
@@ -5560,18 +6805,133 @@ class PinnedWindow(QWidget):
                 self.update()
         super().mouseReleaseEvent(event)
 
+    def _trigger_os_file_drag(self):
+        """在左键拖拽过程中点击右键后，进入可右键往复切换的 PNG 文件 / 贴图拖拽"""
+        export_pix = getattr(self, 'original_pixmap', None)
+        if export_pix is None or (hasattr(export_pix, 'isNull') and export_pix.isNull()):
+            export_pix = getattr(self, 'pixmap', None)
+        if export_pix is None or (hasattr(export_pix, 'isNull') and export_pix.isNull()):
+            self._left_dragging = False
+            self._file_drag_armed = False
+            self._suppress_next_context_menu = False
+            return
+
+        had_mini = getattr(self, '_is_mini_for_drawer', False)
+        self._is_mini_for_drawer = False
+        self._left_dragging = False
+        self._file_drag_armed = False
+
+        if had_mini and hasattr(self, '_normal_size') and self._normal_size is not None:
+            self.zoom_factor = getattr(self, '_normal_zoom', getattr(self, 'zoom_factor', 1.0))
+            self.resize(self._normal_size)
+
+        saved_pos = self.pos()
+        if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
+            drawer = self.main_app_ref.pin_drawer
+            if getattr(drawer, '_is_expanded', False):
+                drawer.retract()
+
+        was_visible = self.isVisible()
+        if was_visible:
+            self.hide()
+            if getattr(self, '_ct_handle', None) is not None:
+                try:
+                    self._ct_handle.hide()
+                except Exception:
+                    pass
+            QApplication.processEvents()
+
+        outcome, drop_pos = "file", None
+        try:
+            outcome, _drag_res, drop_pos = run_toggleable_drag(
+                self,
+                export_pix,
+                start_mode="file",
+                copy_to_clipboard=True,
+                file_drag_fn=lambda w, p: start_pixmap_file_drag(w, p),
+            )
+        finally:
+            self._left_dragging = False
+            self._file_drag_armed = False
+            self._suppress_next_context_menu = False
+            if was_visible:
+                if outcome == "drop_pin" and drop_pos is not None:
+                    saved_pos = QPoint(
+                        max(0, drop_pos.x() - self.width() // 2),
+                        max(0, drop_pos.y() - self.height() // 2),
+                    )
+                self.move(saved_pos)
+                self.show()
+                self._sync_click_through_handle()
+                self.update()
+
     def contextMenuEvent(self, event):
+        if (
+            getattr(self, '_suppress_next_context_menu', False)
+            or getattr(self, '_file_drag_armed', False)
+            or getattr(self, '_left_dragging', False)
+        ):
+            self._suppress_next_context_menu = False
+            event.accept()
+            return
         menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 10px;
+                padding: 5px;
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                font-size: 12.5px;
+                color: #18181B;
+            }
+            QMenu::item {
+                padding: 6px 14px;
+                border-radius: 6px;
+            }
+            QMenu::item:selected {
+                background-color: #F4F4F5;
+                color: #09090B;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #ECECEF;
+                margin: 4px 8px;
+            }
+        """)
         drawer_action = menu.addAction("🗄️ 存入抽屉 (Drawer)")
-        ocr_action = menu.addAction("🔤 OCR & Translate (F2)")
-        edit_action = menu.addAction("🛠 Edit") 
-        close_action = menu.addAction("❌ Close")
+        silent_ocr_action = menu.addAction("⚡ 静默识别文字并复制")
+        ocr_action = menu.addAction("🔤 OCR 识别与翻译 (F2)")
+        qr_action = menu.addAction("🔲 识别二维码 / 条码")
+        edit_action = menu.addAction("🛠 编辑标注")
+        menu.addSeparator()
+        copy_img_action = menu.addAction("📋 复制图片 (Ctrl+C)")
+        copy_file_action = menu.addAction("📄 复制为 PNG 文件 (Ctrl+Shift+C)")
+        save_action = menu.addAction("💾 另存为... (Ctrl+S)")
+        reset_action = menu.addAction("⚖️ 1:1 原始大小与重置透明度 (1)")
+        collapse_label = "📌 展开贴图 (M)" if getattr(self, '_is_collapsed', False) else "📌 折叠为紧凑标签 (M)"
+        collapse_action = menu.addAction(collapse_label)
+        click_through_action = menu.addAction("👻 鼠标穿透 (Ctrl+Shift+T · Ctrl+Alt+T 恢复)")
+        menu.addSeparator()
+        drawer_all_action = close_all_action = None
+        if self.main_app_ref and hasattr(self.main_app_ref, "pin_all_to_drawer"):
+            drawer_all_action = menu.addAction("🗂️ 全部贴图存入抽屉")
+        if self.main_app_ref and hasattr(self.main_app_ref, "close_all_pins"):
+            close_all_action = menu.addAction("🧹 关闭全部贴图")
+        close_action = menu.addAction("❌ 关闭当前贴图 (Esc)")
+
         action = menu.exec_(self.mapToGlobal(event.pos()))
+        if action is None:
+            return
         if action == drawer_action:
             if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
                 self.main_app_ref.pin_drawer.add_pin_directly(self)
+        elif action == silent_ocr_action:
+            self.silent_ocr_copy()
         elif action == ocr_action:
             self.trigger_ocr()
+        elif action == qr_action:
+            self.scan_codes()
         elif action == edit_action and self.main_app_ref:
             pinned_before = set(self.main_app_ref.pinned_windows)
             editor = ImageEditorDialog(self.pixmap, self.main_app_ref)
@@ -5580,19 +6940,39 @@ class PinnedWindow(QWidget):
             # 如果用户只是按 ESC 或 Close 关闭编辑器，原贴图保留不动
             if any(p not in pinned_before for p in self.main_app_ref.pinned_windows):
                 self.close()
-        elif action == close_action: self.close()
+        elif action == copy_img_action:
+            QApplication.clipboard().setPixmap(self.pixmap)
+            self._show_hud("已复制图片")
+        elif action == copy_file_action:
+            self.copy_as_file()
+        elif action == save_action:
+            self.save_as()
+        elif action == reset_action:
+            self.reset_transform()
+        elif action == collapse_action:
+            self.toggle_collapse()
+        elif action == click_through_action:
+            self.set_click_through(True)
+        elif drawer_all_action is not None and action == drawer_all_action:
+            self.main_app_ref.pin_all_to_drawer()
+        elif close_all_action is not None and action == close_all_action:
+            self.main_app_ref.close_all_pins()
+        elif action == close_action:
+            self.close()
 
     def trigger_ocr(self):
         try:
-            QToolTip.showText(QCursor.pos(), "🔤 正在识别贴图文字...", None, QRect(), 2500)
+            QToolTip.showText(QCursor.pos(), "🔤 正在识别贴图文字与条码...", None, QRect(), 2500)
             ocr_img = self.pixmap.toImage()
             worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
             def _on_done(text):
                 QToolTip.hideText()
-                if not text or not text.strip():
-                    QMessageBox.information(None, "文字识别结果", "未能从贴图中识别到有效文字。")
+                codes = getattr(worker, "detected_codes", [])
+                doc = getattr(worker, "ocr_doc", None)
+                if (not text or not text.strip()) and not codes:
+                    QMessageBox.information(None, "文字识别结果", "未能从贴图中识别到有效文字或二维码。")
                     return
-                dlg = OcrResultDialog(text, None)
+                dlg = OcrResultDialog(text, None, detected_codes=codes, ocr_doc=doc)
                 dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
                 self._temp_ocr_dialog = dlg
                 dlg.exec_()
@@ -5603,12 +6983,26 @@ class PinnedWindow(QWidget):
             logging.error("贴图 OCR 触发异常: %s", e, exc_info=True)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape: self.close()
-        elif event.key() == Qt.Key_F2:
+        mods = event.modifiers()
+        key = event.key()
+        if key == Qt.Key_Escape:
+            self.close()
+        elif key == Qt.Key_F2:
             self.trigger_ocr()
-        elif event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_C:
+        elif key == Qt.Key_1 and not mods:
+            self.reset_transform()
+        elif key == Qt.Key_M and not mods:
+            self.toggle_collapse()
+        elif (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) and key == Qt.Key_C:
+            self.copy_as_file()
+        elif (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) and key == Qt.Key_T:
+            self.set_click_through(True)
+        elif (mods & Qt.ControlModifier) and key == Qt.Key_C:
             QApplication.clipboard().setPixmap(self.pixmap)
+            self._show_hud("已复制图片")
             print("Pinned image copied!")
+        elif (mods & Qt.ControlModifier) and key == Qt.Key_S:
+            self.save_as()
 
 class EditableImageLabel(QLabel):
     def __init__(self, pixmap, toolbar_ref):
@@ -5720,12 +7114,12 @@ class EditableImageLabel(QLabel):
                     painter.drawLine(self.crop_rect.left(), y, self.crop_rect.right(), y)
 
                 # 裁剪框边线
-                painter.setPen(QPen(QColor(0, 174, 255), 2))
+                painter.setPen(QPen(QColor(204, 153, 68), 2))
                 painter.drawRect(self.crop_rect)
 
                 # 8 个手柄
                 handle = CROP_HANDLE_SIZE
-                painter.setBrush(QBrush(QColor(0, 174, 255)))
+                painter.setBrush(QBrush(QColor(204, 153, 68)))
                 painter.setPen(QPen(Qt.white, 1))
                 corners = [self.crop_rect.topLeft(), self.crop_rect.topRight(),
                            self.crop_rect.bottomLeft(), self.crop_rect.bottomRight()]
@@ -6155,7 +7549,7 @@ class EditableImageLabel(QLabel):
             if hasattr(self.toolbar_ref, 'crop_toolbar') and self.toolbar_ref.crop_toolbar:
                 self.toolbar_ref.crop_toolbar.update_size(self.crop_rect.width(), self.crop_rect.height())
 
-class CropToolbar(QWidget):
+class CropToolbar(FrostedBarWidget):
     apply_clicked = pyqtSignal()
     cancel_clicked = pyqtSignal()
     ratio_changed = pyqtSignal(object)  # None or (w, h)
@@ -6165,24 +7559,24 @@ class CropToolbar(QWidget):
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setStyleSheet("""
             QWidget#cropToolbar {
-                background: #ffffff;
-                border: 1px solid #d0d7de;
-                border-radius: 10px;
+                background: transparent;
             }
         """)
         self.setObjectName("cropToolbar")
-        add_drop_shadow(self, blur=18, y_offset=4, alpha=40)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setContentsMargins(self.SHADOW_PAD + 8, self.SHADOW_PAD + 4, self.SHADOW_PAD + 8, self.SHADOW_PAD + 4)
         layout.setSpacing(4)
 
         self.size_label = QLabel("0 × 0", self)
-        self.size_label.setStyleSheet("color: #0969da; font-family: 'Consolas', 'Segoe UI'; font-size: 11px; font-weight: bold; padding: 0 4px; border: none; background: transparent;")
+        self.size_label.setStyleSheet(
+            f"color: #7A5110; font-family: {CODEX_MONO_FAMILY}; font-size: 11px; "
+            f"font-weight: 600; padding: 0 4px; border: none; background: transparent;"
+        )
         layout.addWidget(self.size_label)
 
         sep0 = QFrame()
         sep0.setFrameShape(QFrame.VLine)
-        sep0.setStyleSheet("color: #d0d7de;")
+        sep0.setStyleSheet("color: rgba(142, 142, 147, 0.38);")
         layout.addWidget(sep0)
 
         self.ratio_buttons = {}
@@ -6192,10 +7586,12 @@ class CropToolbar(QWidget):
             btn.setFixedHeight(26)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
-                "QPushButton { background: #f6f8fa; color: #24292f; border: 1px solid #d0d7de; "
-                "border-radius: 4px; padding: 2px 7px; font-size: 11px; }"
-                "QPushButton:hover { background: #ebf5ff; color: #0969da; border-color: #0969da; }"
-                "QPushButton:checked { background: #0969da; color: white; font-weight: 600; border-color: #0969da; }"
+                "QPushButton { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.78), stop:1 rgba(248, 245, 239, 0.62)); "
+                "color: #1D1D1F; border: 1px solid rgba(142, 142, 147, 0.45); border-radius: 5px; padding: 2px 7px; font-size: 11px; }"
+                "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.96), stop:1 rgba(250, 244, 232, 0.88)); "
+                "color: #7A5110; border: 1.2px solid rgba(182, 134, 58, 0.82); }"
+                "QPushButton:checked { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(250, 241, 222, 0.95), stop:1 rgba(240, 224, 190, 0.88)); "
+                "color: #7A5110; font-weight: 600; border: 1.5px solid #B6863A; }"
             )
             btn.clicked.connect(lambda checked, r=ratio: self._on_ratio_btn(r))
             layout.addWidget(btn)
@@ -6206,7 +7602,7 @@ class CropToolbar(QWidget):
 
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
-        sep.setStyleSheet("color: #d0d7de;")
+        sep.setStyleSheet("color: rgba(148, 163, 184, 0.4);")
         layout.addWidget(sep)
 
         apply_btn = QPushButton("✓ 确定", self)
@@ -6214,7 +7610,7 @@ class CropToolbar(QWidget):
         apply_btn.setCursor(Qt.PointingHandCursor)
         apply_btn.setStyleSheet(
             "QPushButton { background: #1f883d; color: white; border: none; "
-            "border-radius: 4px; font-weight: bold; font-size: 12px; padding: 2px 10px; }"
+            "border-radius: 5px; font-weight: 600; font-size: 12px; padding: 2px 10px; }"
             "QPushButton:hover { background: #1a7f37; }"
         )
         apply_btn.clicked.connect(self.apply_clicked.emit)
@@ -6224,9 +7620,9 @@ class CropToolbar(QWidget):
         cancel_btn.setFixedHeight(28)
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.setStyleSheet(
-            "QPushButton { background: #fff0ee; color: #cf222e; border: 1px solid #ffbebe; "
-            "border-radius: 4px; font-weight: 500; font-size: 12px; padding: 2px 8px; }"
-            "QPushButton:hover { background: #ffebe9; color: #a40e26; }"
+            "QPushButton { background: rgba(255, 240, 238, 0.85); color: #cf222e; border: 1px solid rgba(255, 190, 190, 0.85); "
+            "border-radius: 5px; font-weight: 400; font-size: 12px; padding: 2px 8px; }"
+            "QPushButton:hover { background: rgba(255, 235, 233, 0.95); color: #a40e26; }"
         )
         cancel_btn.clicked.connect(self.cancel_clicked.emit)
         layout.addWidget(cancel_btn)
@@ -6247,29 +7643,140 @@ class CropToolbar(QWidget):
 class ImageEditorDialog(QDialog):
     def __init__(self, image_data, main_app_ref=None):
         super().__init__()
-        self.setWindowTitle("Image Editor")
+        self.setWindowTitle("图片编辑与预览")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self.main_app_ref = main_app_ref
         
-        if isinstance(image_data, QPixmap): self.base_pixmap = image_data
-        else: 
+        if isinstance(image_data, QPixmap):
+            self.base_pixmap = image_data
+        else:
             rgb_image = cv2.cvtColor(image_data, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             self.base_pixmap = QPixmap.fromImage(QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888))
 
-        self.resize(min(1200, self.base_pixmap.width() + 40), min(800, self.base_pixmap.height() + 100))
+        self.resize(
+            max(980, min(1280, self.base_pixmap.width() + 72)),
+            max(580, min(880, self.base_pixmap.height() + 150)),
+        )
+        self.setMinimumSize(900, 480)
         self.current_tool = None
         self.current_step_num = 1
-        self.current_thickness = 3 
+        self.current_thickness = 3
         self.arrow_enabled = False
-        self.current_color = QColor(255, 0, 0)
-        
+        self.current_color = QColor("#EF4444")
+        self._ocr_busy = False
+
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QDialog {
+                background-color: #F4F4F5;
+            }
+            QWidget#editorToolbar {
+                background-color: #F7F7F8;
+                border-bottom: 1px solid #E4E4E7;
+            }
+            QWidget#editorStatusBar {
+                background-color: #F7F7F8;
+                border-top: 1px solid #E4E4E7;
+            }
+            QLabel#editorStatusHint {
+                color: #71717A;
+                font-size: 11.5px;
+                background: transparent;
+            }
+            QFrame#editorSep {
+                background-color: #E4E4E7;
+                max-width: 1px;
+                min-width: 1px;
+                border: none;
+                margin: 2px 3px;
+            }
+            QLabel#editorDimBadge {
+                background-color: #FFFFFF;
+                color: #52525B;
+                border: 1px solid #E4E4E7;
+                border-radius: 5px;
+                padding: 2px 8px;
+                font-family: """ + CODEX_MONO_FAMILY + """;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton#editorToolBtn {
+                background-color: #FFFFFF;
+                color: #27272A;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                padding: 4px 9px;
+                font-size: 12px;
+                font-weight: 400;
+                min-height: 20px;
+            }
+            QPushButton#editorToolBtn:hover {
+                background-color: #F4F4F5;
+                border-color: #D4D4D8;
+                color: #0D0D0D;
+            }
+            QPushButton#editorToolBtn:checked {
+                background-color: #0D0D0D;
+                color: #FFFFFF;
+                border-color: #0D0D0D;
+            }
+            QPushButton#editorToolBtn:checked:hover {
+                background-color: #27272A;
+                border-color: #27272A;
+            }
+            QWidget#editorToolbar QPushButton#codexPrimaryBtn,
+            QWidget#editorToolbar QPushButton#codexSecondaryBtn,
+            QWidget#editorToolbar QPushButton#codexGhostBtn {
+                padding: 4px 10px;
+                font-size: 12px;
+                min-height: 20px;
+            }
+            QPushButton#editorColorBtn {
+                background-color: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                padding: 0px;
+            }
+            QPushButton#editorColorBtn:hover {
+                background-color: #F4F4F5;
+                border-color: #D4D4D8;
+            }
+            QScrollArea#editorCanvasArea {
+                background-color: #F4F4F5;
+                border: none;
+            }
+        """)
+
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
         self.setup_toolbar(layout)
+
         self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("editorCanvasArea")
+        self.scroll_area.setWidgetResizable(False)
+        self.scroll_area.setAlignment(Qt.AlignCenter)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
         self.img_label = EditableImageLabel(self.base_pixmap, self)
         self.scroll_area.setWidget(self.img_label)
-        layout.addWidget(self.scroll_area)
+        layout.addWidget(self.scroll_area, 1)
+
+        # 底部状态栏（快捷提示 + 实时分辨率）
+        status_bar = QWidget()
+        status_bar.setObjectName("editorStatusBar")
+        sb_lay = QHBoxLayout(status_bar)
+        sb_lay.setContentsMargins(14, 6, 14, 6)
+        sb_lay.setSpacing(10)
+        hint_lbl = QLabel("Ctrl+C 复制并关闭   ·   Ctrl+Z / Ctrl+Y 撤销重做   ·   F2 文字识别   ·   Esc 退出")
+        hint_lbl.setObjectName("editorStatusHint")
+        sb_lay.addWidget(hint_lbl)
+        sb_lay.addStretch()
+        self.dim_badge = QLabel(f"{self.base_pixmap.width()} × {self.base_pixmap.height()} px")
+        self.dim_badge.setObjectName("editorDimBadge")
+        sb_lay.addWidget(self.dim_badge)
+        layout.addWidget(status_bar)
+
         # 初始化 Color 按钮显示当前颜色
         self._update_color_button()
 
@@ -6280,87 +7787,130 @@ class ImageEditorDialog(QDialog):
         self.crop_toolbar.ratio_changed.connect(self.img_label.set_crop_ratio)
         self.crop_toolbar.hide()
 
-    def keyPressEvent(self, event):
-        # 裁剪模式优先处理
-        if self.img_label.crop_mode:
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-                self.apply_crop()
-                return
-            elif event.key() == Qt.Key_Escape:
-                self.cancel_crop()
-                return
-        if event.modifiers() & Qt.ControlModifier:
-            if event.key() == Qt.Key_C:
-                self.copy_to_clipboard()
-            elif event.key() == Qt.Key_Z:
-                self.img_label.undo()
-            elif event.key() == Qt.Key_Y:
-                self.img_label.redo()
-        elif event.key() == Qt.Key_Escape:
-            # 关闭前先提交正在编辑的文本，避免内容丢失
-            self.img_label.commit_text_edit()
-            self.close()
-        elif event.key() == Qt.Key_F2:
-            self.set_tool('OCR', self.btn_ocr)
-            return
+    @staticmethod
+    def _make_editor_icon(name):
+        icon = QIcon()
+        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#27272A")), QIcon.Normal, QIcon.Off)
+        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#FFFFFF")), QIcon.Normal, QIcon.On)
+        icon.addPixmap(VectorIconFactory.create_pixmap(name, QColor("#A1A1AA")), QIcon.Disabled, QIcon.Off)
+        return icon
+
+    def _add_toolbar_sep(self, layout):
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setObjectName("editorSep")
+        sep.setFixedHeight(18)
+        layout.addWidget(sep)
 
     def setup_toolbar(self, parent_layout):
         self.toolbar = QWidget()
         self.toolbar.setObjectName("editorToolbar")
-        self.toolbar.setStyleSheet(TOOLBAR_STYLE)
         layout = QHBoxLayout(self.toolbar)
-        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
-        self.btn_rect = QPushButton("Rect")
-        self.btn_ellipse = QPushButton("Ellipse")
-        self.btn_line = QPushButton("Line")
-        self.btn_arrow = QPushButton("Arrow Off")
-        self.btn_pen = QPushButton("Pen")
-        self.btn_highlighter = QPushButton("Highlighter")
-        self.btn_step = QPushButton("Step")
-        self.btn_text = QPushButton("Text")
-        self.btn_blur = QPushButton("Blur")
-        self.btn_erase = QPushButton("Erase")
-        self.btn_color = QPushButton("Color")
-        self.btn_crop = QPushButton("Crop")
-        self.btn_ocr = QPushButton("OCR")
-        self.btn_history = QPushButton("History")
-        self.btn_settings = QPushButton("Settings")
-        self.btn_pin = QPushButton("Pin")
-        self.btn_copy = QPushButton("Copy")
-        self.btn_save = QPushButton("Save")
-        self.btn_close = QPushButton("Close")
-        
-        self.btn_rect.clicked.connect(lambda: self.set_tool('RECTANGLE', self.btn_rect))
-        self.btn_ellipse.clicked.connect(lambda: self.set_tool('ELLIPSE', self.btn_ellipse))
-        self.btn_line.clicked.connect(lambda: self.set_tool('LINE', self.btn_line))
-        self.btn_arrow.clicked.connect(self.toggle_arrow)
-        self.btn_pen.clicked.connect(lambda: self.set_tool('PEN', self.btn_pen))
-        self.btn_highlighter.clicked.connect(lambda: self.set_tool('HIGHLIGHTER', self.btn_highlighter))
-        self.btn_step.clicked.connect(lambda: self.set_tool('STEP', self.btn_step))
-        self.btn_text.clicked.connect(lambda: self.set_tool('TEXT', self.btn_text))
-        self.btn_blur.clicked.connect(lambda: self.set_tool('BLUR', self.btn_blur))
-        self.btn_erase.clicked.connect(lambda: self.set_tool('ERASE', self.btn_erase))
-        self.btn_color.clicked.connect(self.pick_drawing_color)
-        self.btn_crop.clicked.connect(lambda: self.set_tool('CROP', self.btn_crop))
-        self.btn_ocr.clicked.connect(lambda: self.set_tool('OCR', self.btn_ocr))
-        self.btn_history.clicked.connect(self.open_history)
-        self.btn_settings.clicked.connect(self.open_settings)
-        self.btn_pin.clicked.connect(self.pin_to_screen)
-        self.btn_copy.clicked.connect(self.copy_to_clipboard)
-        self.btn_save.clicked.connect(self.save_image)
-        self.btn_close.clicked.connect(self.close)
 
-        all_btns = [
-            self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_arrow, self.btn_pen,
-            self.btn_highlighter, self.btn_step, self.btn_text, self.btn_blur, self.btn_erase,
-            self.btn_color, self.btn_crop, self.btn_ocr, self.btn_history, self.btn_settings,
-            self.btn_pin, self.btn_copy, self.btn_save, self.btn_close
+        self.btn_rect = QPushButton()
+        self.btn_ellipse = QPushButton()
+        self.btn_line = QPushButton()
+        self.btn_arrow = QPushButton()
+        self.btn_pen = QPushButton()
+        self.btn_highlighter = QPushButton()
+        self.btn_step = QPushButton("1")
+        self.btn_text = QPushButton()
+        self.btn_blur = QPushButton()
+        self.btn_erase = QPushButton()
+        self.btn_color = QPushButton()
+        self.btn_crop = QPushButton("裁剪")
+        self.btn_ocr = QPushButton("识别")
+        self.btn_history = QPushButton("历史")
+        self.btn_settings = QPushButton("设置")
+        self.btn_pin = QPushButton("贴图")
+        self.btn_copy = QPushButton("复制")
+        self.btn_save = QPushButton("保存")
+        self.btn_close = QPushButton("关闭")
+
+        draw_Specs = [
+            (self.btn_rect, "rect", "矩形标注", lambda: self.set_tool('RECTANGLE', self.btn_rect)),
+            (self.btn_ellipse, "ellipse", "圆形/椭圆标注", lambda: self.set_tool('ELLIPSE', self.btn_ellipse)),
+            (self.btn_line, "line", "直线标注", lambda: self.set_tool('LINE', self.btn_line)),
+            (self.btn_arrow, "arrow", "箭头开关（开启后绘制箭头）", self.toggle_arrow),
+            (self.btn_pen, "pen", "画笔工具", lambda: self.set_tool('PEN', self.btn_pen)),
+            (self.btn_highlighter, "marker", "荧光笔", lambda: self.set_tool('HIGHLIGHTER', self.btn_highlighter)),
+            (self.btn_step, None, "序号标注", lambda: self.set_tool('STEP', self.btn_step)),
+            (self.btn_text, "text", "文字输入", lambda: self.set_tool('TEXT', self.btn_text)),
+            (self.btn_blur, "mosaic_blur", "马赛克/模糊", lambda: self.set_tool('BLUR', self.btn_blur)),
+            (self.btn_erase, "eraser", "橡皮擦", lambda: self.set_tool('ERASE', self.btn_erase)),
         ]
-        for btn in all_btns:
+
+        for btn, icon_name, tip, slot in draw_Specs:
+            btn.setObjectName("editorToolBtn")
+            btn.setCheckable(True)
+            btn.setFixedSize(28, 28)
+            btn.setToolTip(tip)
             btn.setCursor(Qt.PointingHandCursor)
-            apply_button_style(btn, danger=(btn is self.btn_close))
+            if icon_name:
+                btn.setIcon(self._make_editor_icon(icon_name))
+                btn.setIconSize(QSize(15, 15))
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton#editorToolBtn {{ font-family: {CODEX_MONO_FAMILY}; font-weight: 600; font-size: 13px; padding: 0; }}"
+                )
+            btn.clicked.connect(slot)
             layout.addWidget(btn)
+
+        self.btn_color.setObjectName("editorColorBtn")
+        self.btn_color.setFixedSize(28, 28)
+        self.btn_color.setToolTip("选择画笔颜色")
+        self.btn_color.setCursor(Qt.PointingHandCursor)
+        self.btn_color.clicked.connect(self.pick_drawing_color)
+        layout.addWidget(self.btn_color)
+
+        self._add_toolbar_sep(layout)
+
+        util_Specs = [
+            (self.btn_crop, "crop", True, "裁剪区域", lambda: self.set_tool('CROP', self.btn_crop)),
+            (self.btn_ocr, "ocr", True, "文字识别与翻译 (F2)", lambda: self.set_tool('OCR', self.btn_ocr)),
+            (self.btn_history, "history", False, "截图历史记录", self.open_history),
+            (self.btn_settings, None, False, "打开系统设置", self.open_settings),
+        ]
+        for btn, icon_name, checkable, tip, slot in util_Specs:
+            btn.setObjectName("editorToolBtn")
+            btn.setCheckable(checkable)
+            btn.setFixedHeight(28)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.PointingHandCursor)
+            if icon_name:
+                btn.setIcon(self._make_editor_icon(icon_name))
+                btn.setIconSize(QSize(13, 13))
+            else:
+                btn.setIcon(_create_codex_icon("general", "#27272A", 13))
+                btn.setIconSize(QSize(13, 13))
+            btn.clicked.connect(slot)
+            layout.addWidget(btn)
+
+        layout.addStretch()
+
+        self._add_toolbar_sep(layout)
+
+        for btn, icon_name, obj_name, tip, slot in [
+            (self.btn_pin, "pin", "codexSecondaryBtn", "固定到桌面贴图", self.pin_to_screen),
+            (self.btn_save, "save", "codexSecondaryBtn", "保存图片到本地", self.save_image),
+            (self.btn_copy, "copy", "codexPrimaryBtn", "复制到剪贴板 (Ctrl+C)", self.copy_to_clipboard),
+            (self.btn_close, None, "codexGhostBtn", "关闭窗口 (Esc)", self.close),
+        ]:
+            btn.setObjectName(obj_name)
+            btn.setFixedHeight(28)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.PointingHandCursor)
+            if icon_name:
+                c = "#FFFFFF" if obj_name == "codexPrimaryBtn" else "#27272A"
+                ico = QIcon()
+                ico.addPixmap(VectorIconFactory.create_pixmap(icon_name, QColor(c)), QIcon.Normal, QIcon.Off)
+                btn.setIcon(ico)
+                btn.setIconSize(QSize(13, 13))
+            btn.clicked.connect(slot)
+            layout.addWidget(btn)
+
         parent_layout.addWidget(self.toolbar)
 
     def open_history(self):
@@ -6374,33 +7924,48 @@ class ImageEditorDialog(QDialog):
 
     def toggle_arrow(self):
         self.arrow_enabled = not self.arrow_enabled
-        self.btn_arrow.setText("Arrow On" if self.arrow_enabled else "Arrow Off")
+        self.btn_arrow.setChecked(self.arrow_enabled)
+        self.btn_arrow.setToolTip("箭头已开启（点击关闭）" if self.arrow_enabled else "箭头开关（开启后绘制箭头）")
 
     def pick_drawing_color(self):
-        color = QColorDialog.getColor(self.current_color, self, "Pick Drawing Color")
+        color = QColorDialog.getColor(self.current_color, self, "选择画笔颜色")
         if color.isValid():
             self.current_color = color
             self._update_color_button()
 
     def _update_color_button(self):
-        self.btn_color.setStyleSheet(
-            f"background-color: {self.current_color.name()}; color: {'white' if self.current_color.lightness() < 128 else 'black'}; border: 2px solid #888; border-radius: 4px; padding: 4px 12px;"
-        )
-        self.btn_color.setText("Color")
+        dpr = 2
+        pm = QPixmap(18 * dpr, 18 * dpr)
+        pm.setDevicePixelRatio(float(dpr))
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#D4D4D8"), 1.0))
+        p.setBrush(self.current_color)
+        p.drawRoundedRect(QRectF(1.5, 1.5, 15.0, 15.0), 4.0, 4.0)
+        p.end()
+        self.btn_color.setIcon(QIcon(pm))
+        self.btn_color.setIconSize(QSize(18, 18))
+        self.btn_color.setText("")
 
     def process_ocr(self, pixmap):
-        self.btn_ocr.setText("OCR...")
+        self._ocr_busy = True
+        self.btn_ocr.setText("识别中…")
         ocr_img = pixmap.toImage()
         self.ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
         self.ocr_worker.finished.connect(self.show_ocr_result)
         self.ocr_worker.start()
 
     def show_ocr_result(self, text):
-        self.btn_ocr.setText("OCR")
-        if not text:
-            QMessageBox.information(self, "OCR 结果", "未能识别到文字，请重试。")
+        self._ocr_busy = False
+        self.btn_ocr.setText("识别")
+        self.btn_ocr.setChecked(False)
+        codes = getattr(self.ocr_worker, "detected_codes", []) if hasattr(self, "ocr_worker") and self.ocr_worker else []
+        doc = getattr(self.ocr_worker, "ocr_doc", None) if hasattr(self, "ocr_worker") and self.ocr_worker else None
+        if not text and not codes:
+            QMessageBox.information(self, "OCR 结果", "未能识别到文字或二维码，请重试。")
         else:
-            dlg = OcrResultDialog(text, self)
+            dlg = OcrResultDialog(text, self, detected_codes=codes, ocr_doc=doc)
             dlg.exec_()
 
     def set_tool(self, tool_name, active_btn=None):
@@ -6412,8 +7977,9 @@ class ImageEditorDialog(QDialog):
             self.cancel_crop()
 
         # 切换工具时重置 OCR 按钮文字
-        if self.btn_ocr.text() != "OCR":
-            self.btn_ocr.setText("OCR")
+        if self._ocr_busy or self.btn_ocr.text() != "识别":
+            self._ocr_busy = False
+            self.btn_ocr.setText("识别")
 
         tool_btns = [
             self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_pen,
@@ -6424,14 +7990,12 @@ class ImageEditorDialog(QDialog):
         if tool_name is None or self.current_tool == tool_name:
             self.current_tool = None
             for btn in tool_btns:
-                apply_button_style(btn)
+                btn.setChecked(False)
             return
 
         self.current_tool = tool_name
         for btn in tool_btns:
-            apply_button_style(btn)
-        if active_btn:
-            apply_button_style(active_btn, active=True)
+            btn.setChecked(btn is active_btn)
 
         # 进入裁剪模式
         if tool_name == 'CROP':
@@ -6466,6 +8030,9 @@ class ImageEditorDialog(QDialog):
         self.img_label.apply_crop()
         self.crop_toolbar.hide()
         self.set_tool(None, self.btn_crop)
+        if hasattr(self, "dim_badge") and getattr(self.img_label, "base_pixmap", None) is not None:
+            pm = self.img_label.base_pixmap
+            self.dim_badge.setText(f"{pm.width()} × {pm.height()} px")
 
     def cancel_crop(self):
         """取消裁剪"""
@@ -6733,87 +8300,631 @@ class CaptureHistoryManager:
         self._save_index()
 
 
+class _HistoryImagePreviewDialog(QDialog):
+    """历史截图大图灯箱预览窗：支持滚轮缩放、1:1 / 适应窗口切换、拖拽平移与快捷操作"""
+    def __init__(self, item, parent_dialog=None):
+        super().__init__(parent_dialog)
+        self._item = item or {}
+        self._parent_dialog = parent_dialog
+        self._filepath = self._item.get("filepath", "")
+        self._pixmap = QPixmap(self._filepath) if self._filepath and os.path.exists(self._filepath) else QPixmap()
+        self._fit_mode = True
+        self._scale = 1.0
+        self._panning = False
+        self._pan_start = QPoint()
+        self._h_start = 0
+        self._v_start = 0
+
+        self.setWindowTitle("历史截图大图预览")
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
+        self.resize(min(1120, int(avail.width() * 0.84)), min(780, int(avail.height() * 0.84)))
+        self.setMinimumSize(640, 440)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QScrollArea#previewViewport {
+                background-color: #EFEFF2;
+                border: none;
+            }
+            QWidget#previewCanvasWrap {
+                background-color: #EFEFF2;
+            }
+            QPushButton#pvBtn {
+                background-color: #FFFFFF;
+                color: #18181B;
+                border: 1px solid #E4E4E7;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+                min-height: 22px;
+            }
+            QPushButton#pvBtn:hover {
+                background-color: #F4F4F5;
+                border-color: #D4D4D8;
+                color: #0D0D0D;
+            }
+            QPushButton#pvPrimaryBtn {
+                background-color: #0D0D0D;
+                color: #FFFFFF;
+                border: 1px solid #0D0D0D;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 600;
+                min-height: 22px;
+            }
+            QPushButton#pvPrimaryBtn:hover {
+                background-color: #27272A;
+            }
+            QLabel#pvFooter {
+                background-color: #FFFFFF;
+                border-top: 1px solid #ECECEF;
+                color: #71717A;
+                font-size: 11.5px;
+                padding: 6px 16px;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        top_w = QWidget()
+        top_w.setObjectName("codexTopBar")
+        top = QHBoxLayout(top_w)
+        top.setContentsMargins(18, 12, 18, 12)
+        top.setSpacing(8)
+
+        title_txt = self._item.get("time_str") or os.path.basename(self._filepath) or "截图预览"
+        w_px = self._pixmap.width() if not self._pixmap.isNull() else int(self._item.get("width", 0) or 0)
+        h_px = self._pixmap.height() if not self._pixmap.isNull() else int(self._item.get("height", 0) or 0)
+        lbl_title = QLabel(title_txt)
+        lbl_title.setObjectName("codexTitle")
+        top.addWidget(lbl_title)
+
+        lbl_dim = QLabel(f"{w_px} × {h_px} px")
+        lbl_dim.setObjectName("codexPill")
+        top.addWidget(lbl_dim)
+
+        self.lbl_zoom = QLabel("适应")
+        self.lbl_zoom.setObjectName("codexPill")
+        top.addWidget(self.lbl_zoom)
+
+        top.addStretch()
+
+        btn_fit = QPushButton("适应窗口")
+        btn_fit.setObjectName("pvBtn")
+        btn_fit.setCursor(Qt.PointingHandCursor)
+        btn_fit.clicked.connect(self.fit_to_window)
+        top.addWidget(btn_fit)
+
+        btn_actual = QPushButton("1:1 原图")
+        btn_actual.setObjectName("pvBtn")
+        btn_actual.setCursor(Qt.PointingHandCursor)
+        btn_actual.clicked.connect(lambda: self.set_scale(1.0))
+        top.addWidget(btn_actual)
+
+        btn_copy = QPushButton("复制图片")
+        btn_copy.setObjectName("pvPrimaryBtn")
+        btn_copy.setCursor(Qt.PointingHandCursor)
+        btn_copy.clicked.connect(self._on_copy)
+        top.addWidget(btn_copy)
+
+        btn_copy_file = QPushButton("复制文件")
+        btn_copy_file.setObjectName("pvBtn")
+        btn_copy_file.setCursor(Qt.PointingHandCursor)
+        btn_copy_file.clicked.connect(self._on_copy_file)
+        top.addWidget(btn_copy_file)
+
+        main_ref = parent_dialog._resolve_main_app_ref() if parent_dialog and hasattr(parent_dialog, "_resolve_main_app_ref") else None
+        if main_ref is not None:
+            btn_pin = QPushButton("贴图")
+            btn_pin.setObjectName("pvBtn")
+            btn_pin.setCursor(Qt.PointingHandCursor)
+            btn_pin.clicked.connect(self._on_pin)
+            top.addWidget(btn_pin)
+
+            if getattr(main_ref, "pin_drawer", None) is not None:
+                btn_drawer = QPushButton("存抽屉")
+                btn_drawer.setObjectName("pvBtn")
+                btn_drawer.setCursor(Qt.PointingHandCursor)
+                btn_drawer.clicked.connect(self._on_drawer)
+                top.addWidget(btn_drawer)
+
+        btn_save = QPushButton("另存为...")
+        btn_save.setObjectName("pvBtn")
+        btn_save.setCursor(Qt.PointingHandCursor)
+        btn_save.clicked.connect(self._on_save)
+        top.addWidget(btn_save)
+
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("codexSecondaryBtn")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.close)
+        top.addWidget(btn_close)
+
+        root.addWidget(top_w)
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("previewViewport")
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setAlignment(Qt.AlignCenter)
+
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignCenter)
+        self.img_label.setStyleSheet("background: #FFFFFF; border: 1px solid #D4D4D8;")
+        self.scroll.setWidget(self.img_label)
+        self.scroll.viewport().installEventFilter(self)
+        self.img_label.installEventFilter(self)
+        root.addWidget(self.scroll, 1)
+
+        footer = QLabel("滚轮缩放 · 双击画面切换 适应 / 1:1 · 按住左键拖拽平移 · Esc 关闭")
+        footer.setObjectName("pvFooter")
+        root.addWidget(footer)
+
+        if self._pixmap.isNull():
+            self.img_label.setText("图片文件不存在或无法读取")
+            self.img_label.resize(360, 180)
+        else:
+            QTimer.singleShot(0, self.fit_to_window)
+
+    def fit_to_window(self):
+        self._fit_mode = True
+        self._render_pixmap()
+
+    def set_scale(self, scale):
+        self._fit_mode = False
+        self._scale = max(0.15, min(4.0, float(scale)))
+        self._render_pixmap()
+
+    def _render_pixmap(self):
+        if self._pixmap.isNull():
+            return
+        vp = self.scroll.viewport().size()
+        avail_w = max(120, vp.width() - 32)
+        avail_h = max(120, vp.height() - 32)
+        if self._fit_mode:
+            fit_scale = min(1.0, avail_w / max(1, self._pixmap.width()), avail_h / max(1, self._pixmap.height()))
+            self._scale = max(0.1, fit_scale)
+            prefix = "适应 · "
+        else:
+            prefix = ""
+        tw = max(1, int(round(self._pixmap.width() * self._scale)))
+        th = max(1, int(round(self._pixmap.height() * self._scale)))
+        scaled = self._pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.img_label.setPixmap(scaled)
+        self.img_label.resize(scaled.size())
+        self.lbl_zoom.setText(f"{prefix}{int(round(self._scale * 100))}%")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "_fit_mode", False):
+            self._render_pixmap()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event):
+        if obj in (self.scroll.viewport(), self.img_label):
+            if event.type() == QEvent.Wheel:
+                delta = event.angleDelta().y()
+                if delta != 0 and not self._pixmap.isNull():
+                    factor = 1.15 if delta > 0 else (1.0 / 1.15)
+                    self.set_scale(self._scale * factor)
+                    return True
+            elif event.type() == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
+                if self._fit_mode:
+                    self.set_scale(1.0)
+                else:
+                    self.fit_to_window()
+                return True
+            elif event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._panning = True
+                self._pan_start = event.globalPos()
+                self._h_start = self.scroll.horizontalScrollBar().value()
+                self._v_start = self.scroll.verticalScrollBar().value()
+                self.scroll.viewport().setCursor(Qt.ClosedHandCursor)
+                return True
+            elif event.type() == QEvent.MouseMove and self._panning:
+                delta = event.globalPos() - self._pan_start
+                self.scroll.horizontalScrollBar().setValue(self._h_start - delta.x())
+                self.scroll.verticalScrollBar().setValue(self._v_start - delta.y())
+                return True
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                if self._panning:
+                    self._panning = False
+                    self.scroll.viewport().setCursor(Qt.ArrowCursor)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _on_copy(self):
+        if self._parent_dialog:
+            self._parent_dialog._copy_item(self._item)
+
+    def _on_copy_file(self):
+        if self._parent_dialog:
+            self._parent_dialog._copy_item_as_file(self._item)
+
+    def _on_pin(self):
+        self.close()
+        if self._parent_dialog:
+            self._parent_dialog._pin_item(self._item)
+
+    def _on_drawer(self):
+        if self._parent_dialog:
+            self._parent_dialog._send_item_to_drawer(self._item)
+
+    def _on_save(self):
+        if not self._pixmap.isNull():
+            save_image_dialog(self, self._pixmap, default_prefix="history")
+
+
+class _DraggableHistoryThumb(QLabel):
+    """支持悬停预览、点击查看大图，以及左键拖出（途中右键切换 PNG 文件 / 贴图）的历史缩略图控件"""
+    def __init__(self, filepath, parent_dialog=None, item_data=None):
+        super().__init__()
+        self._filepath = filepath
+        self._parent_dialog = parent_dialog
+        self._item_data = item_data or {"filepath": filepath}
+        self._drag_start = None
+        self._click_candidate = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("点击查看大图 · 悬停快速预览 · 按住拖出（途中点击右键可在 PNG 文件 / 贴图间切换）")
+
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(180)
+        self._hover_timer.timeout.connect(self._on_hover_timeout)
+
+    def _on_hover_timeout(self):
+        if not self.underMouse():
+            return
+        if self._parent_dialog and self._parent_dialog.isVisible() and hasattr(self._parent_dialog, "_show_hover_preview"):
+            self._parent_dialog._show_hover_preview(self, self._filepath)
+
+    def enterEvent(self, event):
+        self._hover_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_timer.stop()
+        if self._parent_dialog and hasattr(self._parent_dialog, "_hide_hover_preview"):
+            self._parent_dialog._hide_hover_preview()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._hover_timer.stop()
+        if self._parent_dialog and hasattr(self._parent_dialog, "_hide_hover_preview"):
+            self._parent_dialog._hide_hover_preview()
+        if event.button() == Qt.LeftButton:
+            self._drag_start = event.pos()
+            self._click_candidate = True
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start is not None
+            and (event.buttons() & Qt.LeftButton)
+            and (event.pos() - self._drag_start).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            self._drag_start = None
+            self._click_candidate = False
+            self._start_toggleable_drag()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and getattr(self, "_click_candidate", False):
+            self._click_candidate = False
+            self._drag_start = None
+            if self._parent_dialog and hasattr(self._parent_dialog, "_preview_item"):
+                self._parent_dialog._preview_item(self._item_data)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+    def _start_toggleable_drag(self):
+        if not self._filepath or not os.path.exists(self._filepath):
+            return
+        pix = QPixmap(self._filepath)
+        if pix.isNull():
+            return
+
+        dlg = self._parent_dialog
+        was_visible = bool(dlg is not None and dlg.isVisible())
+        was_modal = bool(dlg is not None and dlg.isModal())
+        orig_geo = dlg.geometry() if was_visible else None
+        orig_opacity = dlg.windowOpacity() if was_visible else 1.0
+        if dlg is not None and hasattr(dlg, "_hide_hover_preview"):
+            dlg._hide_hover_preview()
+        if was_visible:
+            dlg._temp_hidden_for_drag = True
+            if was_modal:
+                # 若对话框处于模态 exec_()，绝不能调用 hide()（否则会提前触发 QDialog::done(0) 并破坏 activeModalWidget）
+                dlg.setWindowOpacity(0.0)
+                dlg.move(-24000, -24000)
+            else:
+                dlg.hide()
+            QApplication.processEvents()
+
+        outcome, drop_pos = "file", None
+        try:
+            outcome, _drag_res, drop_pos = run_toggleable_drag(
+                self,
+                pix,
+                start_mode="file",
+                copy_to_clipboard=True,
+                file_drag_fn=lambda w, p: start_pixmap_file_drag(w, p),
+            )
+        finally:
+            if dlg is not None:
+                dlg._temp_hidden_for_drag = False
+                if was_modal and was_visible:
+                    dlg.setWindowOpacity(orig_opacity)
+                    if orig_geo is not None:
+                        dlg.setGeometry(orig_geo)
+            if outcome == "drop_pin" and dlg is not None and hasattr(dlg, "_finish_drag_to_pin"):
+                dlg._finish_drag_to_pin(pix, drop_pos)
+            elif was_visible and dlg is not None and not getattr(dlg, "_did_commit_action", False):
+                if not was_modal:
+                    dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+
+
 class HistoryDialog(QDialog):
-    """现代卡片流式截图历史管理窗口，支持持久化、缩略图预览、重新编辑、贴图、复制、另存与清理"""
+    """Codex 风格卡片流式截图历史管理窗口，支持持久化、大图预览、悬停预览、拖拽切换贴图/文件、重新编辑、贴图、复制与清理"""
+    really_closed = pyqtSignal()
+
     def __init__(self, parent=None, main_app_ref=None):
         super().__init__(parent)
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
         self.main_app_ref = main_app_ref
+        self.main_app_ref = self._resolve_main_app_ref()
         self.mgr = CaptureHistoryManager.get_instance()
+        self._did_commit_action = False
+        self._really_closed_emitted = False
+        self._temp_hidden_for_drag = False
+        self._hover_preview = None
+        self._hover_preview_path = ""
+        self._hover_pixmap_cache = {}
 
-        self.setWindowTitle("📜 截图历史记录 (History)")
-        self.resize(880, 620)
-        self.setMinimumSize(600, 450)
+        self.setWindowTitle("截图历史记录 (History)")
+        self.resize(900, 630)
+        self.setMinimumSize(660, 460)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("""
-            QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
-            QLabel { color: #24292f; }
-            QFrame#card {
-                background: #f8fafc;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QWidget#historyBody {
+                background-color: #FCFCFD;
             }
-            QFrame#card:hover {
-                border: 1px solid #0969da;
-                background: #f0f7ff;
+            QFrame#historyCard {
+                background-color: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 10px;
             }
-            QLineEdit {
-                background: #ffffff;
-                border: 1px solid #d0d7de;
+            QFrame#historyCard:hover {
+                border-color: #D4D4D8;
+                background-color: #FAFAFA;
+            }
+            QLabel#historyThumb {
+                background-color: #F4F4F5;
+                border: 1px solid #ECECEF;
+                border-radius: 7px;
+            }
+            QLabel#historyMetaTitle {
+                font-size: 13.5px;
+                font-weight: 600;
+                color: #0D0D0D;
+                background: transparent;
+            }
+            QLabel#historyMetaSub {
+                font-size: 12px;
+                color: #52525B;
+                font-family: """ + CODEX_MONO_FAMILY + """;
+                background: transparent;
+            }
+            QLabel#historyMetaFile {
+                font-size: 11.5px;
+                color: #A1A1AA;
+                font-family: """ + CODEX_MONO_FAMILY + """;
+                background: transparent;
+            }
+            QPushButton#histBtn {
+                background-color: #FFFFFF;
+                color: #18181B;
+                border: 1px solid #E4E4E7;
                 border-radius: 6px;
-                padding: 6px 12px;
-                font-size: 13px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 400;
+                min-height: 20px;
             }
-            QLineEdit:focus {
-                border-color: #0969da;
+            QPushButton#histBtn:hover {
+                background-color: #F4F4F5;
+                border-color: #D4D4D8;
+                color: #0D0D0D;
+            }
+            QPushButton#histPrimaryBtn {
+                background-color: #0D0D0D;
+                color: #FFFFFF;
+                border: 1px solid #0D0D0D;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 600;
+                min-height: 20px;
+            }
+            QPushButton#histPrimaryBtn:hover {
+                background-color: #27272A;
+            }
+            QPushButton#histDangerBtn {
+                background-color: #FFFFFF;
+                color: #DC2626;
+                border: 1px solid #FECACA;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 400;
+                min-height: 20px;
+            }
+            QPushButton#histDangerBtn:hover {
+                background-color: #FEF2F2;
+                border-color: #FCA5A5;
             }
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # 顶部工具栏
-        top_bar = QHBoxLayout()
-        self.title_lbl = QLabel(f"<b>截图历史记录</b> <span style='color:#656d76;'>（共 {len(self.mgr.items)} 条）</span>")
-        self.title_lbl.setStyleSheet("font-size: 16px;")
+        # 顶部 Codex 工具栏
+        top_bar_w = QWidget()
+        top_bar_w.setObjectName("codexTopBar")
+        top_bar = QHBoxLayout(top_bar_w)
+        top_bar.setContentsMargins(20, 14, 20, 14)
+        top_bar.setSpacing(10)
+
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(VectorIconFactory.create_pixmap("history", QColor("#0D0D0D")).scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        icon_lbl.setFixedSize(18, 18)
+        top_bar.addWidget(icon_lbl)
+
+        self.title_lbl = QLabel("截图历史记录")
+        self.title_lbl.setObjectName("codexTitle")
         top_bar.addWidget(self.title_lbl)
+
+        self.lbl_count = QLabel(f"共 {len(self.mgr.items)} 条")
+        self.lbl_count.setObjectName("codexPill")
+        top_bar.addWidget(self.lbl_count)
 
         top_bar.addStretch()
 
+        self._time_filter = "all"
+        self._filter_group = QButtonGroup(self)
+        self._filter_group.setExclusive(True)
+        for key, label in (("all", "全部"), ("today", "今天"), ("week", "近 7 天")):
+            fbtn = QPushButton(label)
+            fbtn.setCheckable(True)
+            fbtn.setChecked(key == "all")
+            fbtn.setCursor(Qt.PointingHandCursor)
+            fbtn.setStyleSheet("""
+                QPushButton {
+                    background: #FFFFFF; color: #52525B; border: 1px solid #E4E4E7;
+                    border-radius: 6px; padding: 4px 10px; font-size: 12px;
+                }
+                QPushButton:hover { background: #F4F4F5; color: #0D0D0D; }
+                QPushButton:checked { background: #0D0D0D; color: #FFFFFF; border-color: #0D0D0D; font-weight: 600; }
+            """)
+            fbtn.clicked.connect(lambda _=False, k=key: self._set_time_filter(k))
+            self._filter_group.addButton(fbtn)
+            top_bar.addWidget(fbtn)
+
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 搜索时间或尺寸...")
-        self.search_input.setFixedWidth(200)
+        self.search_input.setPlaceholderText("搜索时间、尺寸或备注...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setFixedWidth(220)
         self.search_input.textChanged.connect(self.populate_cards)
         top_bar.addWidget(self.search_input)
 
-        self.btn_clear = QPushButton("🧹 清空全部")
+        self.btn_clear = QPushButton("清空全部")
+        self.btn_clear.setObjectName("codexDangerBtn")
         self.btn_clear.setCursor(Qt.PointingHandCursor)
-        apply_button_style(self.btn_clear, danger=True)
         self.btn_clear.clicked.connect(self.on_clear_all)
         top_bar.addWidget(self.btn_clear)
 
-        self.btn_close = QPushButton("✕ 关闭")
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.setObjectName("codexSecondaryBtn")
         self.btn_close.setCursor(Qt.PointingHandCursor)
-        apply_button_style(self.btn_close)
         self.btn_close.clicked.connect(self.close)
         top_bar.addWidget(self.btn_close)
 
-        layout.addLayout(top_bar)
+        layout.addWidget(top_bar_w)
 
         # 中部滚动区域
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("QScrollArea { border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff; }")
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(lambda _v: self._hide_hover_preview())
 
         self.cards_container = QWidget()
+        self.cards_container.setObjectName("historyBody")
         self.cards_layout = QVBoxLayout(self.cards_container)
-        self.cards_layout.setContentsMargins(12, 12, 12, 12)
+        self.cards_layout.setContentsMargins(20, 16, 20, 16)
         self.cards_layout.setSpacing(10)
         self.cards_layout.addStretch()
         self.scroll_area.setWidget(self.cards_container)
 
         layout.addWidget(self.scroll_area, 1)
 
+        self.populate_cards()
+
+    def _resolve_main_app_ref(self):
+        if self.main_app_ref is not None and hasattr(self.main_app_ref, "create_pinned_window"):
+            return self.main_app_ref
+        p = self.parent()
+        if p is not None and hasattr(p, "create_pinned_window"):
+            self.main_app_ref = p
+            return self.main_app_ref
+        for w in QApplication.topLevelWidgets():
+            if hasattr(w, "create_pinned_window") and hasattr(w, "pin_drawer"):
+                self.main_app_ref = w
+                return self.main_app_ref
+        return self.main_app_ref
+
+    def _show_hover_preview(self, thumb_widget, filepath):
+        if DrawerHoverPreview is None or not filepath or not os.path.exists(filepath):
+            return
+        if self._hover_preview is None:
+            self._hover_preview = DrawerHoverPreview()
+        pix = self._hover_pixmap_cache.get(filepath)
+        if pix is None or pix.isNull():
+            pix = QPixmap(filepath)
+            if not pix.isNull():
+                if len(self._hover_pixmap_cache) >= 24:
+                    self._hover_pixmap_cache.clear()
+                self._hover_pixmap_cache[filepath] = pix
+        if pix.isNull():
+            return
+        top_left = thumb_widget.mapToGlobal(QPoint(0, 0))
+        anchor_rect = QRect(top_left, thumb_widget.size())
+        screen = QApplication.screenAt(anchor_rect.center()) or QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        hint = "点击查看大图 · 右键切 PNG/贴图"
+        self._hover_preview_path = filepath
+        self._hover_preview.show_for_pixmap_beside_rect(pix, anchor_rect, avail, hint_text=hint)
+
+    def _hide_hover_preview(self):
+        if self._hover_preview is not None:
+            try:
+                self._hover_preview.hide()
+            except Exception:
+                pass
+        self._hover_preview_path = ""
+
+    def hideEvent(self, event):
+        self._hide_hover_preview()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._hide_hover_preview()
+        super().closeEvent(event)
+
+    def _set_time_filter(self, key):
+        self._time_filter = key
         self.populate_cards()
 
     def populate_cards(self):
@@ -6823,8 +8934,17 @@ class HistoryDialog(QDialog):
                 child.widget().deleteLater()
 
         filter_txt = self.search_input.text().strip().lower()
+        now_dt = datetime.now()
+        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        week_start = time.time() - 7 * 86400
+
         matched_items = []
         for item in self.mgr.items:
+            ts = float(item.get('timestamp', 0) or 0)
+            if self._time_filter == "today" and ts < today_start:
+                continue
+            elif self._time_filter == "week" and ts < week_start:
+                continue
             if not filter_txt:
                 matched_items.append(item)
             else:
@@ -6832,13 +8952,23 @@ class HistoryDialog(QDialog):
                 if filter_txt in desc:
                     matched_items.append(item)
 
-        self.title_lbl.setText(f"<b>截图历史记录</b> <span style='color:#656d76;'>（共 {len(matched_items)} 条）</span>")
+        self.lbl_count.setText(f"共 {len(matched_items)} 条")
 
         if not matched_items:
-            empty_lbl = QLabel("暂无截图历史记录\n使用 F1 截图后，将自动在这里保存与展示历史。")
-            empty_lbl.setAlignment(Qt.AlignCenter)
-            empty_lbl.setStyleSheet("color: #8c959f; font-size: 14px; padding: 60px;")
-            self.cards_layout.insertWidget(0, empty_lbl)
+            empty_card = QFrame()
+            empty_card.setObjectName("codexCard")
+            empty_lay = QVBoxLayout(empty_card)
+            empty_lay.setContentsMargins(24, 56, 24, 56)
+            empty_lay.setSpacing(6)
+            empty_title = QLabel("暂无匹配的截图记录" if filter_txt else "暂无截图历史记录")
+            empty_title.setAlignment(Qt.AlignCenter)
+            empty_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #18181B; background: transparent;")
+            empty_sub = QLabel("尝试更换搜索关键词" if filter_txt else "使用截图快捷键捕获屏幕后，记录将自动保存并展示在这里。")
+            empty_sub.setAlignment(Qt.AlignCenter)
+            empty_sub.setStyleSheet("font-size: 12px; color: #71717A; background: transparent;")
+            empty_lay.addWidget(empty_title)
+            empty_lay.addWidget(empty_sub)
+            self.cards_layout.insertWidget(0, empty_card)
             return
 
         for item in matched_items:
@@ -6847,31 +8977,31 @@ class HistoryDialog(QDialog):
 
     def _create_item_card(self, item):
         card = QFrame()
-        card.setObjectName("card")
+        card.setObjectName("historyCard")
         card_layout = QHBoxLayout(card)
-        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setContentsMargins(14, 12, 14, 12)
         card_layout.setSpacing(16)
 
-        thumb_lbl = QLabel()
-        thumb_lbl.setFixedSize(140, 95)
+        thumb_lbl = _DraggableHistoryThumb(item.get('filepath', ''), parent_dialog=self, item_data=item)
+        thumb_lbl.setObjectName("historyThumb")
+        thumb_lbl.setFixedSize(148, 96)
         thumb_lbl.setAlignment(Qt.AlignCenter)
-        thumb_lbl.setStyleSheet("background: #0d1117; border-radius: 6px; border: 1px solid #d0d7de;")
         tpath = item.get('thumb_path', '')
         if os.path.exists(tpath):
             pix = QPixmap(tpath)
             if not pix.isNull():
-                scaled = pix.scaled(136, 91, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                scaled = pix.scaled(140, 88, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 thumb_lbl.setPixmap(scaled)
         card_layout.addWidget(thumb_lbl)
 
         info_col = QVBoxLayout()
         info_col.setSpacing(4)
-        lbl_time = QLabel(f"<b>🕒 时间:</b> {item.get('time_str', '')}")
-        lbl_time.setStyleSheet("font-size: 13px; font-weight: 600; color: #1f2328;")
-        lbl_res = QLabel(f"<b>📐 尺寸:</b> {item.get('width', 0)} × {item.get('height', 0)} 像素")
-        lbl_res.setStyleSheet("font-size: 12px; color: #57606a;")
-        lbl_path = QLabel(f"<b>📁 存储:</b> {os.path.basename(item.get('filepath', ''))}")
-        lbl_path.setStyleSheet("font-size: 11px; color: #8c959f;")
+        lbl_time = QLabel(item.get('time_str', ''))
+        lbl_time.setObjectName("historyMetaTitle")
+        lbl_res = QLabel(f"{item.get('width', 0)} × {item.get('height', 0)} px")
+        lbl_res.setObjectName("historyMetaSub")
+        lbl_path = QLabel(os.path.basename(item.get('filepath', '')))
+        lbl_path.setObjectName("historyMetaFile")
 
         info_col.addWidget(lbl_time)
         info_col.addWidget(lbl_res)
@@ -6885,21 +9015,28 @@ class HistoryDialog(QDialog):
         btn_row1 = QHBoxLayout()
         btn_row1.setSpacing(6)
 
-        btn_copy = QPushButton("📋 复制")
+        btn_copy = QPushButton("复制")
+        btn_copy.setObjectName("histPrimaryBtn")
         btn_copy.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_copy)
         btn_copy.clicked.connect(lambda _, it=item: self._copy_item(it))
         btn_row1.addWidget(btn_copy)
 
-        btn_edit = QPushButton("✏ 编辑")
+        btn_preview = QPushButton("大图")
+        btn_preview.setObjectName("histBtn")
+        btn_preview.setCursor(Qt.PointingHandCursor)
+        btn_preview.setToolTip("打开高清大图预览窗口（支持滚轮缩放与 1:1 切换）")
+        btn_preview.clicked.connect(lambda _, it=item: self._preview_item(it))
+        btn_row1.addWidget(btn_preview)
+
+        btn_edit = QPushButton("编辑")
+        btn_edit.setObjectName("histBtn")
         btn_edit.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_edit)
         btn_edit.clicked.connect(lambda _, it=item: self._edit_item(it))
         btn_row1.addWidget(btn_edit)
 
-        btn_pin = QPushButton("📌 贴图")
+        btn_pin = QPushButton("贴图")
+        btn_pin.setObjectName("histBtn")
         btn_pin.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_pin)
         btn_pin.clicked.connect(lambda _, it=item: self._pin_item(it))
         btn_row1.addWidget(btn_pin)
 
@@ -6907,16 +9044,32 @@ class HistoryDialog(QDialog):
 
         btn_row2 = QHBoxLayout()
         btn_row2.setSpacing(6)
+        btn_row2.addStretch()
 
-        btn_save = QPushButton("💾 另存...")
+        btn_copy_file = QPushButton("复制文件")
+        btn_copy_file.setObjectName("histBtn")
+        btn_copy_file.setCursor(Qt.PointingHandCursor)
+        btn_copy_file.setToolTip("导出为 PNG 文件写入剪贴板，可直接粘贴发送到微信 / 文件夹")
+        btn_copy_file.clicked.connect(lambda _, it=item: self._copy_item_as_file(it))
+        btn_row2.addWidget(btn_copy_file)
+
+        main_ref = self._resolve_main_app_ref()
+        if main_ref and hasattr(main_ref, "pin_drawer") and main_ref.pin_drawer:
+            btn_drawer = QPushButton("存抽屉")
+            btn_drawer.setObjectName("histBtn")
+            btn_drawer.setCursor(Qt.PointingHandCursor)
+            btn_drawer.clicked.connect(lambda _, it=item: self._send_item_to_drawer(it))
+            btn_row2.addWidget(btn_drawer)
+
+        btn_save = QPushButton("另存为...")
+        btn_save.setObjectName("histBtn")
         btn_save.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_save)
         btn_save.clicked.connect(lambda _, it=item: self._save_item(it))
         btn_row2.addWidget(btn_save)
 
-        btn_del = QPushButton("🗑 删除")
+        btn_del = QPushButton("删除")
+        btn_del.setObjectName("histDangerBtn")
         btn_del.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_del, danger=True)
         btn_del.clicked.connect(lambda _, it=item: self._delete_item(it))
         btn_row2.addWidget(btn_del)
 
@@ -6924,6 +9077,50 @@ class HistoryDialog(QDialog):
         card_layout.addLayout(btn_col)
 
         return card
+
+    def _preview_item(self, item):
+        self._hide_hover_preview()
+        fpath = (item or {}).get('filepath', '')
+        if not fpath or not os.path.exists(fpath):
+            QToolTip.showText(QCursor.pos(), "图片文件不存在或已被移除", None, QRect(), 2000)
+            return
+        dlg = _HistoryImagePreviewDialog(item, parent_dialog=self)
+        dlg.exec_()
+
+    def _finish_drag_to_pin(self, pix, drop_pos):
+        main_ref = self._resolve_main_app_ref()
+        if main_ref is not None and pix is not None and not pix.isNull():
+            self._did_commit_action = True
+            self._hide_hover_preview()
+            self.close()
+            pin = main_ref.create_pinned_window(pix)
+            if pin is not None and drop_pos is not None:
+                pin.move(max(0, drop_pos.x() - pin.width() // 2), max(0, drop_pos.y() - pin.height() // 2))
+            return pin
+        if self.isHidden():
+            self.show()
+            self.raise_()
+        return None
+
+    def _copy_item_as_file(self, item):
+        fpath = item.get('filepath', '')
+        if os.path.exists(fpath):
+            pix = QPixmap(fpath)
+            if not pix.isNull() and copy_pixmap_as_clipboard_file(pix):
+                QToolTip.showText(QCursor.pos(), "📄 已复制为 PNG 文件（可直接 Ctrl+V 发送）", None, QRect(), 2200)
+
+    def _send_item_to_drawer(self, item):
+        fpath = item.get('filepath', '')
+        main_ref = self._resolve_main_app_ref()
+        if os.path.exists(fpath) and main_ref and getattr(main_ref, 'pin_drawer', None):
+            pix = QPixmap(fpath)
+            if not pix.isNull():
+                drawer = main_ref.pin_drawer
+                if not drawer.drawer_enabled:
+                    drawer.set_feature_enabled(True)
+                    save_settings({"drawer_hover_enabled": True})
+                drawer._insert_pixmaps([pix], keep_open_ms=900)
+                QToolTip.showText(QCursor.pos(), "🗄️ 已存入右侧贴图抽屉！", None, QRect(), 1800)
 
     def _copy_item(self, item):
         fpath = item.get('filepath', '')
@@ -6938,17 +9135,24 @@ class HistoryDialog(QDialog):
         if os.path.exists(fpath):
             pix = QPixmap(fpath)
             if not pix.isNull():
+                self._did_commit_action = True
+                self._hide_hover_preview()
                 self.close()
-                editor = ImageEditorDialog(pix, self.main_app_ref)
+                editor = ImageEditorDialog(pix, self._resolve_main_app_ref())
                 editor.exec_()
 
     def _pin_item(self, item):
         fpath = item.get('filepath', '')
         if os.path.exists(fpath):
             pix = QPixmap(fpath)
-            if not pix.isNull() and self.main_app_ref:
+            main_ref = self._resolve_main_app_ref()
+            if not pix.isNull() and main_ref:
+                self._did_commit_action = True
+                self._hide_hover_preview()
                 self.close()
-                self.main_app_ref.create_pinned_window(pix)
+                main_ref.create_pinned_window(pix)
+            elif not main_ref:
+                QToolTip.showText(QCursor.pos(), "未检测到活跃的贴图管理器", None, QRect(), 2000)
 
     def _save_item(self, item):
         fpath = item.get('filepath', '')
@@ -6966,6 +9170,37 @@ class HistoryDialog(QDialog):
         if ret == QMessageBox.Yes:
             self.mgr.clear_all()
             self.populate_cards()
+
+    def _emit_really_closed(self):
+        self._hide_hover_preview()
+        if not getattr(self, "_really_closed_emitted", False):
+            self._really_closed_emitted = True
+            self.really_closed.emit()
+
+    def exec_nonmodal(self):
+        """以非模态事件循环等待窗口关闭，彻底避免拖拽时临时 hide() 破坏 activeModalWidget。"""
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
+        self._really_closed_emitted = False
+        loop = QEventLoop(self)
+        self.really_closed.connect(loop.quit)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(loop.quit)
+        self.show()
+        _force_activate_window(self)
+        if not self._really_closed_emitted:
+            loop.exec_()
+        return 0
+
+    def done(self, r):
+        super().done(r)
+        if not getattr(self, "_temp_hidden_for_drag", False):
+            self._emit_really_closed()
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        self._emit_really_closed()
 
 
 class _HotkeyInnerEdit(QLineEdit):
@@ -6987,8 +9222,8 @@ class _HotkeyInnerEdit(QLineEdit):
     def start_recording(self):
         self._recording = True
         self._original_val = self.text()
-        self.setText("请按下键盘快捷键...")
-        self.setStyleSheet("border: 2px solid #0969da; background: #f0f7ff; color: #0969da; font-weight: 600;")
+        self.setText("按下快捷键...")
+        self.setStyleSheet("border: 1.5px solid #0D0D0D; background: #F4F4F5; color: #0D0D0D; font-weight: 600; border-radius: 7px;")
 
     def stop_recording(self, restore=True):
         if self._recording:
@@ -7097,37 +9332,40 @@ class _HotkeyInnerEdit(QLineEdit):
 class HotkeyRecorderWidget(QWidget):
     hotkeyChanged = pyqtSignal(str)
 
-    def __init__(self, placeholder="未绑定 (点击录制)", parent=None):
+    def __init__(self, placeholder="点击录制", parent=None):
         super().__init__(parent)
+        self.setFixedWidth(182)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
         self.edit = _HotkeyInnerEdit(self)
-        self.edit.setFixedHeight(32)
+        self.edit.setObjectName("codexHotkeyEdit")
+        self.edit.setFixedHeight(30)
+        self.edit.setAlignment(Qt.AlignCenter)
         self.edit.setPlaceholderText(placeholder)
         self.edit.keyRecorded.connect(self._on_recorded)
         self.edit.recordingCancelled.connect(self._update_clear_btn)
         layout.addWidget(self.edit, 1)
 
         self.btn_clear = QPushButton("×")
-        self.btn_clear.setFixedSize(28, 28)
+        self.btn_clear.setFixedSize(26, 26)
         self.btn_clear.setCursor(Qt.PointingHandCursor)
         self.btn_clear.setToolTip("清除快捷键")
         self.btn_clear.setStyleSheet("""
             QPushButton {
-                background: #f1f3f5;
-                color: #6c757d;
-                border: 1px solid #d0d7de;
-                border-radius: 4px;
-                font-size: 14px;
-                font-weight: bold;
-                padding-bottom: 2px;
+                background: #F4F4F5;
+                color: #71717A;
+                border: 1px solid #E4E4E7;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 600;
+                padding-bottom: 1px;
             }
             QPushButton:hover {
-                background: #ffebe9;
-                color: #cf222e;
-                border-color: #ff8182;
+                background: #FEE2E2;
+                color: #DC2626;
+                border-color: #FCA5A5;
             }
         """)
         self.btn_clear.clicked.connect(self.clear)
@@ -7141,11 +9379,11 @@ class HotkeyRecorderWidget(QWidget):
 
     def _update_clear_btn(self):
         val = self.edit.text().strip()
-        self.btn_clear.setVisible(bool(val and val != "请按下键盘快捷键..."))
+        self.btn_clear.setVisible(bool(val and val != "按下快捷键..."))
 
     def text(self):
         t = self.edit.text().strip()
-        if t == "请按下键盘快捷键...":
+        if t == "按下快捷键...":
             return ""
         return t
 
@@ -7396,68 +9634,111 @@ class UpdateAvailableDialog(QDialog):
         self.info = info
         self.setWindowTitle("发现新版本")
         self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
-        self.setMinimumWidth(560)
-        self.resize(620, 520)
-        self.setStyleSheet("""
-            QDialog { background: #ffffff; font-family: "Microsoft YaHei UI", "Segoe UI"; }
-            QLabel#updTitle { font-size: 18px; font-weight: 700; color: #0F172A; }
-            QLabel#updSub { font-size: 12px; color: #64748B; }
-            QTextEdit { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;
-                        padding: 8px; color: #334155; font-size: 12px; }
-            QPushButton { border-radius: 6px; padding: 8px 16px; font-size: 13px; }
-            QPushButton#updPrimary { background: #0969DA; color: #FFFFFF; border: 1px solid #085CC0; font-weight: 600; }
-            QPushButton#updPrimary:hover { background: #085CC0; }
-            QPushButton#updSecondary { background: #FFFFFF; color: #334155; border: 1px solid #CBD5E1; }
-            QPushButton#updSecondary:hover { background: #F1F5F9; }
+        self.setMinimumWidth(580)
+        self.resize(640, 540)
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QWidget#updBody {
+                background-color: #FCFCFD;
+            }
+            QTextEdit#updNotes {
+                background-color: #FFFFFF;
+                color: #18181B;
+                border: none;
+                border-radius: 9px;
+                padding: 12px 14px;
+                font-size: 12.5px;
+                selection-background-color: #0D0D0D;
+                selection-color: #FFFFFF;
+            }
         """)
         main = QVBoxLayout(self)
-        main.setContentsMargins(20, 18, 20, 16)
-        main.setSpacing(10)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
 
-        title = QLabel(f"发现新版本  v{info.version}")
-        title.setObjectName("updTitle")
-        main.addWidget(title)
-        sub = QLabel(f"当前版本 v{APP_VERSION}   →   最新版本 v{info.version}")
-        sub.setObjectName("updSub")
-        main.addWidget(sub)
+        top_w = QWidget()
+        top_w.setObjectName("codexTopBar")
+        top_lay = QVBoxLayout(top_w)
+        top_lay.setContentsMargins(20, 16, 20, 14)
+        top_lay.setSpacing(6)
 
-        size_text = f"安装包大小：{info.size / 1024 / 1024:.1f} MB" if info.size else "安装包大小：未知"
+        row_head = QHBoxLayout()
+        row_head.setSpacing(10)
+        ico = QLabel()
+        ico.setPixmap(_create_codex_icon("update", "#0D0D0D", 16).pixmap(16, 16))
+        ico.setFixedSize(18, 18)
+        row_head.addWidget(ico)
+
+        title = QLabel(f"发现新版本 v{info.version}")
+        title.setObjectName("codexTitle")
+        row_head.addWidget(title)
+
+        ver_pill = QLabel(f"v{APP_VERSION} → v{info.version}")
+        ver_pill.setObjectName("codexPill")
+        row_head.addWidget(ver_pill)
+        row_head.addStretch()
+        top_lay.addLayout(row_head)
+
+        meta_parts = [f"安装包大小：{info.size / 1024 / 1024:.1f} MB" if info.size else "安装包大小：未知"]
         if info.published_at:
-            size_text += f"    发布时间：{info.published_at[:10]}"
-        main.addWidget(QLabel(size_text))
+            meta_parts.append(f"发布日期：{info.published_at[:10]}")
+        sub = QLabel("   ·   ".join(meta_parts))
+        sub.setObjectName("codexSubtitle")
+        top_lay.addWidget(sub)
+        main.addWidget(top_w)
 
-        main.addWidget(QLabel("更新说明："))
+        body_w = QWidget()
+        body_w.setObjectName("updBody")
+        body_lay = QVBoxLayout(body_w)
+        body_lay.setContentsMargins(20, 16, 20, 16)
+        body_lay.setSpacing(8)
+
+        lbl_notes = QLabel("更新说明")
+        lbl_notes.setObjectName("codexSectionLabel")
+        body_lay.addWidget(lbl_notes)
+
+        notes_card = QFrame()
+        notes_card.setObjectName("codexCard")
+        notes_lay = QVBoxLayout(notes_card)
+        notes_lay.setContentsMargins(2, 2, 2, 2)
         self.notes = QTextEdit()
+        self.notes.setObjectName("updNotes")
         self.notes.setReadOnly(True)
         self.notes.setPlainText((_plain_release_notes(info.notes) or "本次更新暂无详细说明。")[:12000])
-        main.addWidget(self.notes, 1)
+        notes_lay.addWidget(self.notes)
+        body_lay.addWidget(notes_card, 1)
+        main.addWidget(body_w, 1)
 
-        buttons = QHBoxLayout()
+        bottom_w = QWidget()
+        bottom_w.setObjectName("codexBottomBar")
+        buttons = QHBoxLayout(bottom_w)
+        buttons.setContentsMargins(20, 12, 20, 12)
+        buttons.setSpacing(8)
+
         btn_page = QPushButton("打开发布页")
-        btn_page.setObjectName("updSecondary")
+        btn_page.setObjectName("codexGhostBtn")
         btn_page.setCursor(Qt.PointingHandCursor)
         btn_page.clicked.connect(lambda: webbrowser.open(info.page_url))
         buttons.addWidget(btn_page)
         buttons.addStretch()
 
         btn_skip = QPushButton("跳过此版本")
-        btn_skip.setObjectName("updSecondary")
+        btn_skip.setObjectName("codexSecondaryBtn")
         btn_skip.setCursor(Qt.PointingHandCursor)
         btn_skip.clicked.connect(lambda: (self.skip_requested.emit(info.version), self.accept()))
         buttons.addWidget(btn_skip)
 
         btn_later = QPushButton("稍后")
-        btn_later.setObjectName("updSecondary")
+        btn_later.setObjectName("codexSecondaryBtn")
         btn_later.setCursor(Qt.PointingHandCursor)
         btn_later.clicked.connect(self.reject)
         buttons.addWidget(btn_later)
 
         btn_install = QPushButton("下载并安装")
-        btn_install.setObjectName("updPrimary")
+        btn_install.setObjectName("codexPrimaryBtn")
         btn_install.setCursor(Qt.PointingHandCursor)
         btn_install.clicked.connect(lambda: (self.install_requested.emit(), self.accept()))
         buttons.addWidget(btn_install)
-        main.addLayout(buttons)
+        main.addWidget(bottom_w)
 
 
 class UpdateProgressDialog(QDialog):
@@ -7471,30 +9752,49 @@ class UpdateProgressDialog(QDialog):
         self.setWindowTitle("正在下载更新")
         self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
         self.setFixedWidth(520)
-        self.setStyleSheet("""
-            QDialog { background: #ffffff; font-family: "Microsoft YaHei UI", "Segoe UI"; }
-            QLabel { color: #334155; font-size: 12px; }
-            QProgressBar { border: 1px solid #E2E8F0; border-radius: 6px; background: #F1F5F9;
-                           height: 16px; text-align: center; color: #334155; }
-            QProgressBar::chunk { background: #0969DA; border-radius: 5px; }
-            QPushButton { background: #FFFFFF; color: #334155; border: 1px solid #CBD5E1;
-                          border-radius: 6px; padding: 7px 18px; }
-            QPushButton:hover { background: #F1F5F9; }
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
+            QProgressBar#codexProgress {
+                border: none;
+                border-radius: 4px;
+                background-color: #ECECEF;
+                height: 8px;
+            }
+            QProgressBar#codexProgress::chunk {
+                background-color: #0D0D0D;
+                border-radius: 4px;
+            }
         """)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+
+        head_row = QHBoxLayout()
+        head_row.setSpacing(10)
+        ico = QLabel()
+        ico.setPixmap(_create_codex_icon("update", "#0D0D0D", 16).pixmap(16, 16))
+        ico.setFixedSize(18, 18)
+        head_row.addWidget(ico)
+
         self.lbl_title = QLabel(f"正在下载 Capture v{info.version}…")
-        self.lbl_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #0F172A;")
-        layout.addWidget(self.lbl_title)
+        self.lbl_title.setObjectName("codexTitle")
+        head_row.addWidget(self.lbl_title)
+        head_row.addStretch()
+        layout.addLayout(head_row)
+
         self.bar = QProgressBar()
+        self.bar.setObjectName("codexProgress")
+        self.bar.setTextVisible(False)
         self.bar.setRange(0, 0)
         layout.addWidget(self.bar)
-        self.lbl_status = QLabel("正在连接 GitHub…")
-        layout.addWidget(self.lbl_status)
+
         row = QHBoxLayout()
-        row.addStretch()
+        row.setSpacing(12)
+        self.lbl_status = QLabel("正在连接 GitHub…")
+        self.lbl_status.setObjectName("codexSubtitle")
+        row.addWidget(self.lbl_status, 1)
+
         self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.setObjectName("codexSecondaryBtn")
         self.btn_cancel.setCursor(Qt.PointingHandCursor)
         self.btn_cancel.clicked.connect(self._cancel)
         row.addWidget(self.btn_cancel)
@@ -7574,327 +9874,653 @@ def launch_updater_process(new_exe, info):
     return temp_updater
 
 
+# (Codex shared icons & widgets are defined earlier above PinToast)
+
+
 class SettingsDialog(QDialog):
-    """系统偏好设置面板：快捷键自定义、默认保存目录与画质、智谱 GLM-OCR 及火山方舟豆包配置"""
+    """系统偏好设置面板（OpenAI Codex 风格双栏极简设置中心）"""
     def __init__(self, parent=None, hotkey_mgr=None):
         super().__init__(parent)
         self.hotkey_mgr = hotkey_mgr
-        self.setWindowTitle("⚙ 系统设置 - Capture")
-        self.resize(600, 640)
-        self.setMinimumSize(480, 420)
+        self.setWindowTitle("系统设置 - Capture")
+        self.resize(790, 560)
+        self.setMinimumSize(680, 440)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("""
-            QDialog { background: #ffffff; color: #24292f; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
-            QLabel { color: #24292f; font-size: 13px; }
-            QGroupBox {
-                font-size: 13px;
+            QDialog {
+                background: #FFFFFF;
+                color: #0D0D0D;
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
+            }
+            QDialog QLabel, QDialog QPushButton, QDialog QLineEdit, QDialog QComboBox {
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Emoji", sans-serif;
+            }
+            QWidget#codexSidebar {
+                background: #F7F7F8;
+                border-right: 1px solid #ECECEF;
+            }
+            QWidget#codexMainPane {
+                background: #FFFFFF;
+            }
+            QWidget#codexHeader {
+                background: #FFFFFF;
+                border-bottom: 1px solid #F1F1F5;
+            }
+            QWidget#codexFooter {
+                background: #FCFCFD;
+                border-top: 1px solid #ECECEF;
+            }
+            QFrame#codexCard {
+                background: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 10px;
+            }
+            QLabel#codexSectionLabel {
+                font-size: 11.5px;
                 font-weight: 600;
-                color: #0969da;
-                border: 1px solid #d0d7de;
+                color: #71717A;
+                padding: 2px 2px 4px 2px;
+                background: transparent;
+            }
+            QPushButton#codexNavBtn {
+                background: transparent;
+                color: #52525B;
+                border: none;
                 border-radius: 8px;
-                margin-top: 14px;
-                padding-top: 18px;
-                padding-bottom: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-            }
-            QLineEdit, QComboBox {
-                background: #ffffff;
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-                padding: 0px 10px;
+                padding: 0 10px;
+                height: 34px;
+                text-align: left;
                 font-size: 13px;
-                color: #24292f;
-                min-height: 32px;
-                max-height: 32px;
+                font-weight: 400;
             }
-            QLineEdit:focus, QComboBox:focus { border-color: #0969da; }
-            QCheckBox { font-size: 13px; color: #24292f; spacing: 8px; }
-            QScrollArea { background: transparent; border: none; }
+            QPushButton#codexNavBtn:hover {
+                background: #EFEFF3;
+                color: #18181B;
+            }
+            QPushButton#codexNavBtn:checked {
+                background: #E8E8ED;
+                color: #0D0D0D;
+                font-weight: 600;
+            }
+            QLineEdit {
+                background: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                padding: 0 10px;
+                font-size: 12.5px;
+                color: #0D0D0D;
+                min-height: 30px;
+                max-height: 30px;
+            }
+            QLineEdit:hover {
+                border-color: #D4D4D8;
+            }
+            QLineEdit:focus {
+                border: 1.5px solid #0D0D0D;
+                background: #FFFFFF;
+            }
+            QLineEdit#codexHotkeyEdit {
+                background: #FAFAFA;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                padding: 0 8px;
+                font-family: "Cascadia Mono", "Cascadia Code", "Consolas", "Microsoft YaHei UI", monospace;
+                font-size: 12px;
+                font-weight: 600;
+                color: #18181B;
+            }
+            QLineEdit#codexHotkeyEdit:hover {
+                background: #F4F4F5;
+                border-color: #D4D4D8;
+            }
+            QComboBox {
+                background: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                padding: 0 26px 0 10px;
+                font-size: 12.5px;
+                color: #0D0D0D;
+                min-height: 30px;
+                max-height: 30px;
+            }
+            QComboBox:hover {
+                border-color: #D4D4D8;
+            }
+            QComboBox:focus {
+                border: 1.5px solid #0D0D0D;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 24px;
+                background: transparent;
+            }
+            QComboBox QAbstractItemView {
+                background: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 8px;
+                padding: 4px;
+                color: #0D0D0D;
+                selection-background-color: #F4F4F5;
+                selection-color: #0D0D0D;
+                outline: none;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #E4E4E7;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #0D0D0D;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #FFFFFF;
+                border: 2px solid #0D0D0D;
+                width: 12px;
+                height: 12px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #F4F4F5;
+            }
+            QPushButton#codexPrimaryBtn {
+                background: #0D0D0D;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 7px;
+                padding: 0 16px;
+                font-size: 12.5px;
+                font-weight: 600;
+            }
+            QPushButton#codexPrimaryBtn:hover {
+                background: #27272A;
+            }
+            QPushButton#codexPrimaryBtn:pressed {
+                background: #18181B;
+            }
+            QPushButton#codexSecondaryBtn {
+                background: #FFFFFF;
+                color: #18181B;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+                padding: 0 12px;
+                font-size: 12.5px;
+                font-weight: 400;
+            }
+            QPushButton#codexSecondaryBtn:hover {
+                background: #F4F4F5;
+                border-color: #D4D4D8;
+            }
+            QPushButton#codexIconBtn {
+                background: #FFFFFF;
+                border: 1px solid #E4E4E7;
+                border-radius: 7px;
+            }
+            QPushButton#codexIconBtn:hover {
+                background: #F4F4F5;
+                border-color: #D4D4D8;
+            }
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
             QScrollBar:vertical {
-                background: #f6f8fa;
-                width: 8px;
-                border-radius: 4px;
+                background: transparent;
+                width: 6px;
+                margin: 4px 2px;
             }
             QScrollBar::handle:vertical {
-                background: #c0c4cc;
-                min-height: 24px;
-                border-radius: 4px;
+                background: #D4D4D8;
+                min-height: 28px;
+                border-radius: 3px;
             }
-            QScrollBar::handle:vertical:hover { background: #909399; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::handle:vertical:hover {
+                background: #A1A1AA;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
         """)
 
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 14, 16, 14)
-        main_layout.setSpacing(10)
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        # 滚动区域包裹所有设置卡片，防止小屏幕/缩放窗口时控件被挤压变形
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
+        # ==========================================
+        # 左侧导航栏 (Codex Sidebar)
+        # ==========================================
+        sidebar = QWidget()
+        sidebar.setObjectName("codexSidebar")
+        sidebar.setFixedWidth(202)
+        side_lay = QVBoxLayout(sidebar)
+        side_lay.setContentsMargins(12, 16, 12, 14)
+        side_lay.setSpacing(6)
 
-        content_widget = QWidget()
-        content_widget.setObjectName("settingsContent")
-        content_layout = QVBoxLayout(content_widget)
-        content_layout.setContentsMargins(4, 4, 10, 4)
-        content_layout.setSpacing(14)
+        # 品牌标识区
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(6, 0, 6, 10)
+        brand_row.setSpacing(9)
+        brand_icon = QLabel()
+        brand_icon.setPixmap(_create_codex_icon("brand", size=24).pixmap(24, 24))
+        brand_icon.setFixedSize(24, 24)
+        brand_row.addWidget(brand_icon)
 
-        # 1. 全局快捷键分组 (按键录制模式，支持全部 8 项功能)
-        hk_group = QGroupBox("⌨ 全局快捷键自定义 (点击输入框直接按下按键录制)")
-        hk_layout = QGridLayout(hk_group)
-        hk_layout.setContentsMargins(14, 16, 14, 14)
-        hk_layout.setSpacing(10)
+        brand_title = QLabel("Capture")
+        brand_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #0D0D0D; letter-spacing: -0.2px;")
+        brand_row.addWidget(brand_title)
 
-        # 0: 屏幕截图 (默认 F1)
-        hk_layout.addWidget(QLabel("屏幕截图:"), 0, 0)
-        self.input_hk_snip = HotkeyRecorderWidget("未绑定 (默认 F1)")
-        hk_layout.addWidget(self.input_hk_snip, 0, 1)
+        badge_ver = QLabel(f"v{APP_VERSION}")
+        badge_ver.setStyleSheet(f"""
+            background: #EAEAEF;
+            color: #52525B;
+            border-radius: 5px;
+            padding: 1px 6px;
+            font-family: {CODEX_MONO_FAMILY};
+            font-size: 10.5px;
+            font-weight: 600;
+        """)
+        brand_row.addWidget(badge_ver)
+        brand_row.addStretch()
+        side_lay.addLayout(brand_row)
 
-        # 1: 识图翻译 (默认 F2)
-        hk_layout.addWidget(QLabel("识图/翻译:"), 1, 0)
-        self.input_hk_ocr = HotkeyRecorderWidget("未绑定 (默认 F2)")
-        hk_layout.addWidget(self.input_hk_ocr, 1, 1)
+        # 导航菜单项
+        self._nav_specs = [
+            ("shortcuts", "快捷键", "全局快捷键", "点击右侧按键槽后直接按下组合键完成录制，按 Delete 或 × 清除", True),
+            ("general", "通用与保存", "通用与保存", "管理默认存储路径、导出图像编码格式与工作区交互偏好", False),
+            ("ai", "AI 与翻译", "AI 与翻译", "配置智谱 GLM-OCR 多模态识别与火山方舟豆包大模型翻译", False),
+            ("update", "软件更新", "软件更新", "查看版本信息、自动检测策略与 GitHub 官方发行页", False),
+        ]
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        self._nav_buttons = []
 
-        # 2: 贴图置顶 (默认 F3)
-        hk_layout.addWidget(QLabel("贴图置顶:"), 2, 0)
-        self.input_hk_pin = HotkeyRecorderWidget("未绑定 (默认 F3)")
-        hk_layout.addWidget(self.input_hk_pin, 2, 1)
+        for idx, (icon_key, nav_label, _, _, _) in enumerate(self._nav_specs):
+            btn = QPushButton(f"  {nav_label}")
+            btn.setObjectName("codexNavBtn")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setIconSize(QSize(15, 15))
+            btn.setIcon(_create_codex_icon(icon_key, "#0D0D0D" if idx == 0 else "#52525B", 16))
+            if idx == 0:
+                btn.setChecked(True)
+            btn.clicked.connect(lambda checked, i=idx: self._switch_page(i))
+            self._nav_group.addButton(btn, idx)
+            self._nav_buttons.append((btn, icon_key))
+            side_lay.addWidget(btn)
 
-        # 3: 屏幕录制 (默认 F4)
-        hk_layout.addWidget(QLabel("屏幕录制:"), 3, 0)
-        self.input_hk_rec = HotkeyRecorderWidget("未绑定 (默认 F4)")
-        hk_layout.addWidget(self.input_hk_rec, 3, 1)
+        side_lay.addStretch(1)
 
-        # 4: 窗口置顶 (DeskPin)
-        hk_layout.addWidget(QLabel("窗口置顶 (DeskPin):"), 4, 0)
-        self.input_hk_win_pin = HotkeyRecorderWidget("未绑定 (点击录制)")
-        hk_layout.addWidget(self.input_hk_win_pin, 4, 1)
+        # 侧栏底部极简配置提示
+        side_foot = QLabel("配置实时写入本地\ncapture_settings.json")
+        side_foot.setStyleSheet("""
+            color: #8E8EA0;
+            font-size: 11px;
+            padding: 8px 8px 2px 8px;
+            line-height: 1.35;
+            background: transparent;
+        """)
+        side_lay.addWidget(side_foot)
+        root_layout.addWidget(sidebar)
 
-        # 5: 滚动长截图
-        hk_layout.addWidget(QLabel("滚动长截图:"), 5, 0)
-        self.input_hk_scroll = HotkeyRecorderWidget("未绑定 (点击录制)")
-        hk_layout.addWidget(self.input_hk_scroll, 5, 1)
+        # ==========================================
+        # 右侧主内容区 (Header + Stacked Pages + Footer)
+        # ==========================================
+        main_pane = QWidget()
+        main_pane.setObjectName("codexMainPane")
+        pane_lay = QVBoxLayout(main_pane)
+        pane_lay.setContentsMargins(0, 0, 0, 0)
+        pane_lay.setSpacing(0)
 
-        # 6: 截图历史
-        hk_layout.addWidget(QLabel("截图历史:"), 6, 0)
-        self.input_hk_history = HotkeyRecorderWidget("未绑定 (点击录制)")
-        hk_layout.addWidget(self.input_hk_history, 6, 1)
+        # 顶部固定标题栏
+        header = QWidget()
+        header.setObjectName("codexHeader")
+        hdr_lay = QHBoxLayout(header)
+        hdr_lay.setContentsMargins(26, 16, 26, 14)
+        hdr_lay.setSpacing(12)
 
-        # 7: 打开系统设置
-        hk_layout.addWidget(QLabel("打开系统设置:"), 7, 0)
-        self.input_hk_settings = HotkeyRecorderWidget("未绑定 (点击录制)")
-        hk_layout.addWidget(self.input_hk_settings, 7, 1)
+        hdr_text_col = QVBoxLayout()
+        hdr_text_col.setContentsMargins(0, 0, 0, 0)
+        hdr_text_col.setSpacing(3)
+        self.lbl_page_title = QLabel(self._nav_specs[0][2])
+        self.lbl_page_title.setStyleSheet("font-size: 16.5px; font-weight: 600; color: #0D0D0D;")
+        hdr_text_col.addWidget(self.lbl_page_title)
 
-        # 8: 贴图储藏柜
-        hk_layout.addWidget(QLabel("贴图储藏柜:"), 8, 0)
-        self.input_hk_drawer = HotkeyRecorderWidget("未绑定 (默认 Ctrl+1)")
-        hk_layout.addWidget(self.input_hk_drawer, 8, 1)
+        self.lbl_page_desc = QLabel(self._nav_specs[0][3])
+        self.lbl_page_desc.setStyleSheet("font-size: 12px; color: #71717A;")
+        hdr_text_col.addWidget(self.lbl_page_desc)
+        hdr_lay.addLayout(hdr_text_col, 1)
 
-        btn_reset_hk = QPushButton("恢复默认快捷键 (仅基础功能 F1~F4)")
-        btn_reset_hk.setFixedHeight(30)
-        btn_reset_hk.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_reset_hk)
-        btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
-        hk_layout.addWidget(btn_reset_hk, 9, 1, Qt.AlignRight)
+        self.btn_reset_hk = QPushButton("恢复默认快捷键")
+        self.btn_reset_hk.setObjectName("codexSecondaryBtn")
+        self.btn_reset_hk.setFixedHeight(30)
+        self.btn_reset_hk.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
+        hdr_lay.addWidget(self.btn_reset_hk, 0, Qt.AlignVCenter)
 
-        content_layout.addWidget(hk_group)
+        pane_lay.addWidget(header)
 
-        # 2. 保存与文件输出分组
-        save_group = QGroupBox("💾 保存与输出偏好")
-        save_layout = QGridLayout(save_group)
-        save_layout.setContentsMargins(14, 16, 14, 14)
-        save_layout.setSpacing(10)
+        # 分页容器
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("codexPages")
+        self.pages.setStyleSheet("QStackedWidget#codexPages { background: #FFFFFF; border: none; }")
+        pane_lay.addWidget(self.pages, 1)
 
-        save_layout.addWidget(QLabel("默认保存目录:"), 0, 0)
-        dir_box = QHBoxLayout()
+        # ---------- 页面 0：全局快捷键 ----------
+        p0_scroll, p0_lay = self._make_scroll_page()
+
+        lbl_sec_core = QLabel("核心截图与录制")
+        lbl_sec_core.setObjectName("codexSectionLabel")
+        p0_lay.addWidget(lbl_sec_core)
+
+        card_hk_core = CodexCard()
+        self.input_hk_snip = HotkeyRecorderWidget("默认 F1")
+        card_hk_core.add_row("屏幕截图", "框选屏幕区域进行标注、复制、保存或贴图", self.input_hk_snip)
+
+        self.input_hk_ocr = HotkeyRecorderWidget("默认 F2")
+        card_hk_core.add_row("识图与翻译", "选取屏幕文字区域进行 OCR 提取与智能翻译", self.input_hk_ocr)
+
+        self.input_hk_pin = HotkeyRecorderWidget("默认 F3")
+        card_hk_core.add_row("贴图置顶", "将剪贴板内容或所选区域作为悬浮贴图置顶", self.input_hk_pin)
+
+        self.input_hk_rec = HotkeyRecorderWidget("默认 F4")
+        card_hk_core.add_row("屏幕录制", "录制选定区域为 MP4 高清视频或 GIF 动图", self.input_hk_rec)
+        p0_lay.addWidget(card_hk_core)
+
+        lbl_sec_tools = QLabel("效率工具与窗口")
+        lbl_sec_tools.setObjectName("codexSectionLabel")
+        p0_lay.addWidget(lbl_sec_tools)
+
+        card_hk_tools = CodexCard()
+        self.input_hk_drawer = HotkeyRecorderWidget("默认 Ctrl+1")
+        card_hk_tools.add_row("贴图储藏柜总开关", "彻底开启或禁用右侧磁吸贴图收纳抽屉", self.input_hk_drawer)
+
+        self.input_hk_toggle_pins = HotkeyRecorderWidget("默认 Ctrl+Alt+H")
+        card_hk_tools.add_row("隐藏/恢复全部贴图", "临时一键隐藏桌面贴图与抽屉，再次按下全部恢复原位", self.input_hk_toggle_pins)
+
+        self.input_hk_paste_pin = HotkeyRecorderWidget("默认 Ctrl+Alt+V")
+        card_hk_tools.add_row("剪贴板图片直接贴图", "直接把剪贴板最新复制的图片或图片文件置顶贴图", self.input_hk_paste_pin)
+
+        self.input_hk_restore_click_through = HotkeyRecorderWidget("默认 Ctrl+Alt+T")
+        card_hk_tools.add_row("解除贴图鼠标穿透", "一键恢复所有开启鼠标穿透的桌面贴图，防止无法点击关闭", self.input_hk_restore_click_through)
+
+        self.input_hk_win_pin = HotkeyRecorderWidget("点击录制")
+        card_hk_tools.add_row("窗口置顶 (DeskPin)", "将当前鼠标所在应用窗口固定在最前端", self.input_hk_win_pin)
+
+        self.input_hk_scroll = HotkeyRecorderWidget("点击录制")
+        card_hk_tools.add_row("滚动长截图", "自动向下滚动拼接超长网页或文档内容", self.input_hk_scroll)
+
+        self.input_hk_history = HotkeyRecorderWidget("点击录制")
+        card_hk_tools.add_row("截图历史记录", "快速浏览、重新编辑、复制或另存历史截图", self.input_hk_history)
+
+        self.input_hk_settings = HotkeyRecorderWidget("点击录制")
+        card_hk_tools.add_row("打开系统设置", "从后台随时快速唤出设置面板", self.input_hk_settings)
+        p0_lay.addWidget(card_hk_tools)
+        p0_lay.addStretch(1)
+        self.pages.addWidget(p0_scroll)
+
+        # ---------- 页面 1：通用与保存 ----------
+        p1_scroll, p1_lay = self._make_scroll_page()
+
+        lbl_sec_out = QLabel("保存与导出")
+        lbl_sec_out.setObjectName("codexSectionLabel")
+        p1_lay.addWidget(lbl_sec_out)
+
+        card_save = CodexCard()
+        dir_wrap = QWidget()
+        dir_wrap.setObjectName("codexDirWrap")
+        dir_wrap.setStyleSheet("QWidget#codexDirWrap { background: transparent; }")
+        dir_wrap.setFixedWidth(295)
+        dir_box = QHBoxLayout(dir_wrap)
+        dir_box.setContentsMargins(0, 0, 0, 0)
+        dir_box.setSpacing(6)
         self.input_save_dir = QLineEdit()
-        self.input_save_dir.setFixedHeight(32)
         dir_box.addWidget(self.input_save_dir, 1)
         btn_browse_dir = QPushButton("浏览...")
-        btn_browse_dir.setFixedHeight(32)
+        btn_browse_dir.setObjectName("codexSecondaryBtn")
+        btn_browse_dir.setFixedHeight(30)
         btn_browse_dir.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_browse_dir)
         btn_browse_dir.clicked.connect(self._browse_save_dir)
         dir_box.addWidget(btn_browse_dir)
-        save_layout.addLayout(dir_box, 0, 1)
+        card_save.add_row("默认保存目录", "另存与自动备份副本的本地存放文件夹", dir_wrap)
 
-        self.cb_auto_save = QCheckBox("截图/复制时自动在后台静默保存一份副本到该目录")
-        save_layout.addWidget(self.cb_auto_save, 1, 0, 1, 2)
+        self.cb_auto_save = CodexSwitch()
+        card_save.add_row("静默自动保存", "截图或复制完成后，自动在后台保存一份副本到默认目录", self.cb_auto_save)
 
-        save_layout.addWidget(QLabel("默认存储格式:"), 2, 0)
-        self.combo_format = QComboBox()
-        self.combo_format.setFixedHeight(32)
+        self.combo_format = CodexComboBox()
+        self.combo_format.setFixedWidth(185)
         self.combo_format.addItems(["PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)"])
-        save_layout.addWidget(self.combo_format, 2, 1)
+        card_save.add_row("默认输出格式", "自动保存与快捷导出使用的图像编码格式", self.combo_format)
 
-        save_layout.addWidget(QLabel("压缩画质 (JPEG/WebP):"), 3, 0)
-        qual_box = QHBoxLayout()
-        self.slider_quality = QSlider(Qt.Horizontal)
+        qual_wrap = QWidget()
+        qual_wrap.setObjectName("codexQualWrap")
+        qual_wrap.setStyleSheet("QWidget#codexQualWrap { background: transparent; }")
+        qual_wrap.setFixedWidth(215)
+        qual_box = QHBoxLayout(qual_wrap)
+        qual_box.setContentsMargins(0, 0, 0, 0)
+        qual_box.setSpacing(10)
+        self.slider_quality = CodexSlider(Qt.Horizontal)
         self.slider_quality.setRange(70, 100)
         self.slider_quality.setValue(95)
         self.lbl_qual_val = QLabel("95%")
         self.lbl_qual_val.setFixedWidth(40)
+        self.lbl_qual_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_qual_val.setStyleSheet(
+            f"QLabel {{ font-family: {CODEX_MONO_FAMILY}; font-size: 12px; font-weight: 600; color: #0D0D0D; }}"
+        )
         self.slider_quality.valueChanged.connect(lambda v: self.lbl_qual_val.setText(f"{v}%"))
         qual_box.addWidget(self.slider_quality, 1)
         qual_box.addWidget(self.lbl_qual_val)
-        save_layout.addLayout(qual_box, 3, 1)
+        card_save.add_row("有损压缩画质", "应用于 JPEG / WebP 格式输出质量（70% - 100%）", qual_wrap)
+        p1_lay.addWidget(card_save)
 
-        self.cb_show_mode_hints = QCheckBox("显示快捷识图/录屏操作指引条 (支持智能上下避让与拖拽隐藏)")
-        save_layout.addWidget(self.cb_show_mode_hints, 4, 0, 1, 2)
+        lbl_sec_ux = QLabel("工作区交互")
+        lbl_sec_ux.setObjectName("codexSectionLabel")
+        p1_lay.addWidget(lbl_sec_ux)
 
-        self.cb_drawer_hover = QCheckBox("开启贴图储藏柜功能 (可随时按 Ctrl+1 彻底开关此功能，防误唤醒)")
-        save_layout.addWidget(self.cb_drawer_hover, 5, 0, 1, 2)
+        card_ux = CodexCard()
+        self.cb_show_mode_hints = CodexSwitch()
+        card_ux.add_row("快捷操作指引条", "识图或录屏模式显示顶部提示条（支持智能避让与拖拽隐藏）", self.cb_show_mode_hints)
 
-        content_layout.addWidget(save_group)
+        self.cb_drawer_hover = CodexSwitch()
+        card_ux.add_row("开启贴图储藏柜", "在屏幕边缘启用磁吸贴图抽屉，可随时按快捷键彻底开关", self.cb_drawer_hover)
+        p1_lay.addWidget(card_ux)
+        p1_lay.addStretch(1)
+        self.pages.addWidget(p1_scroll)
 
-        # 3. AI 识别与翻译分组 (智谱 GLM-OCR & 火山方舟豆包翻译)
-        ai_group = QGroupBox("🤖 AI 大模型服务 (智谱 GLM-OCR & 火山方舟豆包)")
-        ai_layout = QGridLayout(ai_group)
-        ai_layout.setContentsMargins(14, 16, 14, 14)
-        ai_layout.setSpacing(10)
+        # ---------- 页面 2：AI 与翻译 ----------
+        p2_scroll, p2_lay = self._make_scroll_page()
 
-        # 3.1 智谱 GLM-OCR 识图配置
-        self.cb_ai_ocr = QCheckBox("启用 AI 多模态文字识别 (智谱 GLM-OCR)")
-        self.cb_ai_ocr.setStyleSheet("font-weight: 600; color: #0969da;")
-        ai_layout.addWidget(self.cb_ai_ocr, 0, 0, 1, 2)
+        lbl_sec_zhipu = QLabel("智谱 GLM-OCR 文字识别")
+        lbl_sec_zhipu.setObjectName("codexSectionLabel")
+        p2_lay.addWidget(lbl_sec_zhipu)
 
-        ai_layout.addWidget(QLabel("识图 Token:"), 1, 0)
-        key_box_ocr = QHBoxLayout()
+        card_ocr = CodexCard()
+        self.cb_ai_ocr = CodexSwitch()
+        card_ocr.add_row("启用 AI 多模态识图", "开启后优先使用智谱大模型识别复杂排版、公式与代码片段", self.cb_ai_ocr)
+
+        key_ocr_wrap = QWidget()
+        key_ocr_wrap.setFixedWidth(275)
+        key_box_ocr = QHBoxLayout(key_ocr_wrap)
+        key_box_ocr.setContentsMargins(0, 0, 0, 0)
+        key_box_ocr.setSpacing(6)
         self.input_zhipu_key = QLineEdit()
-        self.input_zhipu_key.setFixedHeight(32)
         self.input_zhipu_key.setEchoMode(QLineEdit.Password)
-        self.input_zhipu_key.setPlaceholderText("输入智谱 AI API Key (bigmodel.cn)...")
+        self.input_zhipu_key.setPlaceholderText("输入智谱 API Key (bigmodel.cn)")
         key_box_ocr.addWidget(self.input_zhipu_key, 1)
-        btn_toggle_zhipu = QPushButton("👁")
-        btn_toggle_zhipu.setFixedSize(32, 32)
+        btn_toggle_zhipu = QPushButton()
+        btn_toggle_zhipu.setObjectName("codexIconBtn")
+        btn_toggle_zhipu.setFixedSize(30, 30)
         btn_toggle_zhipu.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_toggle_zhipu)
+        btn_toggle_zhipu.setIcon(_create_codex_icon("eye", "#52525B", 16))
         def _toggle_zhipu():
-            if self.input_zhipu_key.echoMode() == QLineEdit.Password:
-                self.input_zhipu_key.setEchoMode(QLineEdit.Normal)
-            else:
-                self.input_zhipu_key.setEchoMode(QLineEdit.Password)
+            is_pwd = self.input_zhipu_key.echoMode() == QLineEdit.Password
+            self.input_zhipu_key.setEchoMode(QLineEdit.Normal if is_pwd else QLineEdit.Password)
+            btn_toggle_zhipu.setIcon(_create_codex_icon("eye_off" if is_pwd else "eye", "#0D0D0D" if is_pwd else "#52525B", 16))
         btn_toggle_zhipu.clicked.connect(_toggle_zhipu)
         key_box_ocr.addWidget(btn_toggle_zhipu)
-        ai_layout.addLayout(key_box_ocr, 1, 1)
+        card_ocr.add_row("智谱 API Key", "用于鉴权访问 GLM-OCR 接口（仅保存在本地）", key_ocr_wrap)
 
-        ai_layout.addWidget(QLabel("识图模型:"), 2, 0)
         self.input_ocr_model = QLineEdit()
-        self.input_ocr_model.setFixedHeight(32)
+        self.input_ocr_model.setFixedWidth(240)
         self.input_ocr_model.setPlaceholderText("默认 glm-ocr")
-        ai_layout.addWidget(self.input_ocr_model, 2, 1)
+        card_ocr.add_row("识图模型名称", "填写模型标识，留空则默认使用 glm-ocr", self.input_ocr_model)
+        p2_lay.addWidget(card_ocr)
 
-        # 分割线
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        line.setStyleSheet("color: #d0d7de; margin: 4px 0;")
-        ai_layout.addWidget(line, 3, 0, 1, 2)
+        lbl_sec_volc = QLabel("火山方舟豆包大模型翻译")
+        lbl_sec_volc.setObjectName("codexSectionLabel")
+        p2_lay.addWidget(lbl_sec_volc)
 
-        # 3.2 火山方舟豆包翻译配置
-        self.cb_ai_trans = QCheckBox("启用 AI 智能翻译 (火山引擎豆包)")
-        self.cb_ai_trans.setStyleSheet("font-weight: 600; color: #0969da;")
-        ai_layout.addWidget(self.cb_ai_trans, 4, 0, 1, 2)
+        card_trans = CodexCard()
+        self.cb_ai_trans = CodexSwitch()
+        card_trans.add_row("启用 AI 智能翻译", "利用豆包大模型结合语境精准翻译截屏文字与图片文本", self.cb_ai_trans)
 
-        ai_layout.addWidget(QLabel("翻译 Token:"), 5, 0)
-        key_box_trans = QHBoxLayout()
+        key_trans_wrap = QWidget()
+        key_trans_wrap.setFixedWidth(275)
+        key_box_trans = QHBoxLayout(key_trans_wrap)
+        key_box_trans.setContentsMargins(0, 0, 0, 0)
+        key_box_trans.setSpacing(6)
         self.input_volc_key = QLineEdit()
-        self.input_volc_key.setFixedHeight(32)
         self.input_volc_key.setEchoMode(QLineEdit.Password)
-        self.input_volc_key.setPlaceholderText("输入火山方舟 API Key (ARK_API_KEY)...")
+        self.input_volc_key.setPlaceholderText("输入火山方舟 ARK_API_KEY")
         key_box_trans.addWidget(self.input_volc_key, 1)
-        btn_toggle_volc = QPushButton("👁")
-        btn_toggle_volc.setFixedSize(32, 32)
+        btn_toggle_volc = QPushButton()
+        btn_toggle_volc.setObjectName("codexIconBtn")
+        btn_toggle_volc.setFixedSize(30, 30)
         btn_toggle_volc.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_toggle_volc)
+        btn_toggle_volc.setIcon(_create_codex_icon("eye", "#52525B", 16))
         def _toggle_volc():
-            if self.input_volc_key.echoMode() == QLineEdit.Password:
-                self.input_volc_key.setEchoMode(QLineEdit.Normal)
-            else:
-                self.input_volc_key.setEchoMode(QLineEdit.Password)
+            is_pwd = self.input_volc_key.echoMode() == QLineEdit.Password
+            self.input_volc_key.setEchoMode(QLineEdit.Normal if is_pwd else QLineEdit.Password)
+            btn_toggle_volc.setIcon(_create_codex_icon("eye_off" if is_pwd else "eye", "#0D0D0D" if is_pwd else "#52525B", 16))
         btn_toggle_volc.clicked.connect(_toggle_volc)
         key_box_trans.addWidget(btn_toggle_volc)
-        ai_layout.addLayout(key_box_trans, 5, 1)
+        card_trans.add_row("火山方舟 API Key", "ARK_API_KEY 密钥凭证（仅保存在本地）", key_trans_wrap)
 
-        ai_layout.addWidget(QLabel("翻译接入点:"), 6, 0)
         self.input_volc_model = QLineEdit()
-        self.input_volc_model.setFixedHeight(32)
-        self.input_volc_model.setPlaceholderText("例如: ep-20260629102203-cfllm")
-        ai_layout.addWidget(self.input_volc_model, 6, 1)
+        self.input_volc_model.setFixedWidth(240)
+        self.input_volc_model.setPlaceholderText("例如 ep-20260629102203-cfllm")
+        card_trans.add_row("推理接入点 ID", "火山引擎方舟控制台创建的应用 Endpoint ID", self.input_volc_model)
 
-        ai_layout.addWidget(QLabel("结果展示:"), 7, 0)
-        self.combo_trans_display = QComboBox()
-        self.combo_trans_display.setFixedHeight(32)
-        self.combo_trans_display.addItem("双栏对照（左原图 / 右译文图）", "dialog")
-        self.combo_trans_display.addItem("译文图（单图显示）", "overlay")
-        ai_layout.addWidget(self.combo_trans_display, 7, 1)
+        self.combo_trans_display = CodexComboBox()
+        self.combo_trans_display.setFixedWidth(220)
+        self.combo_trans_display.addItem("双栏对照（原图 / 译文）", "dialog")
+        self.combo_trans_display.addItem("单图覆盖（直接看译文）", "overlay")
+        card_trans.add_row("翻译结果视图", "一键识图翻译完成后的默认结果展示模式", self.combo_trans_display)
+        p2_lay.addWidget(card_trans)
+        p2_lay.addStretch(1)
+        self.pages.addWidget(p2_scroll)
 
-        content_layout.addWidget(ai_group)
+        # ---------- 页面 3：软件更新 ----------
+        p3_scroll, p3_lay = self._make_scroll_page()
 
-        # 4. 软件更新分组
-        update_group = QGroupBox("🔄 软件更新")
-        up_layout = QGridLayout(update_group)
-        up_layout.setContentsMargins(14, 16, 14, 14)
-        up_layout.setSpacing(10)
-        up_layout.addWidget(QLabel(f"当前版本：v{APP_VERSION}"), 0, 0, 1, 2)
-        self.cb_auto_update = QCheckBox("启动时自动检查更新（每 24 小时最多一次）")
-        self.cb_auto_update.setChecked(True)
-        up_layout.addWidget(self.cb_auto_update, 1, 0, 1, 2)
-        up_hint = QLabel("发现新版本后会提示更新说明，可一键下载并自动替换重启。")
-        up_hint.setStyleSheet("color: #64748b; font-size: 12px;")
-        up_hint.setWordWrap(True)
-        up_layout.addWidget(up_hint, 2, 0, 1, 2)
-        up_btn_row = QHBoxLayout()
-        btn_check_update = QPushButton("立即检查更新")
-        btn_check_update.setFixedHeight(32)
+        lbl_sec_up = QLabel("版本与更新通道")
+        lbl_sec_up.setObjectName("codexSectionLabel")
+        p3_lay.addWidget(lbl_sec_up)
+
+        card_up = CodexCard()
+        ver_pill = QLabel(f"v{APP_VERSION}")
+        ver_pill.setObjectName("codexVerPill")
+        ver_pill.setStyleSheet(f"""
+            QLabel#codexVerPill {{
+                background: #F4F4F5;
+                border: 1px solid #E4E4E7;
+                border-radius: 6px;
+                padding: 3px 10px;
+                font-family: {CODEX_MONO_FAMILY};
+                font-size: 12px;
+                font-weight: 600;
+                color: #0D0D0D;
+            }}
+        """)
+        card_up.add_row("当前运行版本", "Murioki Capture 桌面版核心程序", ver_pill)
+
+        self.cb_auto_update = CodexSwitch()
+        card_up.add_row("启动时自动检查更新", "后台静默检索 GitHub Releases（每 24 小时最多检查一次）", self.cb_auto_update)
+
+        up_btns_wrap = QWidget()
+        up_btns_wrap.setObjectName("codexUpBtns")
+        up_btns_wrap.setStyleSheet("QWidget#codexUpBtns { background: transparent; }")
+        up_btn_row = QHBoxLayout(up_btns_wrap)
+        up_btn_row.setContentsMargins(0, 0, 0, 0)
+        up_btn_row.setSpacing(8)
+        btn_check_update = QPushButton("检查更新")
+        btn_check_update.setObjectName("codexPrimaryBtn")
+        btn_check_update.setFixedHeight(30)
         btn_check_update.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_check_update, active=True)
         btn_check_update.clicked.connect(self._check_updates_from_settings)
         up_btn_row.addWidget(btn_check_update)
-        btn_release_page = QPushButton("打开发布页")
-        btn_release_page.setFixedHeight(32)
+
+        btn_release_page = QPushButton("GitHub 发布页")
+        btn_release_page.setObjectName("codexSecondaryBtn")
+        btn_release_page.setFixedHeight(30)
         btn_release_page.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_release_page)
         btn_release_page.clicked.connect(lambda: webbrowser.open(GITHUB_RELEASES_PAGE))
         up_btn_row.addWidget(btn_release_page)
-        up_btn_row.addStretch()
-        up_layout.addLayout(up_btn_row, 3, 0, 1, 2)
+        card_up.add_row("手动检查更新", "发现新版后支持直接查看发行说明并一键下载自动替换重启", up_btns_wrap)
+        p3_lay.addWidget(card_up)
+        p3_lay.addStretch(1)
+        self.pages.addWidget(p3_scroll)
 
-        content_layout.addWidget(update_group)
-        content_layout.addStretch(1)
+        # ==========================================
+        # 底部固定操作栏
+        # ==========================================
+        footer = QWidget()
+        footer.setObjectName("codexFooter")
+        foot_lay = QHBoxLayout(footer)
+        foot_lay.setContentsMargins(26, 12, 26, 12)
+        foot_lay.setSpacing(10)
 
-        scroll_area.setWidget(content_widget)
-        main_layout.addWidget(scroll_area, 1)
+        foot_hint = QLabel("点击「保存并应用」后，热键与面板配置将立即生效")
+        foot_hint.setStyleSheet("font-size: 11.5px; color: #8E8EA0; background: transparent;")
+        foot_lay.addWidget(foot_hint)
+        foot_lay.addStretch(1)
 
-        # 底部按钮栏
-        btn_bar = QHBoxLayout()
-        btn_bar.setContentsMargins(4, 6, 4, 0)
-        btn_bar.setSpacing(10)
-        btn_bar.addStretch()
-
-        btn_save = QPushButton("💾 保存并应用")
-        btn_save.setFixedHeight(36)
-        btn_save.setMinimumWidth(110)
-        btn_save.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_save, active=True)
-        btn_save.clicked.connect(self.save_and_apply)
-        btn_bar.addWidget(btn_save)
-
-        btn_cancel = QPushButton("✕ 取消")
-        btn_cancel.setFixedHeight(36)
-        btn_cancel.setMinimumWidth(80)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("codexSecondaryBtn")
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.setMinimumWidth(78)
         btn_cancel.setCursor(Qt.PointingHandCursor)
-        apply_button_style(btn_cancel)
         btn_cancel.clicked.connect(self.close)
-        btn_bar.addWidget(btn_cancel)
+        foot_lay.addWidget(btn_cancel)
 
-        main_layout.addLayout(btn_bar)
+        btn_save = QPushButton("保存并应用")
+        btn_save.setObjectName("codexPrimaryBtn")
+        btn_save.setFixedHeight(34)
+        btn_save.setMinimumWidth(108)
+        btn_save.setCursor(Qt.PointingHandCursor)
+        btn_save.clicked.connect(self.save_and_apply)
+        foot_lay.addWidget(btn_save)
+
+        pane_lay.addWidget(footer)
+        root_layout.addWidget(main_pane, 1)
 
         self._load_current_values()
+
+    def _make_scroll_page(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.viewport().setObjectName("codexViewport")
+        scroll.viewport().setStyleSheet("QWidget#codexViewport { background: transparent; }")
+        inner = QWidget()
+        inner.setObjectName("codexPageInner")
+        inner.setStyleSheet("QWidget#codexPageInner { background: transparent; }")
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(26, 18, 26, 20)
+        lay.setSpacing(12)
+        scroll.setWidget(inner)
+        return scroll, lay
+
+    def _switch_page(self, index):
+        if 0 <= index < len(self._nav_specs):
+            self.pages.setCurrentIndex(index)
+            _, _, title, desc, show_reset = self._nav_specs[index]
+            self.lbl_page_title.setText(title)
+            self.lbl_page_desc.setText(desc)
+            self.btn_reset_hk.setVisible(show_reset)
+            for idx, (btn, icon_key) in enumerate(self._nav_buttons):
+                btn.setIcon(_create_codex_icon(icon_key, "#0D0D0D" if idx == index else "#52525B", 16))
 
     def _load_current_values(self):
         s = load_settings()
@@ -7907,12 +10533,16 @@ class SettingsDialog(QDialog):
         self.input_hk_history.setText(s.get("hotkey_history", ""))
         self.input_hk_settings.setText(s.get("hotkey_settings", ""))
         self.input_hk_drawer.setText(s.get("hotkey_drawer", "Ctrl+1"))
+        self.input_hk_toggle_pins.setText(s.get("hotkey_toggle_pins", "Ctrl+Alt+H"))
+        self.input_hk_paste_pin.setText(s.get("hotkey_paste_pin", "Ctrl+Alt+V"))
+        self.input_hk_restore_click_through.setText(s.get("hotkey_restore_click_through", "Ctrl+Alt+T"))
 
         self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
-        self.cb_auto_save.setChecked(s.get("auto_save_enabled", False))
-        self.cb_show_mode_hints.setChecked(s.get("show_mode_hints", True))
-        self.cb_drawer_hover.setChecked(s.get("drawer_hover_enabled", True))
-        self.cb_auto_update.setChecked(s.get("auto_check_update", True))
+        self.input_save_dir.setCursorPosition(0)
+        self.cb_auto_save.setChecked(bool(s.get("auto_save_enabled", False)))
+        self.cb_show_mode_hints.setChecked(bool(s.get("show_mode_hints", True)))
+        self.cb_drawer_hover.setChecked(bool(s.get("drawer_hover_enabled", True)))
+        self.cb_auto_update.setChecked(bool(s.get("auto_check_update", True)))
 
         fmt = s.get("save_format", "png").lower()
         if "jp" in fmt: self.combo_format.setCurrentIndex(1)
@@ -7925,11 +10555,11 @@ class SettingsDialog(QDialog):
 
         self.input_zhipu_key.setText(s.get("zhipu_api_key", ""))
         self.input_ocr_model.setText(s.get("glm_ocr_model", DEFAULT_ZHIPU_OCR_MODEL))
-        self.cb_ai_ocr.setChecked(s.get("use_ai_ocr", False))
+        self.cb_ai_ocr.setChecked(bool(s.get("use_ai_ocr", False)))
 
         self.input_volc_key.setText(s.get("volc_api_key", ""))
         self.input_volc_model.setText(s.get("volc_model", DEFAULT_VOLC_TRANS_MODEL))
-        self.cb_ai_trans.setChecked(s.get("use_ai_translation", False))
+        self.cb_ai_trans.setChecked(bool(s.get("use_ai_translation", False)))
 
         display_mode = str(s.get("translation_display_mode", "dialog") or "dialog")
         idx_display = self.combo_trans_display.findData(display_mode)
@@ -7946,18 +10576,24 @@ class SettingsDialog(QDialog):
         self.input_hk_history.setText("")
         self.input_hk_settings.setText("")
         self.input_hk_drawer.setText("Ctrl+1")
+        self.input_hk_toggle_pins.setText("Ctrl+Alt+H")
+        self.input_hk_paste_pin.setText("Ctrl+Alt+V")
+        self.input_hk_restore_click_through.setText("Ctrl+Alt+T")
 
     def _browse_save_dir(self):
         chosen = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.input_save_dir.text())
         if chosen:
             self.input_save_dir.setText(chosen)
+            self.input_save_dir.setCursorPosition(0)
 
     def _check_updates_from_settings(self):
         save_settings({"auto_check_update": self.cb_auto_update.isChecked()})
-        parent = self.parent()
+        main_app = self.parent()
+        if main_app is not None and not hasattr(main_app, "check_for_updates") and hasattr(main_app, "main_app_ref"):
+            main_app = main_app.main_app_ref
         self.accept()
-        if parent is not None and hasattr(parent, "check_for_updates"):
-            QTimer.singleShot(150, lambda: parent.check_for_updates(manual=True))
+        if main_app is not None and hasattr(main_app, "check_for_updates"):
+            QTimer.singleShot(150, lambda: main_app.check_for_updates(manual=True))
 
     def save_and_apply(self):
         fmt_idx = self.combo_format.currentIndex()
@@ -7973,6 +10609,9 @@ class SettingsDialog(QDialog):
             "hotkey_history": self.input_hk_history.text().strip(),
             "hotkey_settings": self.input_hk_settings.text().strip(),
             "hotkey_drawer": self.input_hk_drawer.text().strip() or "Ctrl+1",
+            "hotkey_toggle_pins": self.input_hk_toggle_pins.text().strip(),
+            "hotkey_paste_pin": self.input_hk_paste_pin.text().strip(),
+            "hotkey_restore_click_through": self.input_hk_restore_click_through.text().strip() or "Ctrl+Alt+T",
             "default_save_dir": self.input_save_dir.text().strip(),
             "auto_save_enabled": self.cb_auto_save.isChecked(),
             "show_mode_hints": self.cb_show_mode_hints.isChecked(),
@@ -7989,8 +10628,11 @@ class SettingsDialog(QDialog):
             "auto_check_update": self.cb_auto_update.isChecked(),
         }
         save_settings(new_settings)
-        if hasattr(self.parent(), "pin_drawer") and self.parent().pin_drawer:
-            self.parent().pin_drawer.set_feature_enabled(self.cb_drawer_hover.isChecked())
+        main_app = self.parent()
+        if main_app is not None and not hasattr(main_app, "pin_drawer") and hasattr(main_app, "main_app_ref"):
+            main_app = main_app.main_app_ref
+        if main_app is not None and hasattr(main_app, "pin_drawer") and main_app.pin_drawer:
+            main_app.pin_drawer.set_feature_enabled(self.cb_drawer_hover.isChecked())
         if self.hotkey_mgr:
             self.hotkey_mgr.reload_hotkeys()
         QMessageBox.information(self, "设置已保存", "偏好设置已成功保存并立即生效！")
@@ -8009,7 +10651,7 @@ class CaptureFrame(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setPen(QPen(QColor(0, 174, 255), 3))
+        painter.setPen(QPen(QColor(204, 153, 68), 3))
         painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
 
@@ -8346,7 +10988,7 @@ class RecordBorderFrame(QWidget):
         painter.drawLine(w - 1, h - 1, w - 1, h - 1 - corner_len)
 
 
-class RecordingToolbar(QWidget):
+class RecordingToolbar(FrostedBarWidget):
     start_requested = pyqtSignal()
     stop_requested = pyqtSignal()
     pause_toggled = pyqtSignal(bool)
@@ -8355,94 +10997,142 @@ class RecordingToolbar(QWidget):
 
     def __init__(self, rect, default_quality='original', parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.target_rect = rect
         self.is_recording = False
         self.is_paused = False
         self.drag_position = None
 
-        self.setStyleSheet("""
-            QWidget#recToolbar {
-                background-color: #ffffff;
-                border: 1px solid #d0d7de;
-                border-radius: 10px;
-            }
-            QLabel {
-                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+        self.setStyleSheet(f"""
+            QWidget#recToolbar {{
+                background: transparent;
+                font-family: {CODEX_FONT_FAMILY};
+            }}
+            QLabel {{
                 font-size: 12px;
-                color: #24292f;
-            }
-            QComboBox {
-                background: #f6f8fa;
-                color: #24292f;
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-                padding: 3px 8px;
-                font-size: 11px;
-            }
-            QComboBox::drop-down {
+                color: #0F172A;
+                background: transparent;
+            }}
+            QComboBox {{
+                background: rgba(255, 255, 255, 0.72);
+                color: #0F172A;
+                border: 1px solid rgba(15, 23, 42, 0.14);
+                border-radius: 7px;
+                padding: 4px 8px 4px 10px;
+                font-size: 11.5px;
+                min-height: 18px;
+            }}
+            QComboBox:hover {{
+                border-color: rgba(182, 134, 58, 0.55);
+                background: rgba(255, 255, 255, 0.90);
+            }}
+            QComboBox::drop-down {{
                 border: none;
-            }
-            QComboBox QAbstractItemView {
-                background: #ffffff;
-                color: #24292f;
-                selection-background-color: #0969da;
-                selection-color: #ffffff;
-                border: 1px solid #d0d7de;
-            }
+                width: 22px;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                width: 0px;
+                height: 0px;
+                border: none;
+            }}
+            QComboBox QAbstractItemView {{
+                background: rgba(255, 255, 255, 0.96);
+                color: #1D1D1F;
+                border: 1px solid rgba(28, 28, 30, 0.14);
+                border-radius: 7px;
+                selection-background-color: #FAF1DE;
+                selection-color: #1D1D1F;
+            }}
+            QPushButton#recSecondary {{
+                background: rgba(255, 255, 255, 0.72);
+                color: #0F172A;
+                border: 1px solid rgba(15, 23, 42, 0.14);
+                border-radius: 7px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QPushButton#recSecondary:hover {{
+                background: rgba(255, 255, 255, 0.92);
+                border-color: rgba(15, 23, 42, 0.24);
+            }}
+            QPushButton#recSecondary:disabled {{
+                color: rgba(100, 116, 139, 0.65);
+                border-color: rgba(15, 23, 42, 0.08);
+                background: rgba(255, 255, 255, 0.42);
+            }}
+            QPushButton#recDanger {{
+                background: rgba(255, 255, 255, 0.72);
+                color: #DC2626;
+                border: 1px solid rgba(239, 68, 68, 0.30);
+                border-radius: 7px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QPushButton#recDanger:hover {{
+                background: rgba(254, 242, 242, 0.92);
+                border-color: rgba(239, 68, 68, 0.55);
+            }}
         """)
         self.setObjectName("recToolbar")
-        add_drop_shadow(self, blur=18, y_offset=4, alpha=40)
 
+        pad = self.SHADOW_PAD
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setContentsMargins(pad + 12, pad + 7, pad + 12, pad + 7)
         layout.setSpacing(8)
 
         # 录制状态指示红点
         self.dot_label = QLabel("●")
-        self.dot_label.setStyleSheet("color: #ef4444; font-size: 16px; font-weight: bold;")
+        self.dot_label.setStyleSheet("color: #EF4444; font-size: 13px; font-weight: bold;")
         layout.addWidget(self.dot_label)
 
         # 录制时间显示
         self.time_label = QLabel("00:00")
-        self.time_label.setStyleSheet("font-family: 'Consolas', 'Segoe UI'; font-size: 13px; font-weight: bold; color: #cf222e; min-width: 44px;")
+        self.time_label.setStyleSheet(f"font-family: {CODEX_MONO_FAMILY}; font-size: 13px; font-weight: 700; color: #0F172A; min-width: 44px;")
         layout.addWidget(self.time_label)
 
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.VLine)
-        sep1.setStyleSheet("color: #d0d7de;")
+        sep1.setFixedHeight(16)
+        sep1.setStyleSheet("background-color: rgba(15, 23, 42, 0.14); max-width: 1px; border: none;")
         layout.addWidget(sep1)
 
         # 尺寸显示
         self.size_label = QLabel(f"{rect.width()} × {rect.height()}")
-        self.size_label.setStyleSheet("font-family: 'Consolas', 'Segoe UI'; font-size: 11px; color: #57606a;")
+        self.size_label.setStyleSheet(f"font-family: {CODEX_MONO_FAMILY}; font-size: 11.5px; color: #475569;")
         layout.addWidget(self.size_label)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.VLine)
-        sep2.setStyleSheet("color: #d0d7de;")
+        sep2.setFixedHeight(16)
+        sep2.setStyleSheet("background-color: rgba(15, 23, 42, 0.14); max-width: 1px; border: none;")
         layout.addWidget(sep2)
 
         # 画质预设下拉框（支持 60FPS 极速高刷与 30FPS 均衡预设）
-        self.combo_quality = QComboBox()
-        self.combo_quality.addItem("⚡ 原画 60FPS (100%)", "p60")
-        self.combo_quality.addItem("🎬 原画 30FPS (100%)", "p30")
-        self.combo_quality.addItem("📺 高清 60FPS (75%)", "high60")
-        self.combo_quality.addItem("📺 高清 30FPS (75%)", "high30")
-        self.combo_quality.addItem("📦 标清 30FPS (50%)", "standard")
+        self.combo_quality = CodexComboBox()
+        self.combo_quality.addItem("原画 60FPS (100%)", "p60")
+        self.combo_quality.addItem("原画 30FPS (100%)", "p30")
+        self.combo_quality.addItem("高清 60FPS (75%)", "high60")
+        self.combo_quality.addItem("高清 30FPS (75%)", "high30")
+        self.combo_quality.addItem("标清 30FPS (50%)", "standard")
         found_idx = 0
         for i in range(self.combo_quality.count()):
             if self.combo_quality.itemData(i) == default_quality:
                 found_idx = i
                 break
         self.combo_quality.setCurrentIndex(found_idx)
+        self.combo_quality.ensurePolished()
+        self.combo_quality.setMinimumWidth(max(158, self.combo_quality.sizeHint().width() + 22))
         self.combo_quality.currentIndexChanged.connect(self._on_quality_index_changed)
         layout.addWidget(self.combo_quality)
 
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.VLine)
-        sep3.setStyleSheet("color: #d0d7de;")
+        sep3.setFixedHeight(16)
+        sep3.setStyleSheet("background-color: rgba(15, 23, 42, 0.14); max-width: 1px; border: none;")
         layout.addWidget(sep3)
 
         # 开始/完成录制按钮
@@ -8450,54 +11140,62 @@ class RecordingToolbar(QWidget):
         self.btn_rec.setCursor(Qt.PointingHandCursor)
         self.btn_rec.setStyleSheet("""
             QPushButton {
-                background: #1f883d;
-                color: #ffffff;
+                background: #0F172A;
+                color: #FFFFFF;
                 border: none;
-                border-radius: 6px;
-                padding: 4px 10px;
+                border-radius: 7px;
+                padding: 5px 12px;
                 font-weight: 600;
                 font-size: 12px;
             }
-            QPushButton:hover { background: #1a7f37; }
+            QPushButton:hover { background: #1E293B; }
         """)
         self.btn_rec.clicked.connect(self._toggle_recording)
         layout.addWidget(self.btn_rec)
 
         # 暂停/继续按钮
-        self.btn_pause = QPushButton("⏸ 暂停")
+        self.btn_pause = QPushButton("暂停")
+        self.btn_pause.setObjectName("recSecondary")
         self.btn_pause.setCursor(Qt.PointingHandCursor)
-        apply_button_style(self.btn_pause)
         self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self._toggle_pause)
         layout.addWidget(self.btn_pause)
 
         # 取消按钮
-        self.btn_cancel = QPushButton("✕ 取消")
+        self.btn_cancel = QPushButton("取消 (Esc)")
+        self.btn_cancel.setObjectName("recDanger")
         self.btn_cancel.setCursor(Qt.PointingHandCursor)
-        apply_button_style(self.btn_cancel, danger=True)
+        self.btn_cancel.setToolTip("退出/取消录制 (快捷键 Esc)")
         self.btn_cancel.clicked.connect(self.cancel_requested.emit)
         layout.addWidget(self.btn_cancel)
 
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self._esc_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._esc_shortcut.activated.connect(self.cancel_requested.emit)
+
         self.adjustSize()
         self._position_toolbar()
-        self.show()
 
-        # 对控制栏同样设置 WDA_EXCLUDEFROMCAPTURE，确保控制条即使在录制区域内也绝不录进视频
+        # 先设置 WDA_EXCLUDEFROMCAPTURE，使毛玻璃采样与视频录制均不拍入控制栏本身
         try:
             ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11)
         except Exception:
             pass
 
+        self.show()
+        self.update_frosted_bg()
+
     def _position_toolbar(self):
         screen_geo = QApplication.primaryScreen().geometry()
         w = self.width()
         h = self.height()
+        pad = self.SHADOW_PAD
         x = self.target_rect.center().x() - w // 2
-        y = self.target_rect.bottom() + 10
-        if y + h > screen_geo.bottom() - 10:
-            y = self.target_rect.top() - h - 10
-        x = max(10, min(x, screen_geo.right() - w - 10))
-        y = max(10, min(y, screen_geo.bottom() - h - 10))
+        y = self.target_rect.bottom() + 10 - pad
+        if y + h > screen_geo.bottom() - 10 + pad:
+            y = self.target_rect.top() - h - 10 + pad
+        x = max(10 - pad, min(x, screen_geo.right() - w - 10 + pad))
+        y = max(10 - pad, min(y, screen_geo.bottom() - h - 10 + pad))
         self.move(x, y)
 
     def mousePressEvent(self, event):
@@ -8507,6 +11205,13 @@ class RecordingToolbar(QWidget):
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton and self.drag_position:
             self.move(event.globalPos() - self.drag_position)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.cancel_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _on_quality_index_changed(self):
         key = self.combo_quality.currentData()
@@ -8521,7 +11226,7 @@ class RecordingToolbar(QWidget):
 
     def _toggle_pause(self):
         self.is_paused = not self.is_paused
-        self.btn_pause.setText("▶ 继续" if self.is_paused else "⏸ 暂停")
+        self.btn_pause.setText("继续" if self.is_paused else "暂停")
         self.pause_toggled.emit(self.is_paused)
 
     def set_recording_state(self, recording):
@@ -8529,32 +11234,32 @@ class RecordingToolbar(QWidget):
         self.combo_quality.setEnabled(not recording)
         self.btn_pause.setEnabled(recording)
         if recording:
-            self.btn_rec.setText("■ 完成录制")
+            self.btn_rec.setText("■ 停止录制")
             self.btn_rec.setStyleSheet("""
                 QPushButton {
-                    background: #cf222e;
-                    color: #ffffff;
+                    background: #DC2626;
+                    color: #FFFFFF;
                     border: none;
-                    border-radius: 6px;
-                    padding: 4px 10px;
+                    border-radius: 7px;
+                    padding: 5px 12px;
                     font-weight: 600;
                     font-size: 12px;
                 }
-                QPushButton:hover { background: #a40e26; }
+                QPushButton:hover { background: #B91C1C; }
             """)
         else:
             self.btn_rec.setText("● 开始录制")
             self.btn_rec.setStyleSheet("""
                 QPushButton {
-                    background: #1f883d;
-                    color: #ffffff;
+                    background: #0F172A;
+                    color: #FFFFFF;
                     border: none;
-                    border-radius: 6px;
-                    padding: 4px 10px;
+                    border-radius: 7px;
+                    padding: 5px 12px;
                     font-weight: 600;
                     font-size: 12px;
                 }
-                QPushButton:hover { background: #1a7f37; }
+                QPushButton:hover { background: #1E293B; }
             """)
 
     def update_timer(self, elapsed_seconds):
@@ -8575,57 +11280,38 @@ class RecordingExportDialog(QDialog):
         self.fps = info.get('fps', 30.0) or 30.0
         self.is_playing = False
 
-        self.setWindowTitle("🎥 屏幕录制完成 - 导出预览")
+        self.setWindowTitle("屏幕录制 - 导出预览")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(680, 560)
+        self.resize(720, 600)
+        self.setMinimumSize(620, 500)
         self.setAttribute(Qt.WA_StyledBackground, True)
 
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #ffffff;
-                color: #24292f;
-                font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-            }
-            QLabel {
-                color: #24292f;
-                font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+        self.setStyleSheet(CODEX_DIALOG_BASE_QSS + f"""
+            QWidget#recBody {{
+                background-color: #FCFCFD;
+            }}
+            QLabel#recPreviewStage {{
+                background-color: #18181B;
+                color: #A1A1AA;
+                border: 1px solid #27272A;
+                border-radius: 10px;
+                font-size: 13px;
+            }}
+            QLabel#recTimeLabel {{
+                font-family: {CODEX_MONO_FAMILY};
+                font-size: 11.5px;
+                color: #71717A;
+            }}
+            QLabel#recOptLabel {{
                 font-size: 12px;
-            }
-            QFrame#cardFrame {
-                background-color: #f6f8fa;
-                border: 1px solid #d0d7de;
-                border-radius: 8px;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #d0d7de;
-                height: 6px;
-                background: #eaeef2;
-                border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #0969da;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #ffffff;
-                border: 2px solid #0969da;
-                width: 14px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 7px;
-            }
+                color: #52525B;
+                font-weight: 400;
+            }}
         """)
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
-
-        # 1. 顶部概要信息卡片
-        info_card = QFrame()
-        info_card.setObjectName("cardFrame")
-        card_layout = QHBoxLayout(info_card)
-        card_layout.setContentsMargins(12, 8, 12, 8)
-        card_layout.setSpacing(16)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         sec = int(info.get('duration', 0))
         dur_str = f"{sec // 60:02d}:{sec % 60:02d}"
@@ -8635,132 +11321,150 @@ class RecordingExportDialog(QDialog):
         else:
             size_str = f"{file_size_bytes / 1024:.1f} KB"
 
-        lbl_dur = QLabel(f"⏱ <b>时长:</b> {dur_str}")
-        lbl_res = QLabel(f"📐 <b>分辨率:</b> {info.get('width', 0)} × {info.get('height', 0)}")
-        lbl_frames = QLabel(f"🎞 <b>总帧数:</b> {info.get('frame_count', 0)} 帧 ({int(self.fps)}fps)")
-        lbl_quality = QLabel(f"💎 <b>画质:</b> {info.get('quality_name', '原画')}")
-        lbl_size = QLabel(f"📦 <b>大小:</b> {size_str}")
+        # 1. 顶部 Codex 摘要栏
+        top_w = QWidget()
+        top_w.setObjectName("codexTopBar")
+        top_lay = QVBoxLayout(top_w)
+        top_lay.setContentsMargins(20, 14, 20, 12)
+        top_lay.setSpacing(8)
 
-        for lbl in [lbl_dur, lbl_res, lbl_frames, lbl_quality, lbl_size]:
-            card_layout.addWidget(lbl)
+        head_row = QHBoxLayout()
+        head_row.setSpacing(10)
+        ico = QLabel()
+        ico.setPixmap(VectorIconFactory.create_pixmap("record", QColor("#0D0D0D")).scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        ico.setFixedSize(18, 18)
+        head_row.addWidget(ico)
 
-        main_layout.addWidget(info_card)
+        title = QLabel("屏幕录制完成")
+        title.setObjectName("codexTitle")
+        head_row.addWidget(title)
+        head_row.addStretch()
 
-        # 2. 视频预览显示区
+        pills_row = QHBoxLayout()
+        pills_row.setSpacing(8)
+        for text in [
+            f"时长 {dur_str}",
+            f"{info.get('width', 0)} × {info.get('height', 0)}",
+            f"{info.get('frame_count', 0)} 帧 · {int(self.fps)} fps",
+            f"画质：{info.get('quality_name', '原画')}",
+            size_str,
+        ]:
+            pill = QLabel(text)
+            pill.setObjectName("codexPill")
+            pills_row.addWidget(pill)
+        pills_row.addStretch()
+
+        top_lay.addLayout(head_row)
+        top_lay.addLayout(pills_row)
+        main_layout.addWidget(top_w)
+
+        # 2. 主预览与播放控制区
+        body_w = QWidget()
+        body_w.setObjectName("recBody")
+        body_lay = QVBoxLayout(body_w)
+        body_lay.setContentsMargins(20, 16, 20, 16)
+        body_lay.setSpacing(12)
+
         self.preview_label = QLabel()
+        self.preview_label.setObjectName("recPreviewStage")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet("background-color: #0d1117; border-radius: 8px; border: 1px solid #d0d7de;")
         self.preview_label.setMinimumHeight(300)
-        main_layout.addWidget(self.preview_label, 1)
+        body_lay.addWidget(self.preview_label, 1)
 
-        # 3. 播放控制条 (播放/暂停、进度滑块、当前时间)
+        # 播放控制条
         ctrl_layout = QHBoxLayout()
-        ctrl_layout.setSpacing(8)
+        ctrl_layout.setSpacing(10)
 
         self.btn_play = QPushButton("▶ 播放")
-        self.btn_play.setFixedWidth(70)
+        self.btn_play.setObjectName("codexSecondaryBtn")
+        self.btn_play.setFixedWidth(78)
         self.btn_play.setCursor(Qt.PointingHandCursor)
-        apply_button_style(self.btn_play)
         self.btn_play.clicked.connect(self.toggle_play)
         ctrl_layout.addWidget(self.btn_play)
 
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setCursor(Qt.PointingHandCursor)
+        self.slider = CodexSlider(Qt.Horizontal)
         self.slider.sliderMoved.connect(self.on_slider_moved)
-        ctrl_layout.addWidget(self.slider)
+        ctrl_layout.addWidget(self.slider, 1)
 
         self.time_lbl = QLabel(f"00:00 / {dur_str}")
-        self.time_lbl.setStyleSheet("font-family: 'Consolas', 'Segoe UI'; font-size: 11px; color: #57606a;")
+        self.time_lbl.setObjectName("recTimeLabel")
         ctrl_layout.addWidget(self.time_lbl)
 
-        main_layout.addLayout(ctrl_layout)
+        body_lay.addLayout(ctrl_layout)
 
-        # 4. GIF 导出参数面板
-        gif_opt_layout = QHBoxLayout()
+        # GIF 导出参数卡片
+        gif_card = QFrame()
+        gif_card.setObjectName("codexCard")
+        gif_opt_layout = QHBoxLayout(gif_card)
+        gif_opt_layout.setContentsMargins(14, 10, 14, 10)
         gif_opt_layout.setSpacing(10)
-        gif_opt_layout.addWidget(QLabel("<b>GIF 导出选项:</b>"))
-        gif_opt_layout.addWidget(QLabel("帧率:"))
-        self.combo_gif_fps = QComboBox()
+
+        lbl_gif_title = QLabel("GIF 导出参数")
+        lbl_gif_title.setStyleSheet("font-size: 12.5px; font-weight: 600; color: #0D0D0D; background: transparent;")
+        gif_opt_layout.addWidget(lbl_gif_title)
+        gif_opt_layout.addSpacing(8)
+
+        lbl_fps = QLabel("帧率")
+        lbl_fps.setObjectName("recOptLabel")
+        gif_opt_layout.addWidget(lbl_fps)
+        self.combo_gif_fps = CodexComboBox()
         self.combo_gif_fps.addItems(["5 FPS", "10 FPS", "15 FPS", "20 FPS"])
         self.combo_gif_fps.setCurrentIndex(1)
+        self.combo_gif_fps.setMinimumWidth(96)
         gif_opt_layout.addWidget(self.combo_gif_fps)
 
-        gif_opt_layout.addWidget(QLabel("尺寸:"))
-        self.combo_gif_scale = QComboBox()
+        gif_opt_layout.addSpacing(6)
+        lbl_scale = QLabel("尺寸")
+        lbl_scale.setObjectName("recOptLabel")
+        gif_opt_layout.addWidget(lbl_scale)
+        self.combo_gif_scale = CodexComboBox()
         self.combo_gif_scale.addItems(["原尺寸 (100%)", "高清 (75%)", "适中 (50%)", "紧凑 (33%)"])
         self.combo_gif_scale.setCurrentIndex(1)
+        self.combo_gif_scale.setMinimumWidth(130)
         gif_opt_layout.addWidget(self.combo_gif_scale)
         gif_opt_layout.addStretch()
-        main_layout.addLayout(gif_opt_layout)
+        body_lay.addWidget(gif_card)
 
-        # 5. 底部操作按钮栏 (保存MP4、保存GIF、复制GIF、关闭)
-        btn_bar = QHBoxLayout()
+        main_layout.addWidget(body_w, 1)
+
+        # 3. 底部操作栏
+        bottom_w = QWidget()
+        bottom_w.setObjectName("codexBottomBar")
+        btn_bar = QHBoxLayout(bottom_w)
+        btn_bar.setContentsMargins(20, 12, 20, 12)
         btn_bar.setSpacing(10)
 
-        self.btn_save_mp4 = QPushButton("💾 保存为 MP4 视频")
+        self.btn_save_mp4 = QPushButton("保存为 MP4")
+        self.btn_save_mp4.setObjectName("codexPrimaryBtn")
         self.btn_save_mp4.setFixedHeight(34)
         self.btn_save_mp4.setCursor(Qt.PointingHandCursor)
-        self.btn_save_mp4.setStyleSheet("""
-            QPushButton {
-                background: #0969da;
-                color: #ffffff;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-weight: 600;
-                font-size: 12px;
-            }
-            QPushButton:hover { background: #085cc0; }
-        """)
         self.btn_save_mp4.clicked.connect(self.save_as_mp4)
         btn_bar.addWidget(self.btn_save_mp4)
 
-        self.btn_save_gif = QPushButton("🎞 保存为 GIF 动图")
+        self.btn_save_gif = QPushButton("导出 GIF 动图")
+        self.btn_save_gif.setObjectName("codexSecondaryBtn")
         self.btn_save_gif.setFixedHeight(34)
         self.btn_save_gif.setCursor(Qt.PointingHandCursor)
-        self.btn_save_gif.setStyleSheet("""
-            QPushButton {
-                background: #1f883d;
-                color: #ffffff;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-weight: 600;
-                font-size: 12px;
-            }
-            QPushButton:hover { background: #1a7f37; }
-        """)
         self.btn_save_gif.clicked.connect(self.save_as_gif)
         btn_bar.addWidget(self.btn_save_gif)
 
-        self.btn_copy_gif = QPushButton("📋 复制 GIF 到剪贴板")
+        self.btn_copy_gif = QPushButton("复制 GIF")
+        self.btn_copy_gif.setObjectName("codexSecondaryBtn")
         self.btn_copy_gif.setFixedHeight(34)
         self.btn_copy_gif.setCursor(Qt.PointingHandCursor)
-        self.btn_copy_gif.setStyleSheet("""
-            QPushButton {
-                background: #f6f8fa;
-                color: #24292f;
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-weight: 600;
-                font-size: 12px;
-            }
-            QPushButton:hover { background: #f3f4f6; color: #0969da; border-color: #0969da; }
-        """)
         self.btn_copy_gif.clicked.connect(self.copy_gif_to_clipboard)
         btn_bar.addWidget(self.btn_copy_gif)
 
         btn_bar.addStretch()
 
-        self.btn_close = QPushButton("✕ 关闭")
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.setObjectName("codexSecondaryBtn")
         self.btn_close.setFixedHeight(34)
         self.btn_close.setCursor(Qt.PointingHandCursor)
-        apply_button_style(self.btn_close, danger=True)
         self.btn_close.clicked.connect(self.close)
         btn_bar.addWidget(self.btn_close)
 
-        main_layout.addLayout(btn_bar)
+        main_layout.addWidget(bottom_w)
 
         # 初始化视频解码器与播放定时器
         self.play_timer = QTimer(self)
@@ -8982,6 +11686,9 @@ class GlobalHotkeyManager(QObject):
     on_history_pressed = pyqtSignal()  # 截图历史
     on_settings_pressed = pyqtSignal() # 打开系统设置
     on_drawer_pressed = pyqtSignal()   # 贴图储藏柜 (默认 Ctrl+1)
+    on_toggle_pins_pressed = pyqtSignal()  # 隐藏/恢复全部贴图与抽屉 (默认 Ctrl+Alt+H)
+    on_paste_pin_pressed = pyqtSignal()    # 剪贴板图片直接贴图 (默认 Ctrl+Alt+V)
+    on_restore_click_through_pressed = pyqtSignal()  # 解除所有贴图鼠标穿透 (默认 Ctrl+Alt+T)
 
     HOTKEY_F1_ID = 101
     HOTKEY_F3_ID = 102
@@ -8994,6 +11701,9 @@ class GlobalHotkeyManager(QObject):
     HOTKEY_HISTORY_ID = 109
     HOTKEY_SETTINGS_ID = 110
     HOTKEY_DRAWER_ID = 111
+    HOTKEY_TOGGLE_PINS_ID = 112
+    HOTKEY_PASTE_PIN_ID = 113
+    HOTKEY_RESTORE_CT_ID = 114
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -9002,6 +11712,8 @@ class GlobalHotkeyManager(QObject):
         self._registered_native_ids = set()
         self._space_registered = False
         self._esc_registered = False
+        self._scroll_esc_active = False
+        self._recording_esc_active = False
 
     def install(self, app):
         """安装 Qt 全局原生事件过滤器并注册基础热键"""
@@ -9047,6 +11759,9 @@ class GlobalHotkeyManager(QObject):
         hk_hist = settings.get("hotkey_history", "")
         hk_sett = settings.get("hotkey_settings", "")
         hk_drawer = settings.get("hotkey_drawer", "Ctrl+1")
+        hk_toggle_pins = settings.get("hotkey_toggle_pins", "Ctrl+Alt+H")
+        hk_paste_pin = settings.get("hotkey_paste_pin", "Ctrl+Alt+V")
+        hk_restore_ct = settings.get("hotkey_restore_click_through", "Ctrl+Alt+T")
 
         self._register_one_hotkey(self.HOTKEY_F1_ID, hk_snip, self.trigger_snip)
         self._register_one_hotkey(self.HOTKEY_F2_ID, hk_ocr, self.trigger_ocr)
@@ -9057,6 +11772,9 @@ class GlobalHotkeyManager(QObject):
         self._register_one_hotkey(self.HOTKEY_HISTORY_ID, hk_hist, self.trigger_history)
         self._register_one_hotkey(self.HOTKEY_SETTINGS_ID, hk_sett, self.trigger_settings)
         self._register_one_hotkey(self.HOTKEY_DRAWER_ID, hk_drawer, self.trigger_drawer)
+        self._register_one_hotkey(self.HOTKEY_TOGGLE_PINS_ID, hk_toggle_pins, self.trigger_toggle_pins)
+        self._register_one_hotkey(self.HOTKEY_PASTE_PIN_ID, hk_paste_pin, self.trigger_paste_pin)
+        self._register_one_hotkey(self.HOTKEY_RESTORE_CT_ID, hk_restore_ct, self.trigger_restore_click_through)
 
     def reload_hotkeys(self):
         for hid in list(self._registered_native_ids):
@@ -9065,52 +11783,35 @@ class GlobalHotkeyManager(QObject):
             except Exception:
                 pass
         self._registered_native_ids.clear()
+        self._space_registered = False
+        self._esc_registered = False
         try:
             keyboard.unhook_all()
         except Exception:
             pass
         self._register_static_hotkeys()
+        if self._space_registered or self._scroll_esc_active:
+            self.register_space_hotkey()
+        if self._recording_esc_active:
+            self._ensure_esc_hotkey_registered()
 
-    def register_space_hotkey(self):
-        """滚动截图期间动态启用 Space 与 Esc 热键"""
-        if self._space_registered:
+    def _ensure_esc_hotkey_registered(self):
+        if self._esc_registered:
             return
         MOD_NOREPEAT = 0x4000
-        VK_SPACE = 0x20
         VK_ESCAPE = 0x1B
-
-        if self._user32.RegisterHotKey(None, self.HOTKEY_SPACE_ID, MOD_NOREPEAT, VK_SPACE):
-            self._registered_native_ids.add(self.HOTKEY_SPACE_ID)
+        if self._user32.RegisterHotKey(None, self.HOTKEY_ESC_ID, MOD_NOREPEAT, VK_ESCAPE):
+            self._registered_native_ids.add(self.HOTKEY_ESC_ID)
         else:
             try:
-                keyboard.add_hotkey('space', self.trigger_space, suppress=True)
+                keyboard.add_hotkey('esc', self.trigger_stop, suppress=True)
             except Exception:
                 pass
-        self._space_registered = True
+        self._esc_registered = True
 
-        if not self._esc_registered:
-            if self._user32.RegisterHotKey(None, self.HOTKEY_ESC_ID, MOD_NOREPEAT, VK_ESCAPE):
-                self._registered_native_ids.add(self.HOTKEY_ESC_ID)
-            else:
-                try:
-                    keyboard.add_hotkey('esc', self.trigger_stop, suppress=True)
-                except Exception:
-                    pass
-            self._esc_registered = True
-        logging.info("滚动截图专用热键 (Space/Esc) 已激活。")
-
-    def unregister_space_hotkey(self):
-        """退出滚动截图时注销 Space 与 Esc 热键，归还按键控制权"""
-        if self.HOTKEY_SPACE_ID in self._registered_native_ids:
-            self._user32.UnregisterHotKey(None, self.HOTKEY_SPACE_ID)
-            self._registered_native_ids.remove(self.HOTKEY_SPACE_ID)
-        else:
-            try:
-                keyboard.remove_hotkey('space')
-            except Exception:
-                pass
-        self._space_registered = False
-
+    def _release_esc_hotkey_if_unused(self):
+        if self._scroll_esc_active or self._recording_esc_active:
+            return
         if self.HOTKEY_ESC_ID in self._registered_native_ids:
             self._user32.UnregisterHotKey(None, self.HOTKEY_ESC_ID)
             self._registered_native_ids.remove(self.HOTKEY_ESC_ID)
@@ -9120,6 +11821,51 @@ class GlobalHotkeyManager(QObject):
             except Exception:
                 pass
         self._esc_registered = False
+
+    def register_recording_esc_hotkey(self):
+        """录屏准备/录制期间全局启用 Esc 退出热键"""
+        self._recording_esc_active = True
+        self._ensure_esc_hotkey_registered()
+        logging.info("录屏专用 Esc 退出热键已激活。")
+
+    def unregister_recording_esc_hotkey(self):
+        """退出录屏状态后注销 Esc 热键，归还按键控制权"""
+        self._recording_esc_active = False
+        self._release_esc_hotkey_if_unused()
+
+    def register_space_hotkey(self):
+        """滚动截图期间动态启用 Space 与 Esc 热键"""
+        self._scroll_esc_active = True
+        if self._space_registered:
+            self._ensure_esc_hotkey_registered()
+            return
+        MOD_NOREPEAT = 0x4000
+        VK_SPACE = 0x20
+
+        if self._user32.RegisterHotKey(None, self.HOTKEY_SPACE_ID, MOD_NOREPEAT, VK_SPACE):
+            self._registered_native_ids.add(self.HOTKEY_SPACE_ID)
+        else:
+            try:
+                keyboard.add_hotkey('space', self.trigger_space, suppress=True)
+            except Exception:
+                pass
+        self._space_registered = True
+        self._ensure_esc_hotkey_registered()
+        logging.info("滚动截图专用热键 (Space/Esc) 已激活。")
+
+    def unregister_space_hotkey(self):
+        """退出滚动截图时注销 Space 与 Esc 热键，归还按键控制权"""
+        self._scroll_esc_active = False
+        if self.HOTKEY_SPACE_ID in self._registered_native_ids:
+            self._user32.UnregisterHotKey(None, self.HOTKEY_SPACE_ID)
+            self._registered_native_ids.remove(self.HOTKEY_SPACE_ID)
+        else:
+            try:
+                keyboard.remove_hotkey('space')
+            except Exception:
+                pass
+        self._space_registered = False
+        self._release_esc_hotkey_if_unused()
         logging.info("滚动截图专用热键 (Space/Esc) 已注销。")
 
     def _on_wm_hotkey(self, hotkey_id):
@@ -9141,6 +11887,12 @@ class GlobalHotkeyManager(QObject):
             self.trigger_settings()
         elif hotkey_id == self.HOTKEY_DRAWER_ID:
             self.trigger_drawer()
+        elif hotkey_id == self.HOTKEY_TOGGLE_PINS_ID:
+            self.trigger_toggle_pins()
+        elif hotkey_id == self.HOTKEY_PASTE_PIN_ID:
+            self.trigger_paste_pin()
+        elif hotkey_id == self.HOTKEY_RESTORE_CT_ID:
+            self.trigger_restore_click_through()
         elif hotkey_id == self.HOTKEY_SPACE_ID:
             self.trigger_space()
         elif hotkey_id == self.HOTKEY_ESC_ID:
@@ -9208,6 +11960,27 @@ class GlobalHotkeyManager(QObject):
             self.on_drawer_pressed.emit()
         except Exception as e:
             logging.error("贴图抽屉热键触发异常: %s", e)
+
+    def trigger_toggle_pins(self):
+        try:
+            logging.info("触发隐藏/恢复贴图热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_toggle_pins_pressed.emit()
+        except Exception as e:
+            logging.error("隐藏/恢复贴图热键触发异常: %s", e)
+
+    def trigger_paste_pin(self):
+        try:
+            logging.info("触发剪贴板直接贴图热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_paste_pin_pressed.emit()
+        except Exception as e:
+            logging.error("剪贴板贴图热键触发异常: %s", e)
+
+    def trigger_restore_click_through(self):
+        try:
+            logging.info("触发解除贴图鼠标穿透热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_restore_click_through_pressed.emit()
+        except Exception as e:
+            logging.error("解除鼠标穿透热键触发异常: %s", e)
 
     def trigger_space(self):
         try:
@@ -9345,8 +12118,11 @@ class ScreenshotTool(QWidget):
         
         self.capture_history = [] 
         self.pinned_windows = [] 
+        self._pins_boss_hidden = False
+        self._boss_hidden_pins = []
+        self._boss_hidden_drawer = False
         self.pin_drawer = PinDrawerWindow(main_app=self)
-        self.pin_drawer.set_feature_enabled(load_settings().get("drawer_hover_enabled", True)) 
+        self.pin_drawer.set_feature_enabled(load_settings().get("drawer_hover_enabled", True))  
         
         self.inline_editor = InlineTextEditor(self)
         self.crop_toolbar = CropToolbar(self)
@@ -9372,6 +12148,115 @@ class ScreenshotTool(QWidget):
                 self._drawer_toast = PinToast(msg, pinned=enabled)
                 self._drawer_toast.show()
             except Exception:
+                pass
+
+    def toggle_all_pins_visibility(self):
+        """老板键（Ctrl+Alt+H / 托盘）：一键临时隐藏全部桌面贴图与抽屉，再次触发全部恢复。"""
+        drawer = getattr(self, "pin_drawer", None)
+        if not self._pins_boss_hidden:
+            hidden_list = []
+            for pw in list(self.pinned_windows):
+                try:
+                    if pw is not None and pw.isVisible():
+                        pw.hide()
+                        hidden_list.append(pw)
+                except RuntimeError:
+                    pass
+            self._boss_hidden_pins = hidden_list
+            self._boss_hidden_drawer = bool(drawer and drawer.drawer_enabled)
+            if self._boss_hidden_drawer:
+                if hasattr(drawer, "set_boss_hidden"):
+                    drawer.set_boss_hidden(True)
+                else:
+                    drawer.hide()
+            self._pins_boss_hidden = True
+            self._boss_toast = PinToast("👁️ 已隐藏所有贴图与抽屉（再次按键或托盘恢复）", pinned=False)
+            self._boss_toast.show()
+        else:
+            for pw in list(self._boss_hidden_pins):
+                try:
+                    if pw is not None:
+                        pw.show()
+                        pw.raise_()
+                except RuntimeError:
+                    pass
+            self._boss_hidden_pins = []
+            if self._boss_hidden_drawer and drawer and drawer.drawer_enabled:
+                if hasattr(drawer, "set_boss_hidden"):
+                    drawer.set_boss_hidden(False)
+                else:
+                    drawer.show()
+                    drawer.ensure_on_top(force=True)
+            self._boss_hidden_drawer = False
+            self._pins_boss_hidden = False
+            self._boss_toast = PinToast("👁️ 已恢复所有贴图与抽屉", pinned=True)
+            self._boss_toast.show()
+
+    def paste_clipboard_as_pin(self):
+        """将剪贴板最新的图片（位图或复制的图片文件）直接贴到鼠标所在屏幕位置。"""
+        cb = QApplication.clipboard()
+        if cb is None:
+            return None
+        mime = cb.mimeData()
+        pixmaps = _extract_pixmaps_from_mimedata(mime) if mime is not None else []
+        if not pixmaps:
+            cb_pix = cb.pixmap()
+            if cb_pix is not None and not cb_pix.isNull() and cb_pix.width() > 2 and cb_pix.height() > 2:
+                pixmaps = [cb_pix]
+        if not pixmaps:
+            QToolTip.showText(QCursor.pos(), "📋 剪贴板中暂无可贴图的图片", None, QRect(), 2000)
+            return None
+
+        cursor_pos = QCursor.pos()
+        last_pin = None
+        for idx, pix in enumerate(pixmaps):
+            pos = QPoint(cursor_pos.x() + idx * 24 - 20, cursor_pos.y() + idx * 24 - 20)
+            last_pin = self.create_pinned_window(pix, initial_pos=pos, zoom_factor=1.0)
+        return last_pin
+
+    def restore_all_click_through(self):
+        """解除所有置顶贴图的鼠标穿透锁定。"""
+        restored = 0
+        for pw in list(self.pinned_windows):
+            try:
+                if pw is not None and getattr(pw, "_click_through", False):
+                    pw.set_click_through(False)
+                    restored += 1
+            except RuntimeError:
+                pass
+        msg = f"🖱️ 已解除 {restored} 张贴图的鼠标穿透" if restored > 0 else "🖱️ 当前没有开启鼠标穿透的贴图"
+        self._ct_restore_toast = PinToast(msg, pinned=(restored > 0))
+        self._ct_restore_toast.show()
+
+    def pin_all_to_drawer(self):
+        """一键将当前桌面上的所有贴图批量收入右侧抽屉。"""
+        drawer = getattr(self, "pin_drawer", None)
+        if not drawer:
+            return
+        if not drawer.drawer_enabled:
+            drawer.set_feature_enabled(True)
+            save_settings({"drawer_hover_enabled": True})
+        pixmaps = []
+        for pw in list(self.pinned_windows):
+            try:
+                if pw is not None and pw.pixmap and not pw.pixmap.isNull():
+                    pixmaps.append(pw.pixmap)
+                    pw._dropped_to_drawer = True
+                    pw.close()
+            except RuntimeError:
+                pass
+        if pixmaps:
+            drawer._insert_pixmaps(pixmaps, keep_open_ms=900)
+            self._batch_drawer_toast = PinToast(f"🗄️ 已将 {len(pixmaps)} 张贴图全部收入抽屉", pinned=True)
+            self._batch_drawer_toast.show()
+
+    def close_all_pins(self):
+        """关闭全部当前显示的桌面贴图（记录仍可按 F3 找回）。"""
+        for pw in list(self.pinned_windows):
+            try:
+                if pw is not None:
+                    pw.close()
+            except RuntimeError:
                 pass
 
     def save_state(self):
@@ -9582,11 +12467,13 @@ class ScreenshotTool(QWidget):
         self.toolbar.move(tb_x, tb_y)
         self.toolbar.show()
         self.toolbar.raise_()
+        self.toolbar.update_frosted_bg()
 
         if show_options:
             self.options_bar.move(opt_x, opt_y)
             self.options_bar.show()
             self.options_bar.raise_()
+            self.options_bar.update_frosted_bg()
 
 
     def activate_capture(self, ocr_intent=False, recording_intent=False):
@@ -9664,11 +12551,26 @@ class ScreenshotTool(QWidget):
             self.crop_toolbar.hide()
         self.reset_button_styles()
 
+        drawer = getattr(self, "pin_drawer", None)
+        drawer_temporarily_hidden = False
+        if drawer is not None:
+            if hasattr(drawer, "_hide_hover_preview"):
+                drawer._hide_hover_preview()
+            if getattr(drawer, "_is_expanded", False):
+                drawer.retract()
+            if drawer.isVisible() and getattr(drawer, "_drawer_width", 0) > getattr(drawer, "HANDLE_WIDTH", 16) + 4:
+                drawer.hide()
+                drawer_temporarily_hidden = True
+                QApplication.processEvents()
+
         t2 = _time.time()
         screen = QApplication.primaryScreen()
         self.original_screen = screen.grabWindow(0)
+        if drawer_temporarily_hidden and drawer is not None and not getattr(drawer, "_boss_hidden", False):
+            drawer.ensure_on_top()
         t3 = _time.time()
         self.original_screen_image = self.original_screen.toImage()
+        self.blurred_screen = create_frosted_pixmap(self.original_screen, self.original_screen.width(), self.original_screen.height())
         t4 = _time.time()
         self.setGeometry(0, 0, self.original_screen.width(), self.original_screen.height())
         self.setMouseTracking(True)
@@ -9714,12 +12616,15 @@ class ScreenshotTool(QWidget):
                 self._cached_selection_key = None
             self.original_screen = None
             self.original_screen_image = None
+            self.blurred_screen = None
         finally:
             if hasattr(self, 'toolbar') and self.toolbar:
                 self.toolbar.hide()
             if hasattr(self, 'options_bar') and self.options_bar:
                 self.options_bar.hide()
             self.hide()
+            if hasattr(self, 'pin_drawer') and self.pin_drawer:
+                self.pin_drawer.ensure_on_top(force=True)
 
     def activate_recording(self):
         """激活屏幕录制模式 (F4)"""
@@ -9795,10 +12700,13 @@ class ScreenshotTool(QWidget):
     def _on_quick_ocr_finished(self, text):
         try:
             QToolTip.hideText()
-            if not text or not text.strip():
-                QMessageBox.information(None, "文字识别结果", "未能识别到有效文字，请重新框选。")
+            worker = getattr(self, "_quick_ocr_worker", None)
+            codes = getattr(worker, "detected_codes", []) if worker is not None else []
+            doc = getattr(worker, "ocr_doc", None) if worker is not None else None
+            if (not text or not text.strip()) and not codes:
+                QMessageBox.information(None, "文字识别结果", "未能识别到有效文字或二维码，请重新框选。")
                 return
-            dlg = OcrResultDialog(text, None)
+            dlg = OcrResultDialog(text, None, detected_codes=codes, ocr_doc=doc)
             dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
             self._active_ocr_dialog = dlg
             dlg.activateWindow()
@@ -10266,8 +13174,7 @@ class ScreenshotTool(QWidget):
         """状态提示固定在选区外侧（左下或左上），不跟随鼠标和文字选区。"""
         if not text:
             return
-        font = QFont("Microsoft YaHei UI")
-        font.setPixelSize(12)
+        font = make_ui_font(pixel_size=12)
         painter.setFont(font)
         fm = QFontMetrics(font)
         w = fm.horizontalAdvance(text) + 20
@@ -10288,8 +13195,8 @@ class ScreenshotTool(QWidget):
         if doc is None or doc.is_empty():
             return
         if self._text_selected:
-            fill = QColor(55, 138, 221, 78)
-            border = QColor(24, 95, 165, 75)
+            fill = QColor(196, 146, 62, 78)
+            border = QColor(148, 102, 32, 95)
             painter.setPen(QPen(border, 1))
             for ri, row in enumerate(doc.rows):
                 idxs = sorted(ci for (r, ci) in self._text_selected
@@ -10317,7 +13224,7 @@ class ScreenshotTool(QWidget):
                 ri, ci = self._text_hover
                 rect = self._text_widget_rect(doc.rows[ri].char_rects[ci])
                 painter.fillRect(QRect(rect.left(), rect.bottom() - 2, rect.width(), 2),
-                                 QColor(55, 138, 221, 190))
+                                 QColor(182, 134, 58, 200))
             except (IndexError, KeyError):
                 pass
 
@@ -10364,9 +13271,10 @@ class ScreenshotTool(QWidget):
             self._leave_modal_layer()
 
         def _no_coords(text):
-            # 极少数本地引擎完全没有坐标时，退化为文字对照
+            # 极少数本地引擎完全没有坐标时，退化为文字对照（仍携带可能检出的条码）
             self._leave_modal_layer()
-            dlg = OcrResultDialog(text, self)
+            codes = detect_codes_in_image(self.get_final_static_image())
+            dlg = OcrResultDialog(text, self, detected_codes=codes)
             self._active_ocr_dialog = dlg
             dlg.exec_()
 
@@ -10402,6 +13310,8 @@ class ScreenshotTool(QWidget):
         self.recording_toolbar.pause_toggled.connect(self._on_pause_record)
         self.recording_toolbar.cancel_requested.connect(self._on_cancel_record)
         self.recording_toolbar.quality_changed.connect(self._on_recording_quality_changed)
+        if self.hotkey_listener is not None and hasattr(self.hotkey_listener, "register_recording_esc_hotkey"):
+            self.hotkey_listener.register_recording_esc_hotkey()
 
     def _on_recording_quality_changed(self, quality_key):
         self.recording_quality_key = quality_key
@@ -10519,6 +13429,8 @@ class ScreenshotTool(QWidget):
             except Exception:
                 pass
             self.recording_toolbar = None
+        if self.hotkey_listener is not None and hasattr(self.hotkey_listener, "unregister_recording_esc_hotkey"):
+            self.hotkey_listener.unregister_recording_esc_hotkey()
 
     def reset_button_styles(self):
         pass
@@ -10556,8 +13468,7 @@ class ScreenshotTool(QWidget):
             self.setCursor(Qt.PointingHandCursor)
         elif self.current_tool is None:
             if pos is not None and self.state == "EDITING":
-                # 截图完成后禁止拖动整个选区，只有边框/角点可拉伸
-                edge = self.get_resize_edge(pos, allow_move=False)
+                edge = self.get_resize_edge(pos, allow_move=True)
                 if edge in ['topleft', 'bottomright']:
                     self.setCursor(Qt.SizeFDiagCursor)
                 elif edge in ['topright', 'bottomleft']:
@@ -10566,6 +13477,8 @@ class ScreenshotTool(QWidget):
                     self.setCursor(Qt.SizeHorCursor)
                 elif edge in ['top', 'bottom']:
                     self.setCursor(Qt.SizeVerCursor)
+                elif edge == 'move':
+                    self.setCursor(Qt.SizeAllCursor)
                 else:
                     self.setCursor(Qt.ArrowCursor)
             elif self.state == "EDITING":
@@ -10617,9 +13530,16 @@ class ScreenshotTool(QWidget):
 
     def get_resize_edge(self, pos, allow_move=True):
         r = self.selection_rect
-        margin = 10; x, y = pos.x(), pos.y()
-        left, right = abs(x - r.left()) < margin, abs(x - r.right()) < margin
-        top, bottom = abs(y - r.top()) < margin, abs(y - r.bottom()) < margin
+        if not r.isValid() or r.isNull():
+            return None
+        margin = min(10, max(3, min(r.width(), r.height()) // 3))
+        x, y = pos.x(), pos.y()
+        in_x = (r.left() - margin <= x <= r.right() + margin)
+        in_y = (r.top() - margin <= y <= r.bottom() + margin)
+        left = abs(x - r.left()) < margin and in_y
+        right = abs(x - r.right()) < margin and in_y
+        top = abs(y - r.top()) < margin and in_x
+        bottom = abs(y - r.bottom()) < margin and in_x
 
         if left and top: return 'topleft'
         if right and top: return 'topright'
@@ -10728,14 +13648,14 @@ class ScreenshotTool(QWidget):
         painter.drawRect(zoom_rect)
         painter.drawPixmap(zoom_rect, self.original_screen.copy(src))
 
-        painter.setPen(QPen(QColor(0, 120, 255), 2))
+        painter.setPen(QPen(QColor(212, 162, 72), 2))
         cx, cy = zoom_rect.center().x(), zoom_rect.center().y()
         painter.drawLine(cx, zoom_rect.top(), cx, zoom_rect.bottom())
         painter.drawLine(zoom_rect.left(), cy, zoom_rect.right(), cy)
 
         painter.fillRect(info_rect, QColor(35, 38, 43, 235))
         painter.setPen(QPen(Qt.white))
-        painter.setFont(QFont("Microsoft YaHei", 9))
+        painter.setFont(make_ui_font(9))
         value_label = "HEX" if self.color_output_hex else "RGB"
         painter.drawText(info_rect.adjusted(8, 6, -6, -6), Qt.AlignLeft | Qt.AlignTop,
                          f"坐标: {pos.x()}, {pos.y()}\n{value_label}: {self.format_color_value(color)}\nC 复制颜色值\nShift 切换 RGB/HEX")
@@ -10792,6 +13712,32 @@ class ScreenshotTool(QWidget):
             if event.key() == Qt.Key_Escape and self._text_selected:
                 self._clear_text_selection()
                 return
+            if (not self.selection_rect.isNull()
+                    and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier))
+                    and not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible())):
+                step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
+                dx, dy = 0, 0
+                if event.key() == Qt.Key_Left:
+                    dx = -step
+                elif event.key() == Qt.Key_Right:
+                    dx = step
+                elif event.key() == Qt.Key_Up:
+                    dy = -step
+                elif event.key() == Qt.Key_Down:
+                    dy = step
+                if dx or dy:
+                    r = QRect(self.selection_rect)
+                    nx = max(0, min(max(0, self.width() - r.width()), r.x() + dx))
+                    ny = max(0, min(max(0, self.height() - r.height()), r.y() + dy))
+                    if nx != r.x() or ny != r.y():
+                        r.moveTo(nx, ny)
+                        self.selection_rect = r
+                        self._reset_text_selection_state()
+                        self._invalidate_text_doc()
+                        self._schedule_auto_text_ocr()
+                        self.update_toolbar_positions()
+                        self.update()
+                    return
 
         if getattr(self, 'ocr_intent', False):
             if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
@@ -10931,7 +13877,7 @@ class ScreenshotTool(QWidget):
         close_btn_rect = QRect(banner_rect.right() - 25, banner_rect.top() + (banner_h - 16) // 2, 16, 16)
         self._mode_banner_close_rect = close_btn_rect
 
-        border_color = QColor(9, 105, 218) if is_ocr else QColor(239, 68, 68)
+        border_color = QColor(168, 118, 40) if is_ocr else QColor(239, 68, 68)
 
         # 柔和轻量阴影
         painter.setPen(Qt.NoPen)
@@ -10945,7 +13891,7 @@ class ScreenshotTool(QWidget):
 
         # 提示文字
         painter.setPen(QPen(QColor(36, 41, 47)))
-        painter.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
+        painter.setFont(make_ui_font(9, QFont.DemiBold))
         text = "🔤 识图翻译: 拖选识别区域 | 双击/回车全屏识别 | ESC 取消" if is_ocr else "🎥 屏幕录制: 拖选录制区域 | 双击/回车全屏录制 | ESC 取消"
         text_rect = QRect(banner_rect.left() + 10, banner_rect.top(), banner_rect.width() - 36, banner_rect.height())
         painter.drawText(text_rect, Qt.AlignCenter, text)
@@ -10988,7 +13934,7 @@ class ScreenshotTool(QWidget):
                     for r in outer_region.rects():
                         painter.fillRect(r, mask_color)
 
-                    border_color = QColor(0, 174, 255)
+                    border_color = QColor(204, 153, 68)
                     painter.setPen(QPen(border_color, 2))
                     painter.setBrush(Qt.NoBrush)
                     draw_r = self.hovered_window_rect
@@ -11016,14 +13962,14 @@ class ScreenshotTool(QWidget):
             # 4. 选区渲染：选区内部 100% 原屏通透（零遮罩、零底色），配高精边框与取景器角标
             if not self.selection_rect.isNull():
                 if is_ocr:
-                    border_color = QColor(9, 105, 218)
+                    border_color = QColor(168, 118, 40)
                     badge_text = f"🔤 识别区域: {self.selection_rect.width()} × {self.selection_rect.height()}"
                 elif is_rec:
                     border_color = QColor(239, 68, 68)
                     fps_label = "60FPS" if "60" in getattr(self, 'recording_quality_key', '') else "30FPS"
                     badge_text = f"🎥 录屏选区: {self.selection_rect.width()} × {self.selection_rect.height()} ({fps_label})"
                 else:
-                    border_color = QColor(0, 174, 255)
+                    border_color = QColor(204, 153, 68)
                     badge_text = f"{self.selection_rect.width()} × {self.selection_rect.height()}"
 
                 # 边框线（选区内部绝对不加遮罩，完全透明高亮）
@@ -11034,8 +13980,15 @@ class ScreenshotTool(QWidget):
                 # 四角相机取景器角标
                 draw_viewfinder_corners(painter, self.selection_rect, border_color, length=14, width=3)
 
-                # 悬浮尺寸徽标
-                if self.state != "EDITING":
+                # 悬浮尺寸徽标（框选期或编辑期拖拽移动/拉伸选区时实时显示）
+                is_adjusting_sel = (
+                    self.state == "EDITING"
+                    and getattr(self, 'drag_mode', None) in (
+                        'move', 'left', 'right', 'top', 'bottom',
+                        'topleft', 'topright', 'bottomleft', 'bottomright'
+                    )
+                )
+                if self.state != "EDITING" or is_adjusting_sel:
                     draw_selection_badge(painter, self.selection_rect, badge_text, border_color=border_color)
 
                 # 编辑状态下的标注图元绘制
@@ -11072,12 +14025,12 @@ class ScreenshotTool(QWidget):
                             painter.drawLine(self.crop_rect.left(), y, self.crop_rect.right(), y)
 
                         # 裁剪框边线与 8 个手柄
-                        painter.setPen(QPen(QColor(0, 174, 255), 2))
+                        painter.setPen(QPen(QColor(204, 153, 68), 2))
                         painter.setBrush(Qt.NoBrush)
                         painter.drawRect(self.crop_rect)
 
                         handle = CROP_HANDLE_SIZE
-                        painter.setBrush(QBrush(QColor(0, 174, 255)))
+                        painter.setBrush(QBrush(QColor(204, 153, 68)))
                         painter.setPen(QPen(Qt.white, 1))
                         corners = [self.crop_rect.topLeft(), self.crop_rect.topRight(),
                                    self.crop_rect.bottomLeft(), self.crop_rect.bottomRight()]
@@ -11361,21 +14314,25 @@ class ScreenshotTool(QWidget):
                 self.edits.append({'type': self.current_tool, 'rect': QRect(pos, pos), 'start': pos, 'end': pos, 'color': self.current_color, 'arrow': getattr(self, 'arrow_enabled', False), 'temp': True, 'thickness': self.current_thickness})
             
             elif self.current_tool is None:
-                # 选区内（边框除外）直接进入文字拖选，允许从文字左侧/行间开始拖
-                if (not (event.modifiers() & Qt.AltModifier) and self._text_doc_ready()
+                edge = self.get_resize_edge(pos, allow_move=False)
+                # 按住 Alt 时始终优先移动选区；否则当鼠标落在识别文字上时进入文字拖选
+                if (edge is None
+                        and not (event.modifiers() & Qt.AltModifier)
+                        and self._text_doc_ready()
                         and self.selection_rect.contains(pos)
-                        and self.get_resize_edge(pos, allow_move=False) is None):
+                        and self._text_char_at(pos) is not None):
                     self._start_text_selection(pos)
                     return
 
-                # 截图完成后只允许边框/角点拉伸，不再移动整个选区
-                edge = self.get_resize_edge(pos, allow_move=False)
-                self.drag_mode = edge
-                if edge is not None:
+                # 边框/角点支持拉伸；选区内部（非文字区域或按住 Alt）支持整体拖动调整位置
+                move_edge = self.get_resize_edge(pos, allow_move=True)
+                self.drag_mode = move_edge
+                if move_edge is not None:
                     self._selection_before_drag = QRect(self.selection_rect)
+                    if move_edge == 'move':
+                        self.drag_offset = pos - self.selection_rect.topLeft()
                     self._reset_text_selection_state()
-                elif self.selection_rect.contains(pos):
-                    self.drag_mode = None
+                    self.update_cursor_for_tool(pos)
                     return
                 elif self.geometry().width() == QApplication.primaryScreen().geometry().width():
                     self.state = "SELECTING"
@@ -11442,7 +14399,8 @@ class ScreenshotTool(QWidget):
 
             if event.buttons() == Qt.NoButton:
                 hover = None
-                if self.current_tool is None and not self.crop_mode:
+                if (self.current_tool is None and not self.crop_mode
+                        and not (event.modifiers() & Qt.AltModifier)):
                     if (self.selection_rect.contains(pos)
                             and self.get_resize_edge(pos, allow_move=False) is None):
                         hover = self._text_char_at(pos)
@@ -11546,14 +14504,32 @@ class ScreenshotTool(QWidget):
                 self.update()
 
             elif self.drag_mode and self.drag_mode not in ['ocr', 'text_draw', 'text_move']:
-                r = self.selection_rect
-                if self.drag_mode == 'move': r.moveTo(pos - self.drag_offset)
+                r = QRect(self.selection_rect)
+                if self.drag_mode == 'move':
+                    new_tl = pos - self.drag_offset
+                    max_x = max(0, self.width() - r.width())
+                    max_y = max(0, self.height() - r.height())
+                    r.moveTo(max(0, min(max_x, new_tl.x())), max(0, min(max_y, new_tl.y())))
+                    self.selection_rect = r
                 else:
-                    if 'left' in self.drag_mode: r.setLeft(pos.x())
-                    if 'right' in self.drag_mode: r.setRight(pos.x())
-                    if 'top' in self.drag_mode: r.setTop(pos.y())
-                    if 'bottom' in self.drag_mode: r.setBottom(pos.y())
-                self.selection_rect = r.normalized()
+                    px = max(0, min(self.width() - 1, pos.x()))
+                    py = max(0, min(self.height() - 1, pos.y()))
+                    if 'left' in self.drag_mode: r.setLeft(px)
+                    if 'right' in self.drag_mode: r.setRight(px)
+                    if 'top' in self.drag_mode: r.setTop(py)
+                    if 'bottom' in self.drag_mode: r.setBottom(py)
+                    r = r.normalized()
+                    if r.width() < 4:
+                        if 'left' in self.drag_mode and 'right' not in self.drag_mode:
+                            r.setLeft(max(0, r.right() - 3))
+                        else:
+                            r.setRight(min(self.width() - 1, r.left() + 3))
+                    if r.height() < 4:
+                        if 'top' in self.drag_mode and 'bottom' not in self.drag_mode:
+                            r.setTop(max(0, r.bottom() - 3))
+                        else:
+                            r.setBottom(min(self.height() - 1, r.top() + 3))
+                    self.selection_rect = r
                 self.toolbar.hide()
                 if hasattr(self, 'options_bar') and self.options_bar:
                     self.options_bar.hide()
@@ -11678,11 +14654,11 @@ class ScreenshotTool(QWidget):
                         if self.text_rect.width() > 10 and self.text_rect.height() > 10:
                             self.inline_editor.start_editing(self.text_rect)
 
-                    if self.drag_mode in ('left', 'right', 'top', 'bottom',
+                    if self.drag_mode in ('move', 'left', 'right', 'top', 'bottom',
                                           'topleft', 'topright', 'bottomleft', 'bottomright'):
                         before = getattr(self, '_selection_before_drag', None)
                         if before is not None and self.selection_rect != before:
-                            # 只有选区尺寸真的变了才重新识别，避免点击边框/空白触发无意义 OCR
+                            # 只有选区位置或尺寸真的变了才重新识别，避免点击触发无意义 OCR
                             self._invalidate_text_doc()
                             self._schedule_auto_text_ocr()
                     self._selection_before_drag = None
@@ -11690,6 +14666,8 @@ class ScreenshotTool(QWidget):
                     self.drag_mode = None
                     self.setFocus()
                     self.show_toolbar()
+                    self.update_cursor_for_tool(event.pos())
+                    self.update()
 
                 elif self.current_tool in ['RECTANGLE', 'LINE', 'ELLIPSE', 'STEP']:
                     if len(self.edits) > 0 and self.edits[-1].get('temp'):
@@ -11700,10 +14678,13 @@ class ScreenshotTool(QWidget):
 
     def show_ocr_result(self, text):
         self.btn_ocr.setText("🔤 识别")
-        if not text:
-            QMessageBox.information(self, "OCR 结果", "未能识别到文字，请重试。")
+        worker = getattr(self, "ocr_worker", None)
+        codes = getattr(worker, "detected_codes", []) if worker is not None else []
+        doc = getattr(worker, "ocr_doc", None) if worker is not None else None
+        if not text and not codes:
+            QMessageBox.information(self, "OCR 结果", "未能识别到文字或二维码，请重试。")
         else:
-            dlg = OcrResultDialog(text, self)
+            dlg = OcrResultDialog(text, self, detected_codes=codes, ocr_doc=doc)
             dlg.exec_() 
             
     def show_toolbar(self):
@@ -12090,12 +15071,54 @@ class ScreenshotTool(QWidget):
         self.hide_app(keep_history=False)
 
     def show_history_dialog(self):
+        if getattr(self, "_history_dialog_open", False):
+            active_dlg = getattr(self, "_active_history_dialog", None)
+            if active_dlg is not None and not getattr(active_dlg, "_really_closed_emitted", True):
+                active_dlg.show()
+                _force_activate_window(active_dlg)
+            return
+        self._history_dialog_open = True
+        was_capturing = self.isVisible()
+        tb_was_visible = bool(getattr(self, "toolbar", None) and self.toolbar.isVisible())
+        opt_was_visible = bool(getattr(self, "options_bar", None) and self.options_bar.isVisible())
+        crop_was_visible = bool(getattr(self, "crop_toolbar", None) and self.crop_toolbar.isVisible())
+        dlg = None
         try:
-            dlg = HistoryDialog(self)
-            dlg.exec_()
+            if was_capturing:
+                self.commit_text_edit()
+                if tb_was_visible:
+                    self.toolbar.hide()
+                if opt_was_visible:
+                    self.options_bar.hide()
+                if crop_was_visible:
+                    self.crop_toolbar.hide()
+                self.hide()
+                QApplication.processEvents()
+            dlg = HistoryDialog(parent=None, main_app_ref=self)
+            self._active_history_dialog = dlg
+            dlg.exec_nonmodal()
         except Exception as e:
             logging.error("打开历史窗口失败: %s", e, exc_info=True)
-            QMessageBox.warning(self, "截图历史", f"无法打开截图历史:\n{e}")
+            QMessageBox.warning(None, "截图历史", f"无法打开截图历史:\n{e}")
+        finally:
+            self._active_history_dialog = None
+            self._history_dialog_open = False
+            if was_capturing:
+                if dlg is not None and getattr(dlg, "_did_commit_action", False):
+                    self.hide_app(keep_history=False)
+                else:
+                    self.showFullScreen()
+                    _force_activate_window(self)
+                    if tb_was_visible and getattr(self, "toolbar", None):
+                        self.toolbar.show()
+                        self.toolbar.raise_()
+                    if opt_was_visible and getattr(self, "options_bar", None):
+                        self.options_bar.show()
+                        self.options_bar.raise_()
+                    if crop_was_visible and getattr(self, "crop_toolbar", None):
+                        self.crop_toolbar.show()
+                        self.crop_toolbar.raise_()
+                    QTimer.singleShot(30, lambda: _force_activate_window(self) if self.isVisible() else None)
 
     def _shutdown_update_workers(self):
         thread = self._update_thread
@@ -12288,10 +15311,14 @@ class ScreenshotTool(QWidget):
                 self._scroll_hint.close()
             except: pass
 
-        hint = QLabel("Space: 开始/停止滚动  |  ESC: 取消")
+        hint = QLabel("Space 开始/停止滚动   ·   ESC 取消")
         hint.setWindowFlags(Qt.ToolTip | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         hint.setAttribute(Qt.WA_ShowWithoutActivating)
-        hint.setStyleSheet("background: rgba(20,20,20,225); color: #00AEFF; padding: 7px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; border: 1px solid rgba(0,174,255,100);")
+        hint.setStyleSheet(
+            f"background: rgba(13, 13, 13, 236); color: #FAFAFA; padding: 7px 16px; "
+            f"border-radius: 8px; font-family: {CODEX_FONT_FAMILY}; font-size: 12.5px; "
+            f"font-weight: 400; border: 1px solid rgba(255, 255, 255, 0.14);"
+        )
         hint.adjustSize()
         hint_x = scroll_rect.left() + max(0, (scroll_rect.width() - hint.width()) // 2)
         hint_y = max(0, scroll_rect.top() - hint.height() - 8)
@@ -12335,7 +15362,13 @@ class ScreenshotTool(QWidget):
         self.scroll_waiting = False
 
     def stop_trigger(self):
-        if self.scroll_thread and self.scroll_thread.is_recording:
+        if (
+            (self.recording_thread and self.recording_thread.isRunning())
+            or self.recording_toolbar is not None
+            or self.recording_border is not None
+        ):
+            self._on_cancel_record()
+        elif self.scroll_thread and self.scroll_thread.is_recording:
             self.scroll_thread.stop()
             # ESC 取消：不拼接
             self._scroll_cancelled = True
@@ -12413,15 +15446,19 @@ class AppTrayIcon(QSystemTrayIcon):
             pixmap.fill(Qt.transparent)
             painter = QPainter(pixmap)
             painter.setRenderHint(QPainter.Antialiasing)
-            painter.setBrush(QColor(0, 174, 255))
-            painter.setPen(QPen(Qt.white, 2))
-            painter.drawRoundedRect(2, 2, 28, 28, 6, 6)
+            painter.setBrush(QColor(28, 28, 30))
+            painter.setPen(QPen(QColor(180, 174, 165, 220), 1.5))
+            painter.drawRoundedRect(2, 2, 28, 28, 7, 7)
+            painter.setBrush(QColor(219, 166, 74))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(12, 12, 8, 8)
             painter.end()
             self.setIcon(QIcon(pixmap))
         
         self.setToolTip(f"Capture v{APP_VERSION} (F1 截图 | F2 识图翻译 | F4 录屏 | F3 贴图)")
         
-        menu = QMenu()
+        menu = FrostedTrayMenu()
+        self._tray_menu = menu
         snip_action = QAction("✂ 开始截图", menu)
         snip_action.triggered.connect(self.main_app.activate_capture)
         menu.addAction(snip_action)
@@ -12434,6 +15471,18 @@ class AppTrayIcon(QSystemTrayIcon):
         pin_action = QAction("📌 贴图置顶", menu)
         pin_action.triggered.connect(self.main_app.hotkey_pin)
         menu.addAction(pin_action)
+        paste_pin_action = QAction("📋 剪贴板图片贴图", menu)
+        paste_pin_action.triggered.connect(self.main_app.paste_clipboard_as_pin)
+        menu.addAction(paste_pin_action)
+        toggle_pins_action = QAction("👁️ 隐藏/恢复贴图与抽屉", menu)
+        toggle_pins_action.triggered.connect(self.main_app.toggle_all_pins_visibility)
+        menu.addAction(toggle_pins_action)
+        self._toggle_pins_action = toggle_pins_action
+        restore_ct_action = QAction("🖱️ 恢复贴图点击 (取消穿透 · Ctrl+Alt+T)", menu)
+        restore_ct_action.triggered.connect(self.main_app.restore_all_click_through)
+        menu.addAction(restore_ct_action)
+        self._restore_ct_action = restore_ct_action
+        menu.aboutToShow.connect(self._refresh_menu_labels)
         drawer_action = QAction("🗄️ 贴图抽屉 (Ctrl+1)", menu)
         drawer_action.triggered.connect(self.main_app.toggle_drawer)
         menu.addAction(drawer_action)
@@ -12461,6 +15510,28 @@ class AppTrayIcon(QSystemTrayIcon):
         
         self.setContextMenu(menu)
         self.activated.connect(self.on_tray_activated)
+
+    def _refresh_menu_labels(self):
+        try:
+            s = load_settings()
+            hk_boss = s.get("hotkey_toggle_pins", "Ctrl+Alt+H") or "Ctrl+Alt+H"
+            hk_ct = s.get("hotkey_restore_click_through", "Ctrl+Alt+T") or "Ctrl+Alt+T"
+            if getattr(self, "_toggle_pins_action", None) is not None:
+                hidden = bool(getattr(self.main_app, "_pins_boss_hidden", False))
+                self._toggle_pins_action.setText(
+                    f"👁️ 恢复全部贴图与抽屉 ({hk_boss})" if hidden else f"👁️ 隐藏全部贴图与抽屉 ({hk_boss})"
+                )
+            if getattr(self, "_restore_ct_action", None) is not None:
+                ct_count = sum(
+                    1 for pw in getattr(self.main_app, "pinned_windows", [])
+                    if pw is not None and getattr(pw, "_click_through", False)
+                )
+                if ct_count > 0:
+                    self._restore_ct_action.setText(f"🖱️ 解除鼠标穿透 ({ct_count} 张穿透中 · {hk_ct})")
+                else:
+                    self._restore_ct_action.setText(f"🖱️ 恢复贴图点击 (无穿透 · {hk_ct})")
+        except Exception:
+            pass
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick: self.main_app.activate_capture()
@@ -12510,10 +15581,7 @@ if __name__ == '__main__':
         app.setQuitOnLastWindowClosed(False)
 
         # 全局超清现代系统字体注入（Microsoft YaHei UI / Segoe UI，开启抗锯齿与亚像素 ClearType 微调）
-        global_font = QFont("Microsoft YaHei UI", 9)
-        global_font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
-        global_font.setHintingPreference(QFont.PreferFullHinting)
-        app.setFont(global_font)
+        ensure_high_dpi_and_fonts()
 
         icon_path = get_resource_path("app_icon.ico")
         if os.path.exists(icon_path):
@@ -12559,6 +15627,9 @@ if __name__ == '__main__':
         hotkey_mgr.on_history_pressed.connect(ex.show_history_dialog)
         hotkey_mgr.on_settings_pressed.connect(ex.show_settings_dialog)
         hotkey_mgr.on_drawer_pressed.connect(ex.toggle_drawer)
+        hotkey_mgr.on_toggle_pins_pressed.connect(ex.toggle_all_pins_visibility)
+        hotkey_mgr.on_paste_pin_pressed.connect(ex.paste_clipboard_as_pin)
+        hotkey_mgr.on_restore_click_through_pressed.connect(ex.restore_all_click_through)
 
         sys.exit(app.exec_())
     except Exception as e:

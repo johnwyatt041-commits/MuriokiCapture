@@ -24,6 +24,7 @@ hiddenimports = [
     'numpy',
     'keyboard',
     'pin_drawer',
+    'frosted_ui',
 ]
 
 tmp_ret_rapid = collect_all('rapidocr_onnxruntime')
