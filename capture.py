@@ -59,6 +59,27 @@ _RAPID_OCR_TRIED = False
 _RAPID_OCR_LOCK = threading.Lock()
 _RAPID_OCR_INFER_LOCK = threading.Lock()
 
+def _find_custom_ocr_models():
+    """检查程序目录或打包资源中的 models/ 是否放有升级版 ONNX 模型（如 PP-OCRv4/v5）。"""
+    model_dirs = []
+    for cand in (os.path.join(BASE_DIR, "models"), get_resource_path("models")):
+        if cand and os.path.isdir(cand) and cand not in model_dirs:
+            model_dirs.append(cand)
+    det_names = ("ch_PP-OCRv5_det_infer.onnx", "ch_PP-OCRv4_det_infer.onnx", "det.onnx")
+    rec_names = ("ch_PP-OCRv5_rec_infer.onnx", "ch_PP-OCRv4_rec_infer.onnx", "rec.onnx")
+    cls_names = ("ch_ppocr_mobile_v2.0_cls_infer.onnx", "cls.onnx")
+
+    def _pick(names):
+        for d in model_dirs:
+            for name in names:
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    return _pick(det_names), _pick(rec_names), _pick(cls_names)
+
+
 def get_rapid_ocr_engine():
     global _RAPID_OCR_ENGINE, _RAPID_OCR_TRIED
     if not _RAPID_OCR_TRIED:
@@ -67,8 +88,27 @@ def get_rapid_ocr_engine():
                 _RAPID_OCR_TRIED = True
                 try:
                     from rapidocr_onnxruntime import RapidOCR
-                    _RAPID_OCR_ENGINE = RapidOCR()
-                    logging.info("RapidOCR 引擎按需懒加载成功")
+                    det_path, rec_path, cls_path = _find_custom_ocr_models()
+                    init_kwargs = {
+                        "use_angle_cls": False,
+                        "text_score": 0.42,
+                        "min_height": 16,
+                        "width_height_ratio": -1,
+                        "det_model_path": det_path,
+                        "det_limit_type": "max",
+                        "det_limit_side_len": 1920,
+                        "det_box_thresh": 0.45,
+                        "det_unclip_ratio": 1.75,
+                    }
+                    if rec_path:
+                        init_kwargs["rec_model_path"] = rec_path
+                    if cls_path:
+                        init_kwargs["cls_model_path"] = cls_path
+                    try:
+                        _RAPID_OCR_ENGINE = RapidOCR(**init_kwargs)
+                    except Exception:
+                        _RAPID_OCR_ENGINE = RapidOCR()
+                    logging.info("RapidOCR 引擎按需懒加载成功 (det=%s, rec=%s)", det_path or "builtin", rec_path or "builtin")
                 except Exception as _ocr_pre_err:
                     logging.warning("RapidOCR 引擎加载失败: %s", _ocr_pre_err)
     return _RAPID_OCR_ENGINE
@@ -84,7 +124,7 @@ from PyQt5.QtCore import (Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QShared
                           QPropertyAnimation, QEasingCurve, pyqtProperty, QEvent, QEventLoop)
 from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QFontDatabase, QBrush, QWheelEvent,
                          QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QFontMetricsF, QRegion,
-                         QKeySequence)
+                         QKeySequence, QLinearGradient)
 
 # ==========================================
 # ENVIRONMENT & OCR SETUP
@@ -130,7 +170,7 @@ from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -150,6 +190,7 @@ def load_settings():
     defaults = {
         "use_ai_translation": False,
         "use_ai_ocr": False,
+        "ocr_enable_sea_langs": False,
         "ocr_target_lang": "",
         "translation_display_mode": "dialog",
         "zhipu_api_key": "",
@@ -1490,12 +1531,24 @@ LANG_NAME_MAP = {
 }
 
 def resolve_ocr_target_lang(text=""):
-    """目标语言：优先使用用户上次手动选择并持久化的值；未设置时中文译英、其余译中。"""
+    """智能判断默认目标语言：中英混排或有明显外文正文时优先译中文，避免误把英文对话反向译英。"""
+    t = text or ""
+    cjk_chars = len(re.findall(r'[\u4e00-\u9fff]', t))
+    non_cjk = len(re.findall(r'[A-Za-z\u00C0-\u024F\u0E00-\u0E7F\u3040-\u30ff\uac00-\ud7af]', t))
+    natural = "en" if (cjk_chars > 0 and cjk_chars * 3.0 >= non_cjk * 1.4 and non_cjk < 30) else "zh-CN"
+
     saved = str(load_settings().get("ocr_target_lang", "") or "").strip()
     valid_codes = {code for code, _label in SUPPORTED_LANGUAGES}
-    if saved in valid_codes:
+    if saved not in valid_codes:
+        return natural
+    # 东南亚小语种（菲/泰）显式偏好保留；中/英切换若与当前截图语种冲突则自动自适应翻转
+    if saved in ("tl", "th"):
         return saved
-    return "en" if re.search(r'[\u4e00-\u9fff]', text or "") else "zh-CN"
+    if saved == "en" and non_cjk >= 18 and cjk_chars * 3.0 < non_cjk:
+        return "zh-CN"
+    if saved == "zh-CN" and natural == "en" and cjk_chars >= 6 and non_cjk < 12:
+        return "en"
+    return saved
 
 def translate_single_chunk(text, target_lang, source_lang='auto', timeout=6):
     """单段落文本在线翻译：主通道 Chrome 接口，备用通道 MyMemory"""
@@ -1552,20 +1605,48 @@ def translate_single_chunk(text, target_lang, source_lang='auto', timeout=6):
     raise RuntimeError("翻译请求超时或网络异常，请检查网络设置。")
 
 def _looks_like_target(text, target_lang):
-    """粗略判断文本是否已经是目标语言，避免英文/数字块再走一遍在线翻译。"""
+    """谨慎判断文本是否已纯为目标语言或纯标识符/数字，避免误跳日文汉字、法/西/菲等拉丁语或中英混排句。"""
     t = (text or "").strip()
     if not t:
         return True
+    # 纯数字、时间戳、百分比、货币或纯符号无需翻译
     letters = [c for c in t if c.isalpha()]
     if not letters:
         return True
-    ascii_ratio = sum(1 for c in letters if ord(c) < 128) / len(letters)
-    cjk_ratio = sum(1 for c in letters if '\u4e00' <= c <= '\u9fff') / len(letters)
-    base = str(target_lang).split('-')[0].lower()
-    if base == 'en':
-        return ascii_ratio >= 0.9
+    # 纯 URL / 路径 / 版本号 / 点号及双下划线隐藏目录(.git, __pycache__) / 带单位数字(15 KB) / 用户名句柄 直接保留
+    if ' ' not in t and re.fullmatch(
+        r'(?:https?://\S+|[/\\][\w./\\-]+|v?\d+(?:\.\d+)+[a-zA-Z0-9_-]*'
+        r'|\d+(?:\.\d+)?[smhdw%]?'
+        r'|\.[A-Za-z0-9_.-]+|__[A-Za-z0-9_]+__'
+        r'|@[A-Za-z0-9_.-]+|[A-Za-z]+_?[A-Za-z0-9_]*\d+[A-Za-z0-9_]*|[a-z0-9]{2,}_+)',
+        t, re.IGNORECASE
+    ):
+        return True
+    if re.fullmatch(r'\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB|PB|px|pt|dp|sp|ms|Hz|fps|%)', t, re.IGNORECASE):
+        return True
+
+    has_kana = any(('\u3040' <= c <= '\u30ff') for c in t)
+    has_hangul = any(('\uac00' <= c <= '\ud7af') for c in t)
+    cjk_count = sum(1 for c in letters if '\u4e00' <= c <= '\u9fff')
+    ascii_count = sum(1 for c in letters if ord(c) < 128)
+    total = len(letters)
+    cjk_ratio = cjk_count / total
+    ascii_ratio = ascii_count / total
+
+    base = str(target_lang or "").split('-')[0].lower()
     if base == 'zh':
-        return cjk_ratio >= 0.5
+        if has_kana or has_hangul:
+            return False
+        # 仅当几乎全为汉字（>=85%）且不含明显英文单词时视为已是中文
+        has_eng_word = bool(re.search(r'[A-Za-z]{2,}', t))
+        return cjk_ratio >= 0.85 and not has_eng_word
+    if base == 'en':
+        # 拉丁语系（法/西/德/菲等）也全部是 ASCII/拉丁字母，不可按 ascii_ratio>=0.9 跳过！
+        # 仅跳过无空格且含下划线/驼峰/斜杠的纯代码标识符
+        if cjk_count == 0 and ' ' not in t and re.fullmatch(r'[A-Za-z0-9_./:-]+', t):
+            if '_' in t or '/' in t or re.search(r'[a-z][A-Z]', t) or len(t) <= 1:
+                return True
+        return False
     return False
 
 
@@ -1621,20 +1702,68 @@ def _clean_ai_output(choice_dict):
             return lines[-1]
     return ""
 
-def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25, is_cancelled_fn=None):
-    """使用火山引擎方舟豆包大模型进行极速高质量文本翻译（关闭思考以实现极低延迟与高吞吐）"""
-    if not text or not text.strip():
-        return "", source_lang
-    text = text.strip()
-
+def _call_volc_ark_chat(messages, timeout=25, max_tokens=2048, is_cancelled_fn=None):
+    """共享火山引擎方舟豆包大模型调用（支持自动关闭思考与不支持该参数时的降级重试）。"""
     if is_cancelled_fn and is_cancelled_fn():
-        return "", source_lang
-
+        return ""
     api_key = get_volc_api_key()
     if not api_key:
         raise RuntimeError("未检测到火山方舟 API 密钥，请在系统设置中配置 翻译 Token (ARK_API_KEY)。")
 
     model_ep = load_settings().get("volc_model", "").strip() or DEFAULT_VOLC_TRANS_MODEL
+    base_payload = {
+        "model": model_ep,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
+    }
+    auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
+
+    for try_mode in ("no_thinking", "fallback_standard"):
+        if is_cancelled_fn and is_cancelled_fn():
+            return ""
+        payload_dict = dict(base_payload)
+        if try_mode == "fallback_standard":
+            payload_dict.pop("thinking", None)
+
+        req = urllib.request.Request(
+            VOLC_ARK_API_URL,
+            data=json.dumps(payload_dict).encode('utf-8'),
+            headers={"Content-Type": "application/json", "Authorization": auth_header},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                choice = data['choices'][0]['message']
+                return _clean_ai_output(choice)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='replace') if e.fp else ''
+            logging.warning("火山方舟翻译请求失败 (HTTP %s): %s", e.code, body[:180])
+            if e.code == 401:
+                raise RuntimeError("火山方舟 API 密钥无效或未授权 (HTTP 401)，请在系统设置中检查您的翻译 Token。")
+            if e.code == 400 and try_mode == "no_thinking" and "thinking" in body.lower():
+                continue
+            api_msg = ""
+            try:
+                err_json = json.loads(body)
+                api_msg = err_json.get("error", {}).get("message") or err_json.get("message") or ""
+            except Exception:
+                api_msg = ""
+            raise RuntimeError(f"火山方舟翻译失败: {api_msg}" if api_msg else f"火山方舟翻译失败 (HTTP {e.code})。")
+        except Exception as e:
+            logging.warning("火山方舟翻译调用异常: %s", e)
+            raise RuntimeError(f"火山方舟翻译请求失败: {e}")
+
+    return ""
+
+
+def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25, is_cancelled_fn=None):
+    """使用火山引擎方舟豆包大模型进行极速高质量文本翻译（关闭思考以实现极低延迟与高吞吐）"""
+    if not text or not text.strip():
+        return "", source_lang
+    text = text.strip()
 
     target_name = _AI_LANG_NAMES.get(target_lang, target_lang)
     if source_lang and source_lang != 'auto':
@@ -1648,67 +1777,40 @@ def ai_translate_single_chunk(text, target_lang, source_lang='auto', timeout=25,
         f"Translate the following text into {target_name}. "
         f"Output ONLY the translated text without explanations, greetings, or notes."
     )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": text},
+    ]
+    result = _call_volc_ark_chat(messages, timeout=timeout, max_tokens=2048, is_cancelled_fn=is_cancelled_fn)
+    detected_src = source_lang if source_lang != 'auto' else 'auto'
+    return result, detected_src
 
-    base_payload = {
-        "model": model_ep,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 2048,
-        "thinking": {
-            "type": "disabled"
-        }
-    }
 
-    auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
-
-    # 优先带 thinking: disabled 请求以获得极速响应；若当前接入点不支持 thinking 参数则自动降级重试标准格式
-    for try_mode in ["no_thinking", "fallback_standard"]:
-        if is_cancelled_fn and is_cancelled_fn():
-            return "", source_lang
-
-        payload_dict = dict(base_payload)
-        if try_mode == "fallback_standard":
-            payload_dict.pop("thinking", None)
-
-        payload_bytes = json.dumps(payload_dict).encode('utf-8')
-        req = urllib.request.Request(
-            VOLC_ARK_API_URL,
-            data=payload_bytes,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": auth_header,
-            },
-            method="POST"
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                choice = data['choices'][0]['message']
-                result = _clean_ai_output(choice)
-                detected_src = source_lang if source_lang != 'auto' else 'auto'
-                return result, detected_src
-        except urllib.error.HTTPError as e:
-            body = e.read().decode('utf-8', errors='replace') if e.fp else ''
-            logging.warning("火山方舟翻译请求失败 (HTTP %s): %s", e.code, body[:180])
-            if e.code == 401:
-                raise RuntimeError("火山方舟 API 密钥无效或未授权 (HTTP 401)，请在系统设置中检查您的翻译 Token。")
-            if e.code == 400 and try_mode == "no_thinking" and "thinking" in body.lower():
-                continue
-            try:
-                err_json = json.loads(body)
-                msg = err_json.get("error", {}).get("message") or err_json.get("message") or f"HTTP {e.code}"
-                raise RuntimeError(f"火山方舟翻译失败: {msg}")
-            except Exception:
-                raise RuntimeError(f"火山方舟翻译失败 (HTTP {e.code})。")
-        except Exception as e:
-            logging.warning("火山方舟翻译调用异常: %s", e)
-            raise RuntimeError(f"火山方舟翻译请求失败: {e}")
-
-    return "", source_lang
+def ai_translate_batch(texts, target_lang, timeout=30, is_cancelled_fn=None):
+    """带上下文连贯性的批量 AI 翻译：一次传入同屏多个文字块，返回等长译文列表。"""
+    if not texts:
+        return []
+    target_name = _AI_LANG_NAMES.get(target_lang, target_lang)
+    system_prompt = (
+        f"You are a professional UI and document translator. "
+        f"You will receive a JSON array of {len(texts)} text snippets extracted in reading order from the same screenshot. "
+        f"Translate every snippet naturally and coherently into {target_name}, using surrounding snippets as context so terminology and phrasing match. "
+        f"If a snippet is already in {target_name} or is a pure identifier/number, keep it as-is. "
+        f"Return ONLY a valid JSON array of exact length {len(texts)} (no markdown code fence, no extra text)."
+    )
+    user_content = json.dumps(list(texts), ensure_ascii=False)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    raw = _call_volc_ark_chat(messages, timeout=timeout, max_tokens=4096, is_cancelled_fn=is_cancelled_fn)
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, list) or len(parsed) != len(texts):
+        raise ValueError(f"AI 批量返回条数不匹配: {len(parsed) if isinstance(parsed, list) else type(parsed).__name__} != {len(texts)}")
+    return [str(item or "").strip() for item in parsed]
 
 def ai_translate_text(text, target_lang, source_lang='auto', is_cancelled_fn=None):
     """AI 翻译：多段落/超长文本处理"""
@@ -1769,9 +1871,12 @@ class TranslationWorker(QThread):
 # ==========================================
 # OCR 结果展示与多语言智能翻译弹窗 (现代浅色双栏对照风格)
 # ==========================================
+_DETACHED_OCR_WORKERS = set()
+
+
 class OcrResultDialog(QDialog):
     def __init__(self, text, parent=None, prefill_translation=None, target_lang=None, prefill_error="",
-                 detected_codes=None, ocr_doc=None):
+                 detected_codes=None, ocr_doc=None, source_image=None, ocr_warning=""):
         super().__init__(parent)
         self.setWindowTitle("文字识别与翻译 (OCR & Translation)")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
@@ -1779,11 +1884,15 @@ class OcrResultDialog(QDialog):
         self.setMinimumSize(800, 500)
 
         self.current_worker = None
+        self._reocr_worker = None
+        self._dialog_closed = False
         self.detected_lang = "auto"
         self.prefill_translation = prefill_translation
         self.prefill_error = prefill_error
         self.detected_codes = list(detected_codes or [])
         self.ocr_doc = ocr_doc
+        self.source_image = QImage(source_image) if (source_image is not None and not source_image.isNull()) else None
+        self.ocr_warning = str(ocr_warning or "").strip()
         self.debounce_timer = QTimer(self)
         self.debounce_timer.setSingleShot(True)
         self.debounce_timer.timeout.connect(self.trigger_translation)
@@ -1812,10 +1921,12 @@ class OcrResultDialog(QDialog):
                 use_ai = self.combo_mode.currentData() == "ai"
                 self._set_status("AI 翻译完成" if use_ai else "翻译完成", "ok")
         elif (text or "").strip():
+            if self.ocr_warning:
+                self._set_status(self.ocr_warning, "warn")
             # 普通识别入口：弹窗打开后立即发起初次自动翻译
             QTimer.singleShot(80, self.trigger_translation)
         else:
-            self._set_status("已解码二维码/条码", "ok")
+            self._set_status(self.ocr_warning or "已解码二维码/条码", "warn" if self.ocr_warning else "ok")
 
     def _set_status(self, text, tone="muted"):
         if not text:
@@ -1892,6 +2003,13 @@ class OcrResultDialog(QDialog):
         self.combo_ocr_mode.setMinimumWidth(116)
         self.combo_ocr_mode.currentIndexChanged.connect(self._on_ocr_mode_changed)
 
+        self.btn_reocr = QPushButton("重新识别")
+        self.btn_reocr.setObjectName("codexSecondaryBtn")
+        self.btn_reocr.setCursor(Qt.PointingHandCursor)
+        self.btn_reocr.setToolTip("使用当前所选识别引擎对原截图重新执行 OCR")
+        self.btn_reocr.setVisible(self.source_image is not None)
+        self.btn_reocr.clicked.connect(self.trigger_reocr)
+
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.VLine)
         sep1.setObjectName("sepLine")
@@ -1932,6 +2050,7 @@ class OcrResultDialog(QDialog):
 
         row2.addWidget(lbl_ocr_mode)
         row2.addWidget(self.combo_ocr_mode)
+        row2.addWidget(self.btn_reocr)
         row2.addWidget(sep1)
         row2.addWidget(lbl_mode)
         row2.addWidget(self.combo_mode)
@@ -2166,9 +2285,83 @@ class OcrResultDialog(QDialog):
         self.trigger_translation()
 
     def _on_ocr_mode_changed(self):
-        """识别模式切换时保存设置"""
+        """识别模式切换时保存设置，若持有原图则立即用新引擎重新识别"""
         use_ai_ocr = self.combo_ocr_mode.currentData() == "ai_ocr"
         save_settings({"use_ai_ocr": use_ai_ocr})
+        if self.source_image is not None:
+            self.trigger_reocr()
+
+    def trigger_reocr(self):
+        """使用当前选择的识别引擎对原截图重新识别并刷新结果"""
+        if self.source_image is None or self.source_image.isNull() or self._dialog_closed:
+            return
+        use_ai_ocr = self.combo_ocr_mode.currentData() == "ai_ocr"
+        self.debounce_timer.stop()
+
+        self.btn_reocr.setEnabled(False)
+        self.combo_ocr_mode.setEnabled(False)
+        self._set_status("AI 正在重新识别..." if use_ai_ocr else "正在重新识别...", "info")
+
+        worker = OcrWorker(self.source_image, use_ai=use_ai_ocr)
+        _DETACHED_OCR_WORKERS.add(worker)
+        self._reocr_worker = worker
+
+        def _cleanup_worker(*_args, _w=worker):
+            _DETACHED_OCR_WORKERS.discard(_w)
+            try:
+                _w.deleteLater()
+            except RuntimeError:
+                pass
+
+        def _on_done(new_text, _w=worker):
+            if self._dialog_closed or self._reocr_worker is not _w:
+                return
+            self._reocr_worker = None
+            self.btn_reocr.setEnabled(True)
+            self.combo_ocr_mode.setEnabled(True)
+            self.ocr_doc = getattr(_w, "ocr_doc", None)
+            warn = str(getattr(_w, "ocr_warning", "") or "").strip()
+            self.ocr_warning = warn
+            clean = (new_text or "").strip()
+            if clean.startswith("识别发生错误:"):
+                self._set_status("重新识别失败", "err")
+                QMessageBox.warning(self, "重新识别失败", clean)
+                return
+            self.source_edit.blockSignals(True)
+            self.source_edit.setPlainText(clean)
+            self.source_edit.blockSignals(False)
+            self.lbl_char_count.setText(f"{len(clean)} 字符")
+            if clean:
+                self.trigger_translation()
+                if warn:
+                    self._set_status(warn, "warn")
+            else:
+                self.target_edit.clear()
+                self._set_status(warn or "未识别到文字", "warn")
+
+        worker.finished.connect(_on_done)
+        worker.finished.connect(_cleanup_worker)
+        worker.start()
+
+    def _cleanup_on_close(self):
+        self._dialog_closed = True
+        self.debounce_timer.stop()
+        if self.current_worker and self.current_worker.isRunning():
+            try:
+                self.current_worker.cancel()
+                self.current_worker.finished.disconnect()
+                self.current_worker.error.disconnect()
+            except Exception:
+                pass
+        self._reocr_worker = None
+
+    def done(self, r):
+        self._cleanup_on_close()
+        super().done(r)
+
+    def closeEvent(self, event):
+        self._cleanup_on_close()
+        super().closeEvent(event)
 
     def trigger_translation(self):
         text = self.source_edit.toPlainText().strip()
@@ -2200,7 +2393,10 @@ class OcrResultDialog(QDialog):
         self.btn_translate.setEnabled(True)
         self.target_edit.setPlainText(result)
         use_ai = self.combo_mode.currentData() == "ai"
-        self._set_status("AI 翻译完成" if use_ai else "翻译完成", "ok")
+        if self.ocr_warning:
+            self._set_status(self.ocr_warning, "warn")
+        else:
+            self._set_status("AI 翻译完成" if use_ai else "翻译完成", "ok")
 
         # 更新识别到的源语言标签
         lang_name = LANG_NAME_MAP.get(detected_src, detected_src)
@@ -2261,18 +2457,51 @@ def _image_to_base64(image: QImage):
     pil_img.save(ba, format="PNG", optimize=True)
     return base64.b64encode(ba.getvalue()).decode('utf-8')
 
+
+def _image_to_data_uri(image: QImage, max_side=2400, png_byte_limit=1_600_000):
+    """为多模态 AI OCR 准备最优图像 Data URI：极小图放大并留白，超大高分图适度压缩以提速防超时。"""
+    img = image.convertToFormat(QImage.Format_RGB888)
+    w, h = img.width(), img.height()
+    ptr = img.bits()
+    ptr.setsize(img.byteCount())
+    pil_img = Image.frombytes("RGB", (w, h), bytes(ptr), "raw", "RGB", img.bytesPerLine())
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+
+    if min(w, h) < 40 and max(w, h) * 2 <= max_side:
+        pil_img = pil_img.resize((max(1, w * 2), max(1, h * 2)), resample)
+        arr_rgb = np.asarray(pil_img)
+        padded = cv2.copyMakeBorder(arr_rgb, 12, 12, 12, 12, cv2.BORDER_REPLICATE)
+        pil_img = Image.fromarray(padded, mode="RGB")
+    elif max(w, h) > max_side:
+        pil_img.thumbnail((max_side, max_side), resample)
+
+    ba = io.BytesIO()
+    pil_img.save(ba, format="PNG", optimize=True)
+    raw = ba.getvalue()
+    if len(raw) > png_byte_limit:
+        jb = io.BytesIO()
+        pil_img.save(jb, format="JPEG", quality=92, optimize=True)
+        jraw = jb.getvalue()
+        if len(jraw) < len(raw):
+            return f"data:image/jpeg;base64,{base64.b64encode(jraw).decode('utf-8')}"
+    return f"data:image/png;base64,{base64.b64encode(raw).decode('utf-8')}"
+
+
 def ai_ocr_recognize(image: QImage, timeout=30):
     """使用智谱 AI GLM-OCR 专业多模态/文档识别模型解析文字"""
     api_key = get_zhipu_api_key()
     if not api_key:
         raise RuntimeError("未检测到智谱 API 密钥，请在系统设置中配置 识图 Token (bigmodel.cn)。")
 
-    img_base64 = _image_to_base64(image)
+    data_uri = _image_to_data_uri(image)
     model_name = load_settings().get("glm_ocr_model", "").strip() or DEFAULT_ZHIPU_OCR_MODEL
 
     payload = json.dumps({
         "model": model_name,
-        "file": f"data:image/png;base64,{img_base64}"
+        "file": data_uri
     }).encode('utf-8')
 
     auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
@@ -2321,12 +2550,13 @@ def ai_ocr_recognize(image: QImage, timeout=30):
         logging.warning("智谱 GLM-OCR 请求失败 (HTTP %s): %s", e.code, body[:180])
         if e.code == 401:
             raise RuntimeError("智谱 API 密钥无效或未授权 (HTTP 401)，请在系统设置中检查您的识图 Token。")
+        api_msg = ""
         try:
             err_json = json.loads(body)
-            msg = err_json.get("error", {}).get("message") or err_json.get("msg") or f"HTTP {e.code}"
-            raise RuntimeError(f"智谱 GLM-OCR 识别失败: {msg}")
+            api_msg = err_json.get("error", {}).get("message") or err_json.get("msg") or ""
         except Exception:
-            raise RuntimeError(f"智谱 GLM-OCR 识别失败 (HTTP {e.code})。")
+            api_msg = ""
+        raise RuntimeError(f"智谱 GLM-OCR 识别失败: {api_msg}" if api_msg else f"智谱 GLM-OCR 识别失败 (HTTP {e.code})。")
     except Exception as e:
         logging.warning("智谱 GLM-OCR 调用异常: %s", e)
         raise RuntimeError(f"智谱 GLM-OCR 请求失败: {e}")
@@ -2338,20 +2568,18 @@ def ai_ocr_recognize(image: QImage, timeout=30):
 # 二维码 / 条形码自动检测与表格 TSV 结构重建
 # ==========================================
 def _qimage_to_rgb_array(image: QImage):
-    """将 QImage 安全转换为连续 RGB ndarray (H, W, 3)。"""
+    """将 QImage 安全转换为独立拥有的连续 RGB ndarray (H, W, 3)，绝不悬空引用临时 QImage 内存。"""
     if image is None or image.isNull():
         return None
-    img_rgb = image.convertToFormat(QImage.Format_RGB888)
+    img_rgb = image if image.format() == QImage.Format_RGB888 else image.convertToFormat(QImage.Format_RGB888)
     width, height = img_rgb.width(), img_rgb.height()
     if width <= 0 or height <= 0:
         return None
     bpl = img_rgb.bytesPerLine()
-    ptr = img_rgb.bits()
+    ptr = img_rgb.constBits()
     ptr.setsize(img_rgb.byteCount())
     raw = np.frombuffer(ptr, np.uint8).reshape((height, bpl))
-    if bpl > width * 3:
-        return np.ascontiguousarray(raw[:, :width * 3].reshape((height, width, 3)))
-    return np.ascontiguousarray(raw.reshape((height, width, 3)))
+    return np.array(raw[:, :width * 3].reshape((height, width, 3)), dtype=np.uint8, copy=True)
 
 
 def detect_codes_in_image(img_source):
@@ -2472,7 +2700,7 @@ def extract_table_tsv(doc=None, fallback_text=""):
                 # 统计中位行高，用于聚齐每一列左边界 X 坐标（保留空白列对齐）
                 heights = sorted(max(8, c.rect.height()) for c in valid_rows)
                 med_h = heights[len(heights) // 2]
-                col_tol = max(24.0, med_h * 1.4)
+                col_tol = max(16.0, med_h * 1.1)
                 multi_cells = [c for vr in visual_rows if len(vr["cells"]) >= 2 for c in vr["cells"]]
                 x_buckets = []
                 for left_x in sorted(c.rect.left() for c in multi_cells):
@@ -2549,12 +2777,62 @@ def _ocr_item_bbox(points):
         return None
 
 
+def _char_visual_weight(ch):
+    """按字符视觉宽度估算权重，避免中英混排时等分字符框发生横向漂移。"""
+    if not ch:
+        return 1.0
+    o = ord(ch)
+    if (0x4E00 <= o <= 0x9FFF) or (0x3000 <= o <= 0x30FF) or (0xFF00 <= o <= 0xFFEF) or (0xAC00 <= o <= 0xD7AF):
+        return 2.0
+    if ch in "ilI1|.,:;'!` ":
+        return 0.58
+    if ch in "mwMW@#%&":
+        return 1.25
+    return 1.0
+
+
+def _estimate_char_rects(rect, text):
+    """按字符视觉权重为文本块估算逐字符包围盒（保证 len == len(text)）。"""
+    if not text:
+        return []
+    weights = [_char_visual_weight(ch) for ch in text]
+    total_w = sum(weights) or float(len(text))
+    rects = []
+    cur_x = float(rect.left())
+    span_w = float(max(1, rect.width()))
+    for idx, w in enumerate(weights):
+        cw = span_w * (w / total_w)
+        x0 = int(round(cur_x))
+        x1 = rect.right() + 1 if idx == len(weights) - 1 else int(round(cur_x + cw))
+        rects.append(QRect(x0, rect.top(), max(1, x1 - x0), rect.height()))
+        cur_x += cw
+    return rects
+
+
+def _should_insert_space_between(prev_text, next_text, gap, min_h):
+    """判断同行相邻两个识别词块之间是否应补充空格。"""
+    if not prev_text or not next_text:
+        return False
+    prev_ch = prev_text[-1]
+    next_ch = next_text[0]
+    if prev_ch.isspace() or next_ch.isspace():
+        return False
+    if prev_ch.isascii() and prev_ch.isalnum() and next_ch.isascii() and next_ch.isalnum():
+        return True
+    if prev_ch in ",:;.)]}%?!" and next_ch.isascii() and (next_ch.isalnum() or next_ch in "([{\"'"):
+        return True
+    is_cjk_pair = ('\u4e00' <= prev_ch <= '\u9fff') and ('\u4e00' <= next_ch <= '\u9fff')
+    if is_cjk_pair:
+        return gap >= max(8.0, min_h * 0.85)
+    return gap >= max(3.0, min_h * 0.30)
+
+
 def build_ocr_doc(rapid_lines, image_size):
     """
     将 RapidOCR 的逐块结果整理为按阅读顺序排列的行：
     1. 先按纵向中心聚类成视觉行；
-    2. 行内按横坐标排序，英文词块之间补空格；
-    3. 为每个字符估算一个矩形，用于鼠标框选与高亮。
+    2. 行内按横坐标排序，结合标点与间隙智能补空格；
+    3. 按字符视觉权重估算矩形，用于鼠标框选与高亮。
     """
     if not rapid_lines:
         return None
@@ -2580,26 +2858,35 @@ def build_ocr_doc(rapid_lines, image_size):
 
     segments.sort(key=lambda s: (s[0].center().y(), s[0].left()))
 
-    # 纵向聚类成行：以行内平均中心为基准，容差取行高的一半左右
+    # 纵向聚类成行：跟踪行内平均 Y 中心与平均高度，避免首个词块偏大导致整行漂移
     grouped = []
     for seg in segments:
         rect = seg[0]
         placed = False
         for row in grouped:
             row_rect = row["rect"]
-            anchor = row["anchor"]
+            anchor_y = row["cy"]
+            anchor_h = row["h"]
             h_min = max(1, min(row_rect.height(), rect.height()))
             overlap = min(row_rect.bottom(), rect.bottom()) - max(row_rect.top(), rect.top())
-            center_delta = abs(rect.center().y() - anchor.center().y())
-            same_row = (center_delta <= max(8.0, max(anchor.height(), rect.height()) * 0.7)
-                        or (overlap >= h_min * 0.5 and center_delta <= anchor.height() * 1.2))
+            center_delta = abs(rect.center().y() - anchor_y)
+            same_row = (center_delta <= max(6.0, max(anchor_h, rect.height()) * 0.65)
+                        or (overlap >= h_min * 0.55 and center_delta <= max(anchor_h, rect.height()) * 1.15))
             if same_row:
                 row["items"].append(seg)
                 row["rect"] = row_rect.united(rect)
+                n = len(row["items"])
+                row["cy"] = (anchor_y * (n - 1) + rect.center().y()) / n
+                row["h"] = (anchor_h * (n - 1) + rect.height()) / n
                 placed = True
                 break
         if not placed:
-            grouped.append({"rect": QRect(rect), "items": [seg], "anchor": QRect(rect)})
+            grouped.append({
+                "rect": QRect(rect),
+                "items": [seg],
+                "cy": float(rect.center().y()),
+                "h": float(rect.height()),
+            })
 
     grouped.sort(key=lambda r: (r["rect"].top(), r["rect"].left()))
 
@@ -2607,14 +2894,15 @@ def build_ocr_doc(rapid_lines, image_size):
     for group in grouped:
         items = sorted(group["items"], key=lambda s: s[0].left())
 
-        # 同一视觉行内按横向间隙再分块：聊天气泡、左右分栏、标签+值不会被强行拼成一条超长行。
+        # 同一视觉行内按行高自适应横向间隙分块：小字表格/多栏不会被硬编码 56px 强行拼成一条
         clusters = []
         for item in items:
             rect = item[0]
             if clusters:
                 prev_rect = clusters[-1][-1][0]
                 gap = rect.left() - prev_rect.right()
-                gap_limit = max(56.0, min(rect.height(), prev_rect.height()) * 3.0)
+                min_h = max(4.0, float(min(rect.height(), prev_rect.height())))
+                gap_limit = max(14.0, min_h * 2.2)
                 if gap <= gap_limit:
                     clusters[-1].append(item)
                     continue
@@ -2624,11 +2912,12 @@ def build_ocr_doc(rapid_lines, image_size):
             parts = []
             char_rects = []
             prev_rect = None
-            prev_char = ""
+            prev_text = ""
             for rect, text, _score in cluster:
-                if prev_rect is not None and prev_char and text:
-                    next_char = text[0]
-                    if prev_char.isascii() and prev_char.isalnum() and next_char.isascii() and next_char.isalnum():
+                if prev_rect is not None and prev_text and text:
+                    gap = rect.left() - prev_rect.right()
+                    min_h = max(4.0, float(min(rect.height(), prev_rect.height())))
+                    if _should_insert_space_between(prev_text, text, gap, min_h):
                         gap_left = prev_rect.right() + 1
                         gap_right = rect.left() - 1
                         if gap_right - gap_left >= 2:
@@ -2638,13 +2927,10 @@ def build_ocr_doc(rapid_lines, image_size):
                             space_rect = QRect(rect.left() - 2, rect.top(), 2, rect.height())
                         parts.append(" ")
                         char_rects.append(space_rect)
-                char_w = rect.width() / max(1, len(text))
-                for idx, ch in enumerate(text):
-                    parts.append(ch)
-                    char_rects.append(QRect(int(rect.left() + idx * char_w), rect.top(),
-                                            max(1, int(math.ceil(char_w))), rect.height()))
+                parts.extend(text)
+                char_rects.extend(_estimate_char_rects(rect, text))
                 prev_rect = rect
-                prev_char = text[-1]
+                prev_text = text
 
             row_text = "".join(parts).strip()
             if not row_text:
@@ -2659,40 +2945,75 @@ def build_ocr_doc(rapid_lines, image_size):
     return OcrDoc(rows, image_size)
 
 
-def tesseract_ocr_lines(image_rgb, lang_str=None, min_conf=5):
+def _border_ring_median(img_arr):
+    """采样图像最外圈 2px 边界的中位颜色/亮度，用于稳定判断深浅背景与边缘留白填充。"""
+    if img_arr is None or img_arr.size == 0:
+        return 255 if (img_arr is not None and img_arr.ndim == 2) else (255, 255, 255)
+    h, w = img_arr.shape[:2]
+    b = min(2, h, w)
+    strips = [img_arr[:b, :], img_arr[h - b:, :], img_arr[:, :b], img_arr[:, w - b:]]
+    if img_arr.ndim == 2:
+        vals = np.concatenate([s.reshape(-1) for s in strips])
+        return int(np.median(vals))
+    vals = np.concatenate([s.reshape(-1, img_arr.shape[2]) for s in strips], axis=0)
+    med = np.median(vals, axis=0)
+    return tuple(int(v) for v in med[:3])
+
+
+def _prepare_gray_for_tesseract(image_rgb):
+    """共享 Tesseract 灰度预处理：深底彩字用最大色差映射提纯对比度、小中字放大与留白。"""
+    bg_rgb = _border_ring_median(image_rgb)
+    bg_luma = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+    if bg_luma < 115:
+        # 深底彩色终端字在灰度转换下容易对比度骤降，按与深色底的最大通道色差提取黑字白底
+        bg_vec = np.array(bg_rgb, dtype=np.int16).reshape(1, 1, 3)
+        diff = np.max(np.abs(image_rgb.astype(np.int16) - bg_vec), axis=2)
+        gray = np.clip(255 - diff, 0, 255).astype(np.uint8)
+    else:
+        gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+
+    h_img, w_img = gray.shape
+    scale = 2.5 if h_img < 160 else (2.0 if max(h_img, w_img) < 1400 else 1.0)
+    if scale > 1.0 and max(h_img, w_img) * scale > 4200:
+        scale = max(1.0, 4200.0 / max(1, h_img, w_img))
+    if scale > 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # 仅在前景文字相对背景确实偏淡时启用 CLAHE，避免在干净深色终端高对比字上制造振铃噪点
+    fg_contrast = float(np.percentile(np.abs(gray.astype(np.int16) - float(np.median(gray))), 98))
+    if fg_contrast < 65.0:
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        processed = clahe.apply(gray)
+    else:
+        processed = gray
+    processed = cv2.normalize(processed, None, 0, 255, cv2.NORM_MINMAX)
+
+    pad = 16
+    edge_val = _border_ring_median(processed)
+    canvas = cv2.copyMakeBorder(processed, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=edge_val)
+    return canvas, scale, pad
+
+
+def tesseract_ocr_lines(image_rgb, lang_str=None, min_conf=5, allow_fallback_langs=False):
     """
-    RapidOCR 不可用时的坐标回退：用 Tesseract image_to_data 获取词级 bbox，
-    再交给 build_ocr_doc 聚合成行。这样即使只装了 Tesseract，取字/译文覆盖也能定位文字。
+    使用 Tesseract image_to_data 获取词级 bbox 与置信度。
+    默认仅用中英 (AUTO_OCR_LANGS)，避免泰语/菲律宾语包误认污染正常中文结果。
     """
     requested_lang = lang_str or AUTO_OCR_LANGS
     try:
-        pil_img = Image.fromarray(image_rgb).convert('L')
-        # 深色截图（白字黑底）先反色，避免 Tesseract 完全识别不到
-        from PIL import ImageOps
-        if np.mean(np.asarray(pil_img)) < 127:
-            pil_img = ImageOps.invert(pil_img)
-        # 提升灰色小字/低对比度正文的识别率
-        pil_img = ImageOps.autocontrast(pil_img, cutoff=1)
-
-        # 小图放大 + 边缘留白，显著提升小字号中文的识别率；坐标会在下面换算回原图
-        scale = 2.0 if pil_img.height < 220 else 1.0
-        if scale > 1.0:
-            try:
-                resample = Image.Resampling.LANCZOS
-            except AttributeError:
-                resample = Image.LANCZOS
-            pil_img = pil_img.resize((int(pil_img.width * scale), int(pil_img.height * scale)),
-                                     resample)
-        pad = 16
-        arr_gray = np.asarray(pil_img)
-        edge_val = int(np.median(arr_gray[:2, :])) if arr_gray.size else 255
-        canvas = Image.new('L', (pil_img.width + pad * 2, pil_img.height + pad * 2), edge_val)
-        canvas.paste(pil_img, (pad, pad))
-
+        canvas, scale, pad = _prepare_gray_for_tesseract(image_rgb)
+        pil_canvas = Image.fromarray(canvas, mode='L')
         data = pytesseract.image_to_data(
-            canvas, lang=requested_lang, config='--oem 1 --psm 3',
+            pil_canvas, lang=requested_lang, config='--oem 1 --psm 3',
             output_type=pytesseract.Output.DICT
         )
+        has_words = any(str(t).strip() for t in (data.get('text') or []))
+        if not has_words:
+            # 稀疏单块/单行截图在 psm 3 下可能为空，回退 psm 6 再扫一次
+            data = pytesseract.image_to_data(
+                pil_canvas, lang=requested_lang, config='--oem 1 --psm 6',
+                output_type=pytesseract.Output.DICT
+            )
     except Exception as e:
         logging.warning("Tesseract 词级版面识别失败: %s", e)
         return []
@@ -2712,23 +3033,523 @@ def tesseract_ocr_lines(image_rgb, lang_str=None, min_conf=5):
         try:
             x = int((data['left'][i] - pad) / scale)
             y = int((data['top'][i] - pad) / scale)
-            w = int(data['width'][i] / scale)
-            h = int(data['height'][i] / scale)
+            w = int(math.ceil(data['width'][i] / scale))
+            h = int(math.ceil(data['height'][i] / scale))
         except Exception:
             continue
         if w < 2 or h < 2:
             continue
         box = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
         lines.append((box, text, max(0.0, min(1.0, conf / 100.0))))
-    if not lines and lang_str is None and requested_lang != TESSERACT_LANGS:
-        # 中英没识别到内容时，再尝试泰语/菲律宾语等完整语言包
-        return tesseract_ocr_lines(image_rgb, TESSERACT_LANGS, min_conf)
+
+    if not lines and allow_fallback_langs and lang_str is None and requested_lang != TESSERACT_LANGS:
+        return tesseract_ocr_lines(image_rgb, TESSERACT_LANGS, min_conf, allow_fallback_langs=False)
     return lines
+
+
+def _tile_starts(total_len, tile_len, overlap):
+    """生成带重叠的滑窗切片起点列表，保证末端完整覆盖。"""
+    if total_len <= tile_len:
+        return [0]
+    step = max(1, tile_len - overlap)
+    starts = list(range(0, total_len - tile_len + 1, step))
+    last = total_len - tile_len
+    if not starts or starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def _rapid_ocr_single_tile(rapid_engine, bgr):
+    """对单块 BGR 图像做小字放大、边缘留白后推理，并精确反算回原图坐标。"""
+    h, w = bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return []
+
+    if h < 48 or w < 120:
+        scale = min(2.5, 1600.0 / max(1, w, h))
+    elif max(h, w) < 900 and min(h, w) < 450:
+        scale = 2.0
+    else:
+        scale = 1.0
+    scale = max(1.0, scale)
+
+    if scale > 1.05:
+        work = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    else:
+        scale = 1.0
+        work = bgr
+
+    pad = 24
+    bg_bgr = _border_ring_median(work)
+    padded = cv2.copyMakeBorder(work, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=bg_bgr)
+
+    with _RAPID_OCR_INFER_LOCK:
+        res, _ = rapid_engine(padded)
+    if not res:
+        return []
+
+    mapped = []
+    for item in res:
+        try:
+            pts, text, score = item[0], str(item[1]).strip(), float(item[2])
+            if not text:
+                continue
+            new_pts = []
+            for pt in pts:
+                ox = max(0.0, min(float(w), (float(pt[0]) - pad) / scale))
+                oy = max(0.0, min(float(h), (float(pt[1]) - pad) / scale))
+                new_pts.append([ox, oy])
+            xs = [p[0] for p in new_pts]
+            ys = [p[1] for p in new_pts]
+            if max(xs) - min(xs) < 2 or max(ys) - min(ys) < 2:
+                continue
+            mapped.append([new_pts, text, score])
+        except Exception:
+            continue
+    return mapped
+
+
+def _dedup_tiled_boxes(candidates):
+    """对切片识别结果按非切边优先 + 置信度与字数加权去重。"""
+    if len(candidates) <= 1:
+        return [c[0] for c in candidates]
+
+    ordered = sorted(
+        candidates,
+        key=lambda c: (not c[2], c[1] * max(1, len(c[0][1].strip()))),
+        reverse=True
+    )
+    kept = []
+    for item, _score, _clipped, rect in ordered:
+        x0, y0, x1, y1 = rect
+        rw = max(1.0, x1 - x0)
+        rh = max(1.0, y1 - y0)
+        duplicate = False
+        for _k_item, k_rect in kept:
+            kx0, ky0, kx1, ky1 = k_rect
+            ix0, iy0 = max(x0, kx0), max(y0, ky0)
+            ix1, iy1 = min(x1, kx1), min(y1, ky1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            iw, ih = ix1 - ix0, iy1 - iy0
+            min_w = min(rw, max(1.0, kx1 - kx0))
+            min_h = min(rh, max(1.0, ky1 - ky0))
+            inter_area = iw * ih
+            min_area = min(rw * rh, max(1.0, (kx1 - kx0) * (ky1 - ky0)))
+            if (ih >= 0.55 * min_h and iw >= 0.50 * min_w) or (inter_area >= 0.50 * min_area):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append((item, rect))
+    return [k[0] for k in kept]
+
+
+def _rapid_ocr_tiled(rapid_engine, bgr):
+    """超大/长截图走带重叠滑窗分块识别，避免长边压缩导致小字糊掉。"""
+    h, w = bgr.shape[:2]
+    tile_w, tile_h, overlap = 1600, 1400, 180
+    if max(h, w) <= 1920:
+        return _rapid_ocr_single_tile(rapid_engine, bgr)
+
+    xs = _tile_starts(w, tile_w, overlap)
+    ys = _tile_starts(h, tile_h, overlap)
+    candidates = []
+    for y0 in ys:
+        y1 = min(h, y0 + tile_h)
+        for x0 in xs:
+            x1 = min(w, x0 + tile_w)
+            sub_res = _rapid_ocr_single_tile(rapid_engine, bgr[y0:y1, x0:x1])
+            for pts, text, score in sub_res:
+                shifted = [[pt[0] + x0, pt[1] + y0] for pt in pts]
+                pxs = [p[0] for p in shifted]
+                pys = [p[1] for p in shifted]
+                bx0, bx1 = min(pxs), max(pxs)
+                by0, by1 = min(pys), max(pys)
+                clipped = (
+                    (x0 > 0 and bx0 <= x0 + 4)
+                    or (x1 < w and bx1 >= x1 - 4)
+                    or (y0 > 0 and by0 <= y0 + 4)
+                    or (y1 < h and by1 >= y1 - 4)
+                )
+                candidates.append(([shifted, text, score], score, clipped, (bx0, by0, bx1, by1)))
+    return _dedup_tiled_boxes(candidates)
+
+
+def _enhance_bgr_for_retry(bgr):
+    """低置信度或空结果时的对比度增强 + 锐化预处理（深色底自动反色）。"""
+    work = bgr
+    bg = _border_ring_median(work)
+    luma = 0.114 * bg[0] + 0.587 * bg[1] + 0.299 * bg[2]
+    if luma < 110:
+        work = cv2.bitwise_not(work)
+    lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    l_ch = clahe.apply(l_ch)
+    merged = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+    blur = cv2.GaussianBlur(merged, (0, 0), 1.0)
+    return cv2.addWeighted(merged, 1.35, blur, -0.35, 0)
+
+
+def _ocr_quality_stats(lines):
+    if not lines:
+        return 0.0, 0.0, 0, 1.0
+    total_weighted = 0.0
+    conf_sum = 0.0
+    total_chars = 0
+    low_cnt = 0
+    for item in lines:
+        text = str(item[1]).strip()
+        score = float(item[2]) if len(item) > 2 else 1.0
+        n = max(1, len(text))
+        total_weighted += score * n
+        conf_sum += score
+        total_chars += len(text)
+        if score < 0.72:
+            low_cnt += 1
+    mean_conf = conf_sum / len(lines)
+    low_ratio = low_cnt / len(lines)
+    return total_weighted, mean_conf, total_chars, low_ratio
+
+
+def _merge_non_overlapping_ocr(primary_lines, extra_lines, min_score=0.72):
+    """把补充识别中未与主结果重叠的高置信度文本框并入，挽回局部漏检。"""
+    if not extra_lines:
+        return primary_lines
+    merged = list(primary_lines)
+    primary_rects = [r for r in (_ocr_item_bbox(it[0]) for it in primary_lines) if r is not None]
+    for item in extra_lines:
+        score = float(item[2]) if len(item) > 2 else 0.0
+        if score < min_score:
+            continue
+        rect = _ocr_item_bbox(item[0])
+        if rect is None:
+            continue
+        overlapped = False
+        for pr in primary_rects:
+            inter = pr.intersected(rect)
+            if not inter.isValid():
+                continue
+            min_h = max(1, min(pr.height(), rect.height()))
+            min_w = max(1, min(pr.width(), rect.width()))
+            if inter.height() >= min_h * 0.4 and inter.width() >= min_w * 0.3:
+                overlapped = True
+                break
+        if not overlapped:
+            merged.append(item)
+            primary_rects.append(rect)
+    return merged
+
+
+def _rapid_ocr_with_retry(rapid_engine, rgb_arr):
+    """执行 RapidOCR：RGB→BGR 转换、切片/小字放大留白，并在为空或低置信度时自动对比度增强重识。"""
+    bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+    primary = _rapid_ocr_tiled(rapid_engine, bgr)
+    p_total, p_mean, p_chars, p_low = _ocr_quality_stats(primary)
+
+    need_retry = (not primary) or (p_mean < 0.78) or (len(primary) >= 2 and p_low >= 0.30)
+    if not need_retry:
+        return primary
+
+    enhanced = _enhance_bgr_for_retry(bgr)
+    retry = _rapid_ocr_tiled(rapid_engine, enhanced)
+    if not retry:
+        return primary
+
+    r_total, r_mean, r_chars, _ = _ocr_quality_stats(retry)
+    if not primary:
+        return retry
+    if r_total > p_total * 1.06 or (r_chars >= p_chars * 0.9 and r_mean > p_mean + 0.04):
+        return _merge_non_overlapping_ocr(retry, primary, min_score=0.75)
+    return _merge_non_overlapping_ocr(primary, retry, min_score=0.75)
+
+
+def _group_tess_words_into_lines(tess_words, image_size):
+    """将 Tesseract 词级结果通过 build_ocr_doc 聚合成视觉行并附带行平均置信度。"""
+    if not tess_words:
+        return []
+    doc = build_ocr_doc(tess_words, image_size)
+    if doc is None or doc.is_empty():
+        return []
+
+    word_items = []
+    for item in tess_words:
+        rect = _ocr_item_bbox(item[0])
+        if rect is not None:
+            word_items.append((rect, float(item[2]) if len(item) > 2 else 0.5))
+
+    grouped = []
+    for row in doc.rows:
+        txt = re.sub(r'(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])', '', row.text).strip()
+        if not txt:
+            continue
+        confs = [c for wr, c in word_items if row.rect.intersects(wr)]
+        avg_conf = sum(confs) / len(confs) if confs else 0.5
+        r = row.rect
+        box = [[r.left(), r.top()], [r.right(), r.top()], [r.right(), r.bottom()], [r.left(), r.bottom()]]
+        grouped.append([box, txt, avg_conf])
+    return grouped
+
+
+def _win_ocr_clusters_for_tile(bgr, langs=("zh-Hans-CN", "en-US")):
+    """调用 Windows 内置 Windows.Media.Ocr 对单块图像识别并按横向间隙拆分为独立 UI 词簇。"""
+    try:
+        import asyncio
+        import winsdk.windows.media.ocr as wocr
+        import winsdk.windows.graphics.imaging as wimg
+        import winsdk.windows.globalization as wglob
+        import winsdk.windows.storage.streams as wstreams
+    except Exception:
+        return []
+
+    h, w = bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return []
+    scale = 2.5 if h < 70 else (2.0 if max(h, w) <= 1350 else 1.0)
+    if max(h, w) * scale > 3200:
+        scale = max(1.0, 3200.0 / max(1, h, w))
+    work = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1.05 else bgr
+    pad = 16
+    padded = cv2.copyMakeBorder(work, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=_border_ring_median(work))
+    ok_enc, enc_buf = cv2.imencode(".png", padded, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    if not ok_enc:
+        return []
+    png_bytes = enc_buf.tobytes()
+
+    async def _run_async():
+        stream = wstreams.InMemoryRandomAccessStream()
+        writer = wstreams.DataWriter(stream.get_output_stream_at(0))
+        writer.write_bytes(png_bytes)
+        await writer.store_async()
+        await writer.flush_async()
+        dec = await wimg.BitmapDecoder.create_async(stream)
+        bmp = await dec.get_software_bitmap_async()
+
+        avail = {l.language_tag.lower(): l for l in wocr.OcrEngine.available_recognizer_languages}
+        per_lang = {}
+        for tag in langs:
+            lang_obj = avail.get(tag.lower())
+            if lang_obj is None:
+                continue
+            eng = wocr.OcrEngine.try_create_from_language(lang_obj)
+            if eng is None:
+                continue
+            res = await eng.recognize_async(bmp)
+            clusters = []
+            for line in res.lines:
+                words = list(line.words)
+                if not words:
+                    continue
+                groups = [[words[0]]]
+                for wd in words[1:]:
+                    prev_r = groups[-1][-1].bounding_rect
+                    curr_r = wd.bounding_rect
+                    gap = curr_r.x - (prev_r.x + prev_r.width)
+                    ref_h = max(6.0, min(float(prev_r.height), float(curr_r.height)))
+                    if gap > max(12.0 * scale, ref_h * 1.8):
+                        groups.append([wd])
+                    else:
+                        groups[-1].append(wd)
+                for grp in groups:
+                    # 剥离 WinOCR 在文件列表/菜单左侧把图标识别出的前导孤立词盒（如 Ü / 同 / 国 / 口 / a(紧接文件名)）
+                    while len(grp) >= 2:
+                        w0 = str(grp[0].text or "").strip()
+                        w1 = str(grp[1].text or "").strip()
+                        is_sym_icon = (
+                            re.fullmatch(r'[\u00C0-\u024F©®™•·◦▪▸►□■▫○●◌◎◇◆◈|]|[口囗凵曰白国同回图目日四困团圆因网]|C\)', w0)
+                            and re.match(r'^[A-Za-z0-9._\-\u4e00-\u9fff]', w1)
+                        )
+                        is_file_icon_char = (
+                            len(w0) == 1 and w0.isascii() and w0.isalnum()
+                            and ('.' in w1 or '_' in w1 or '-' in w1)
+                            and re.match(r'^[A-Za-z0-9._\-]+\.[A-Za-z0-9]{1,6}$', w1)
+                        )
+                        if is_sym_icon or is_file_icon_char:
+                            grp = grp[1:]
+                        else:
+                            break
+                    parts = []
+                    x0 = min(wd.bounding_rect.x for wd in grp)
+                    y0 = min(wd.bounding_rect.y for wd in grp)
+                    x1 = max(wd.bounding_rect.x + wd.bounding_rect.width for wd in grp)
+                    y1 = max(wd.bounding_rect.y + wd.bounding_rect.height for wd in grp)
+                    for wi, wd in enumerate(grp):
+                        wt = str(wd.text or "").strip()
+                        if not wt:
+                            continue
+                        if parts and (parts[-1][-1].isascii() or wt[0].isascii()):
+                            parts.append(" " + wt)
+                        else:
+                            parts.append(wt)
+                    txt = "".join(parts).strip()
+                    if not txt:
+                        continue
+                    ox0 = max(0.0, min(float(w), (x0 - pad) / scale))
+                    oy0 = max(0.0, min(float(h), (y0 - pad) / scale))
+                    ox1 = max(ox0 + 2.0, min(float(w), (x1 - pad) / scale))
+                    oy1 = max(oy0 + 2.0, min(float(h), (y1 - pad) / scale))
+                    box = [[ox0, oy0], [ox1, oy0], [ox1, oy1], [ox0, oy1]]
+                    has_spurious_cjk = (
+                        bool(re.search(r'[A-Za-z]+\s*[\u3001-\u303f\u2103\xb0]+\s*[A-Za-z]+', txt))
+                        or bool(re.search(r'[A-Za-z]+\s*[\uff1a\uff08\uff09]+\s*[A-Za-z0-9]', txt))
+                        or (len(re.findall(r'[A-Za-z]', txt)) >= 4 and len(re.findall(r'[\u4e00-\u9fff]', txt)) == 1)
+                    )
+                    base_conf = 0.80 if tag == "en-US" else 0.74
+                    conf = 0.55 if (tag == "zh-Hans-CN" and has_spurious_cjk) else base_conf
+                    clusters.append([box, txt, conf])
+            per_lang[tag] = clusters
+        return per_lang
+
+    try:
+        per_lang = asyncio.run(_run_async())
+    except Exception as e:
+        logging.warning("Windows OCR 执行异常: %s", e)
+        return []
+
+    zh_lines = per_lang.get("zh-Hans-CN", [])
+    en_lines = per_lang.get("en-US", [])
+    if not zh_lines:
+        return en_lines
+    if not en_lines:
+        return zh_lines
+
+    merged = list(zh_lines)
+    merged_rects = [_ocr_item_bbox(it[0]) for it in merged]
+    for e_item in en_lines:
+        e_rect = _ocr_item_bbox(e_item[0])
+        if e_rect is None:
+            continue
+        e_text = str(e_item[1]).strip()
+        overlaps = []
+        for idx, z_rect in enumerate(merged_rects):
+            if z_rect is None:
+                continue
+            inter = z_rect.intersected(e_rect)
+            if not inter.isValid():
+                continue
+            min_h = max(1, min(z_rect.height(), e_rect.height()))
+            min_w = max(1, min(z_rect.width(), e_rect.width()))
+            if inter.height() >= min_h * 0.45 and inter.width() >= min_w * 0.30:
+                overlaps.append(idx)
+        if not overlaps:
+            merged.append(e_item)
+            merged_rects.append(e_rect)
+        elif len(overlaps) == 1:
+            idx = overlaps[0]
+            z_text = str(merged[idx][1]).strip()
+            z_conf = float(merged[idx][2])
+            pure_latin_row = not re.search(r'[\u4e00-\u9fff]', z_text)
+            if (z_conf < 0.70 or pure_latin_row) and re.fullmatch(r'[A-Za-z0-9\s\-_./:=,;!?()|]+', e_text):
+                merged[idx] = e_item
+                merged_rects[idx] = e_rect
+        elif all(not re.search(r'[\u4e00-\u9fff]', str(merged[k][1])) for k in overlaps) and re.fullmatch(r'[A-Za-z0-9\s\-_./:=,;!?()|]+', e_text):
+            # 同一纯英文行被 zh-Hans-CN 拆断时，用完整的 en-US 整行整体替换
+            for k in sorted(overlaps, reverse=True):
+                merged.pop(k)
+                merged_rects.pop(k)
+            merged.append(e_item)
+            merged_rects.append(e_rect)
+    return merged
+
+
+def win_ocr_lines(image_rgb):
+    """调用 Windows.Media.Ocr（支持大图滑窗切片与中英互补）获取高精 UI 行框。"""
+    if image_rgb is None or image_rgb.size == 0:
+        return []
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    if max(h, w) <= 1350:
+        return _win_ocr_clusters_for_tile(bgr)
+
+    tile_w, tile_h, overlap = 1300, 1080, 160
+    xs = _tile_starts(w, tile_w, overlap)
+    ys = _tile_starts(h, tile_h, overlap)
+    candidates = []
+    for y0 in ys:
+        y1 = min(h, y0 + tile_h)
+        for x0 in xs:
+            x1 = min(w, x0 + tile_w)
+            sub_res = _win_ocr_clusters_for_tile(bgr[y0:y1, x0:x1])
+            for pts, text, score in sub_res:
+                shifted = [[pt[0] + x0, pt[1] + y0] for pt in pts]
+                pxs = [p[0] for p in shifted]
+                pys = [p[1] for p in shifted]
+                bx0, bx1 = min(pxs), max(pxs)
+                by0, by1 = min(pys), max(pys)
+                clipped = (
+                    (x0 > 0 and bx0 <= x0 + 4)
+                    or (x1 < w and bx1 >= x1 - 4)
+                    or (y0 > 0 and by0 <= y0 + 4)
+                    or (y1 < h and by1 >= y1 - 4)
+                )
+                candidates.append(([shifted, text, score], score, clipped, (bx0, by0, bx1, by1)))
+    return _dedup_tiled_boxes(candidates)
+
+
+def _fuse_rapid_and_tesseract(rapid_lines, tess_words, image_size):
+    """
+    空间框级融合 RapidOCR 与 Tesseract：
+    - RapidOCR 空白/漏检区域：直接补入 Tesseract 行；
+    - RapidOCR 极低置信度框 (<0.62) 且 Tesseract 高置信度 (>=0.72)：局部替换；
+    - 避免把孤立误识别噪声替代掉整段正常结果。
+    """
+    tess_lines = _group_tess_words_into_lines(tess_words, image_size)
+    if not rapid_lines:
+        return tess_lines
+    if not tess_lines:
+        return rapid_lines
+
+    fused = [list(it) for it in rapid_lines]
+    fused_rects = [_ocr_item_bbox(it[0]) for it in fused]
+
+    for t_box, t_text, t_conf in tess_lines:
+        t_rect = _ocr_item_bbox(t_box)
+        if t_rect is None:
+            continue
+        if not any(ch.isalnum() or ('\u4e00' <= ch <= '\u9fff') for ch in t_text):
+            continue
+
+        overlaps = []
+        for idx, r_rect in enumerate(fused_rects):
+            if r_rect is None:
+                continue
+            inter = r_rect.intersected(t_rect)
+            if not inter.isValid():
+                continue
+            min_h = max(1, min(r_rect.height(), t_rect.height()))
+            min_w = max(1, min(r_rect.width(), t_rect.width()))
+            if inter.height() >= min_h * 0.45 and inter.width() >= min_w * 0.30:
+                overlaps.append(idx)
+
+        if not overlaps:
+            if t_conf >= 0.42:
+                fused.append([t_box, t_text, t_conf])
+                fused_rects.append(t_rect)
+        elif len(overlaps) == 1:
+            idx = overlaps[0]
+            r_score = float(fused[idx][2]) if len(fused[idx]) > 2 else 1.0
+            r_text = str(fused[idx][1]).strip()
+            can_replace = (r_score < 0.62 and t_conf >= 0.72) or (r_score <= 0.75 and t_conf >= 0.85)
+            if can_replace and len(t_text.replace(" ", "")) >= max(2, int(len(r_text.replace(" ", "")) * 0.82)):
+                fused[idx] = [t_box, t_text, t_conf]
+                fused_rects[idx] = t_rect
+        else:
+            # 多个低分碎片跨同一整行时，用高置信度 Tesseract 行整体替换
+            if t_conf >= 0.85 and all((float(fused[k][2]) if len(fused[k]) > 2 else 1.0) <= 0.76 for k in overlaps):
+                merged_r_len = sum(len(str(fused[k][1]).replace(" ", "")) for k in overlaps)
+                if len(t_text.replace(" ", "")) >= max(2, int(merged_r_len * 0.85)):
+                    for k in sorted(overlaps, reverse=True):
+                        fused.pop(k)
+                        fused_rects.pop(k)
+                    fused.append([t_box, t_text, t_conf])
+                    fused_rects.append(t_rect)
+
+    return fused
 
 
 
 # ==========================================
-# OCR 后台工作线程 (智能双引擎融合: 懒加载 RapidOCR + 深度预处理 Tesseract / AI 视觉识别)
+# OCR 后台工作线程 (智能双引擎融合: 懒加载 RapidOCR + 空间对齐 Tesseract / AI 视觉识别)
 # ==========================================
 class OcrWorker(QThread):
     finished = pyqtSignal(str)
@@ -2744,6 +3565,7 @@ class OcrWorker(QThread):
         self.fast = fast
         self.detected_codes = []
         self.ocr_doc = None
+        self.ocr_warning = ""
 
     def run(self):
         try:
@@ -2758,113 +3580,82 @@ class OcrWorker(QThread):
                 except Exception as ex_c:
                     logging.warning("QR/Barcode 识别异常: %s", ex_c)
 
-            # AI 识别模式
+            # AI 识别模式（失败时自动回退到本地离线 OCR，并附带警告提示）
             if self.use_ai:
-                result = ai_ocr_recognize(self.image)
-                self.finished.emit(result if result else "")
-                return
+                try:
+                    result = ai_ocr_recognize(self.image)
+                    self.finished.emit(result if result else "")
+                    return
+                except Exception as ex_ai:
+                    logging.warning("AI OCR 失败，将尝试回退本地 OCR: %s", ex_ai)
+                    self.ocr_warning = f"AI 识别失败，已回退本地 OCR：{ex_ai}"
 
             if arr is None:
-                self.finished.emit("")
-                return
-            width, height = int(arr.shape[1]), int(arr.shape[0])
-
-            def _preprocess_for_tess(img_arr):
-                gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
-                if np.mean(gray) < 127:
-                    gray = cv2.bitwise_not(gray)
-
-                h_img, w_img = gray.shape
-                scale = 2.5 if h_img < 50 else (1.5 if h_img < 100 else 1.0)
-                if scale > 1.0:
-                    processed = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                if self.ocr_warning:
+                    self.finished.emit(f"识别发生错误:\n{self.ocr_warning}")
                 else:
-                    processed = gray
+                    self.finished.emit("")
+                return
 
-                processed = cv2.normalize(processed, None, 0, 255, cv2.NORM_MINMAX)
-                edge_val = int(np.median(processed[:2, :]))
-                padding = 16
-                return cv2.copyMakeBorder(processed, padding, padding, padding, padding, cv2.BORDER_CONSTANT, value=edge_val)
-
-            # 1. 运行懒加载 RapidOCR 提取按行分块的识别结果与几何包围盒
+            # 1. 运行 RapidOCR（含 RGB→BGR、小字放大留白、大图滑窗切片与低置信度对比增强重识）
             rapid_lines = []
             rapid_engine = get_rapid_ocr_engine()
             if rapid_engine is not None:
                 try:
-                    # RapidOCR 单例不做并发保护时可能被多个线程同时推理，这里串行化确保稳定
-                    with _RAPID_OCR_INFER_LOCK:
-                        res, _ = rapid_engine(arr)
-                    if res:
-                        rapid_lines = res
+                    rapid_lines = _rapid_ocr_with_retry(rapid_engine, arr)
                 except Exception as ex_r:
                     logging.warning(f"RapidOCR 执行异常: {ex_r}")
 
-            # 1.05 RapidOCR 不可用（未安装/加载失败）时，用 Tesseract 词级 bbox 兜底，
-            #     否则取字和图上译文会因为没有坐标而完全失效
-            if not rapid_lines and self.fast:
+            # 2. 若 RapidOCR 未安装或置信度偏低，启用 Windows 内置 OCR（高精 UI/中英双引擎互补）
+            _tot, mean_conf, _chars, low_ratio = _ocr_quality_stats(rapid_lines)
+            if (not rapid_lines) or (not self.fast and (mean_conf < 0.78 or low_ratio > 0.25)):
                 try:
-                    rapid_lines = tesseract_ocr_lines(arr)
-                    if rapid_lines:
-                        logging.info("Tesseract 词级坐标回退成功: %d 个文本块", len(rapid_lines))
-                except Exception as ex_tb:
-                    logging.warning(f"Tesseract 词级坐标回退异常: {ex_tb}")
+                    win_lines = win_ocr_lines(arr)
+                    if win_lines:
+                        if not rapid_lines:
+                            rapid_lines = win_lines
+                        else:
+                            rapid_lines = _merge_non_overlapping_ocr(rapid_lines, win_lines, min_score=0.72)
+                except Exception as ex_win:
+                    logging.warning(f"Windows OCR 融合异常: {ex_win}")
 
-            # 1.1 同步构建带坐标的版面结果（供取字层与译文覆盖使用），不受后续文本融合影响
+            # 3. 按需运行 Tesseract（无 RapidOCR 时的非快扫高精度融合、小语种兜底或其余引擎空白/低置信度补全）
+            settings = load_settings()
+            use_sea_langs = bool(settings.get("ocr_enable_sea_langs", False))
+            _tot, mean_conf, _chars, low_ratio = _ocr_quality_stats(rapid_lines)
+            need_tess = (not rapid_lines) or use_sea_langs or (rapid_engine is None and not self.fast) or (
+                not self.fast and (mean_conf < 0.76 or low_ratio > 0.25)
+            )
+            if need_tess:
+                try:
+                    req_lang = TESSERACT_LANGS if use_sea_langs else AUTO_OCR_LANGS
+                    tess_min_conf = 25 if rapid_lines else 18
+                    tess_words = tesseract_ocr_lines(
+                        arr, lang_str=req_lang, min_conf=tess_min_conf, allow_fallback_langs=(not rapid_lines)
+                    )
+                    if tess_words:
+                        rapid_lines = _fuse_rapid_and_tesseract(rapid_lines, tess_words, self.image.size())
+                        logging.info("Tesseract 空间融合完成: 当前共 %d 个文本块", len(rapid_lines))
+                except Exception as ex_tb:
+                    logging.warning(f"Tesseract 空间融合异常: {ex_tb}")
+
+            # 3. 统一通过 build_ocr_doc 构建版面坐标与整洁的行序/空格文本
             if rapid_lines:
                 try:
                     doc = build_ocr_doc(rapid_lines, self.image.size())
                     if doc is not None and not doc.is_empty():
                         self.ocr_doc = doc
                         self.doc_ready.emit(doc)
-                        if self.fast:
-                            # 取字/一键翻译只需要版面文本，跳过 Tesseract 融合以降低延迟
-                            self.finished.emit(doc.text)
-                            return
+                        self.finished.emit(doc.text)
+                        return
                 except Exception as ex_doc:
                     logging.warning(f"OCR 版面构建异常: {ex_doc}")
 
-            # 2. 运行 Tesseract 多语言识别
-            tess_text = ""
-            try:
-                lang_str = TESSERACT_LANGS
-                padded = _preprocess_for_tess(arr)
-                # psm 3 (全自动页面分割) 比 psm 6 在多语言稀疏混排下容错率更高
-                custom_config = r'--oem 1 --psm 3'
-                tess_text = pytesseract.image_to_string(padded, lang=lang_str, config=custom_config).strip()
-                if tess_text:
-                    tess_text = re.sub(r'(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])', '', tess_text)
-            except Exception as ex_t:
-                logging.warning(f"Tesseract 执行异常: {ex_t}")
-
-            # 3. 智能多语言融合判决：
-            # 判断画面是否出现东南亚/特殊语种（如泰文 U+0E00 ~ U+0E7F）
-            has_special_lang = any('\u0e00' <= ch <= '\u0e7f' for ch in tess_text)
-
-            if not rapid_lines and not tess_text:
-                self.finished.emit("")
+            if self.ocr_warning and not rapid_lines:
+                self.finished.emit(f"识别发生错误:\n{self.ocr_warning}")
                 return
-
-            if not has_special_lang and rapid_lines:
-                # 纯中文/英文环境：RapidOCR 准确率极高且无字间虚假空格，优先整合成文
-                text_out = "\n".join([item[1] for item in rapid_lines if item and item[1].strip()])
-                self.finished.emit(text_out)
-                return
-
-            if has_special_lang and not rapid_lines:
-                # 仅 Tesseract 检出内容
-                self.finished.emit(tess_text)
-                return
-
-            # 当同时存在中英文与泰语等小语种混排时：
-            # 进行行级置信度修补，若某行在 RapidOCR 中置信度偏低（< 0.65）或为生僻乱码，
-            # 说明命中 RapidOCR 字典盲区，此时保留 Tesseract 的完整段落或做联合输出
-            rapid_full = "\n".join([item[1] for item in rapid_lines if item and item[1].strip()])
-
-            # 若 Tesseract 字符数明显更多（涵盖了 Rapid 漏掉的小语种行）
-            if len(tess_text) > len(rapid_full) * 1.2:
-                self.finished.emit(tess_text)
-            else:
-                self.finished.emit(rapid_full if rapid_full else tess_text)
+            text_out = "\n".join(str(item[1]).strip() for item in rapid_lines if item and str(item[1]).strip())
+            self.finished.emit(text_out)
 
         except Exception as e:
             logging.error("OCR Worker Error: %s", e, exc_info=True)
@@ -3090,6 +3881,20 @@ class TextSelectLayer(QWidget):
 # ==========================================
 # 图上译文覆盖层 (逐行并发翻译，原地替换显示)
 # ==========================================
+def _prep_text_for_translate(text, use_ai=False):
+    """在线翻译遇到小写下划线连接词/文件名（如 pin_drawer.py / app_icon.ico）时展开为空格，避免引擎整词拒翻。"""
+    t = (text or "").strip()
+    if use_ai or not t or ' ' in t or '_' not in t:
+        return t
+    m = re.fullmatch(r'([A-Za-z]{2,}(?:_[A-Za-z]{2,})+)(\.[A-Za-z0-9]{1,6})?', t)
+    if not m:
+        return t
+    stem, ext = m.group(1), m.group(2) or ""
+    if stem.isupper():
+        return t
+    return stem.replace('_', ' ') + ext
+
+
 class RowTranslationWorker(QThread):
     """按行并发翻译，逐行回传，避免整段翻译无法定位到原文位置。"""
 
@@ -3112,20 +3917,37 @@ class RowTranslationWorker(QThread):
             return text
         if _looks_like_target(text, self.target_lang):
             return text
-        if self.use_ai:
-            res, _ = ai_translate_single_chunk(text, self.target_lang, 'auto', timeout=25,
-                                               is_cancelled_fn=lambda: self._cancelled)
-        else:
-            res, _ = translate_single_chunk(text, self.target_lang, 'auto', timeout=8)
-        return res if res else text
+        send_text = _prep_text_for_translate(text, self.use_ai)
+        last_err = None
+        for attempt in range(2):
+            if self._cancelled:
+                return text
+            try:
+                if self.use_ai:
+                    res, _ = ai_translate_single_chunk(
+                        send_text, self.target_lang, 'auto', timeout=25,
+                        is_cancelled_fn=lambda: self._cancelled
+                    )
+                else:
+                    res, _ = translate_single_chunk(send_text, self.target_lang, 'auto', timeout=8)
+                return res if res else text
+            except Exception as ex:
+                last_err = ex
+                if attempt == 0 and not self._cancelled:
+                    time.sleep(0.2)
+        if last_err is not None:
+            raise last_err
+        return text
 
     def _build_batches(self):
         batches = []
         current = []
         size = 0
+        max_items = 8 if self.use_ai else 10
+        max_chars = 1500 if self.use_ai else 1700
         for i, text in enumerate(self.texts):
-            add = len(text) + 2
-            if current and (size + add > 1700 or len(current) >= 10):
+            add = len(text) + 4
+            if current and (size + add > max_chars or len(current) >= max_items):
                 batches.append(current)
                 current = []
                 size = 0
@@ -3145,6 +3967,21 @@ class RowTranslationWorker(QThread):
                 pending.append((pos, i))
         if not pending:
             return results, True
+
+        # AI 翻译优先走带上下文的 JSON 批量接口，保证同屏术语与句子前后连贯
+        if self.use_ai and len(pending) > 1:
+            plain = [self.texts[i].strip() for _, i in pending]
+            try:
+                translated_list = ai_translate_batch(
+                    plain, self.target_lang, timeout=30,
+                    is_cancelled_fn=lambda: self._cancelled
+                )
+                for (pos, _i), trans in zip(pending, translated_list):
+                    results[pos] = trans if trans else self.texts[_i]
+                return results, True
+            except Exception as e:
+                logging.warning("AI 批量上下文翻译失败，回退逐块翻译: %s", e)
+
         if self.use_ai or len(pending) == 1:
             ok = True
             for pos, i in pending:
@@ -3155,16 +3992,16 @@ class RowTranslationWorker(QThread):
                     ok = False
             return results, ok
 
-        # 普通在线翻译把多个段落拼成一次请求；用 [[n]] 编号防止 Google 合并/重排后译文错位
-        plain = [self.texts[i].replace("\n\n", "\n").strip() for _, i in pending]
+        # 普通在线翻译把多个段落拼成一次请求；用 [[n]] 编号并容忍空格/全角括号变形
+        plain = [_prep_text_for_translate(self.texts[i].replace("\n\n", "\n"), use_ai=False) for _, i in pending]
         try:
             marked = "\n\n".join(f"[[{k + 1}]] {p}" for k, p in enumerate(plain))
             res, _ = translate_single_chunk(marked, self.target_lang, 'auto', timeout=12)
-            matches = list(re.finditer(r'\[\[(\d+)\]\]', res or ""))
+            matches = list(re.finditer(r'\[\s*\[\s*(\d+)\s*\]\s*\]|【\s*【\s*(\d+)\s*】\s*】', res or ""))
             if len(matches) == len(pending):
                 ok = True
                 for k, match in enumerate(matches):
-                    num = int(match.group(1)) - 1
+                    num = int(match.group(1) or match.group(2)) - 1
                     start = match.end()
                     end = matches[k + 1].start() if k + 1 < len(matches) else len(res)
                     part = res[start:end].strip()
@@ -3220,94 +4057,897 @@ class RowTranslationWorker(QThread):
 
 
 class TranslationBlock:
-    """把相邻的文字行合并成段落/气泡，整段翻译并整段覆盖，避免逐行小白块。"""
+    """把同一段落的连续文字行合并为语义块，并保留真实视觉字高与行数供精确排版。"""
 
-    __slots__ = ("text", "rect", "row_indices")
+    __slots__ = ("text", "rect", "row_indices", "line_height", "ink_height", "line_count")
 
-    def __init__(self, row_indices, rect):
+    def __init__(self, row_indices, rect, line_height=None, line_count=1, ink_height=None):
         self.row_indices = list(row_indices)
         self.rect = QRect(rect)
         self.text = ""
+        lh = float(line_height if line_height is not None else max(1, rect.height()))
+        self.line_height = lh
+        self.ink_height = float(ink_height if ink_height is not None else lh)
+        self.line_count = int(line_count)
+
+
+_LEADING_ICON_PREFIX_RE = re.compile(
+    r'^(?:[©®™•·◦▪▸►□■▫○●◌◎◇◆◈]+(?:\s+|$)'
+    r'|[\u00C0-\u024F]\s+(?=[A-Za-z0-9._\-\u4e00-\u9fff])'
+    r'|[A-Za-z0-9]\s+(?=[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,6}\b)'
+    r'|[口囗凵曰白国同回图目日四困团圆因网]+\s*(?=[A-Za-z_][A-Za-z0-9_.\-]{1,})'
+    r'|[口囗凵曰白]+\s*(?=[A-Za-z0-9])'
+    r'|[OQ]\s+(?=[A-Za-z\u4e00-\u9fff])(?!型|币|&)'
+    r'|C\)\s+(?=[A-Za-z0-9]))'
+)
 
 
 def _clean_ocr_text(text):
-    """清掉 OCR 把图标识别成的孤立字母/符号，避免译文出现奇怪的 O、Q、©。"""
+    """清掉 OCR 边角竖线与常见图标误识前缀，绝不误删 Open/OK/Query 等英文首字母或正常汉字。"""
     t = (text or "").strip()
-    t = re.sub(r'^[\s\|\[\]{}()<>«»“”"\'`~^*_+=|\\/]+', '', t)
-    t = re.sub(r'[\s\|\[\]{}()<>«»“”"\'`~^*_+=|\\/]+$', '', t)
-    # OEditing / Q Search 这类“图标字母 + 正文”只去掉前面的图标字母
-    t = re.sub(r'^[0OQ]\s*(?=[A-Za-z])', '', t)
-    # 铅笔/搜索图标 + 中文：去掉 O/Q，但保留“O型圈”这类真实词
-    t = re.sub(r'^[OQ]\s*(?=[\u4e00-\u9fff])(?!型|币)', '', t)
-    t = re.sub(r'^[©®™•·]\s*', '', t)
+    t = re.sub(r'^[\s\|`~^\\]+', '', t)
+    t = re.sub(r'[\s\|`~^\\]+$', '', t)
+    t = _LEADING_ICON_PREFIX_RE.sub('', t)
     return t.strip()
 
 
+def _is_ocr_noise_token(t):
+    """过滤头像/图标/圆角徽章被误识出的符号乱码（如 (@ERE), OBE), +1)）。"""
+    if not t:
+        return True
+    if len(t) <= 9 and not re.search(r'[\u4e00-\u9fff]', t):
+        if (')' in t and '(' not in t and not re.match(r'^\d{1,2}\)', t)) or (']' in t and '[' not in t):
+            return True
+        if re.fullmatch(r'[\(\[\{@#*+]+[^a-z\u4e00-\u9fff]{1,6}[\)\]\}]*', t):
+            return True
+    return False
+
+
 def _is_meaningful_block(text, rect):
-    clean = re.sub(r'[^\w\u4e00-\u9fff]+', '', text or '', flags=re.UNICODE)
+    t = (text or "").strip()
+    if _is_ocr_noise_token(t):
+        return False
+    clean = re.sub(r'[^\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+', '', t, flags=re.UNICODE)
     if not clean:
         return False
-    if len(clean) < 2 and not any('\u4e00' <= c <= '\u9fff' for c in clean):
+    if rect.width() < 8 or rect.height() < 7:
         return False
-    if rect.width() < 18 or rect.height() < 10:
+    if len(clean) == 1 and clean.isascii() and not clean.isdigit() and rect.width() < 20 and rect.height() < 20:
         return False
     return True
 
 
-def build_translation_blocks(rows):
-    blocks = []
-    for idx, row in enumerate(rows):
-        target = None
-        for block in blocks:
-            inter = block.rect.intersected(row.rect)
-            min_w = max(1, min(block.rect.width(), row.rect.width()))
-            overlap_ratio = inter.width() / min_w if inter.isValid() else 0.0
-            gap = row.rect.top() - block.rect.bottom()
-            if overlap_ratio >= 0.35 and -max(10.0, row.rect.height() * 0.6) <= gap <= max(8.0, row.rect.height() * 0.8):
-                target = block
-                break
-        if target is not None:
-            target.row_indices.append(idx)
-            target.rect = target.rect.united(row.rect)
+_LIST_PREFIX_RE = re.compile(
+    r'^(?:[•·◦▪▸►]|\*\s+|-\s+(?!\d)|(?:\d{1,2}|[a-zA-Z])[.)、]\s+|[\u2460-\u2473]\s*)'
+)
+
+
+def _is_list_or_menu_boundary(prev_text, curr_text, prev_rect, curr_rect, curr_raw=""):
+    """判断两行之间是否属于列表项/独立短菜单项/标题切正文边界，避免错误合并破坏排版。"""
+    if not prev_text or not curr_text:
+        return True
+    if _LIST_PREFIX_RE.match(curr_text) or (curr_raw and _LIST_PREFIX_RE.match(curr_raw.strip())):
+        return True
+    if len(prev_text) < 18 or prev_rect.width() < curr_rect.height() * 6.5:
+        return True
+    if prev_rect.width() < curr_rect.width() * 0.55 and len(prev_text) <= 24:
+        return True
+    if (prev_rect.width() < 150 and curr_rect.width() < 150
+            and len(prev_text) <= 18 and len(curr_text) <= 18
+            and not prev_text.endswith((",", "，", "、", "-"))
+            and (prev_text[0].isupper() and curr_text[0].isupper())):
+        return True
+    if prev_text[-1] in "。！？.!?：:…" or prev_text.endswith(".."):
+        return True
+    return False
+
+
+def _join_block_lines(line_pairs, block_width):
+    """将同段落内自动折行合并成连贯语义句送翻，避免按硬换行逐行碎裂翻译。"""
+    if not line_pairs:
+        return ""
+    if len(line_pairs) == 1:
+        return line_pairs[0][0]
+
+    parts = [line_pairs[0][0]]
+    for idx in range(1, len(line_pairs)):
+        prev_txt, prev_rect = line_pairs[idx - 1]
+        curr_txt, _curr_rect = line_pairs[idx]
+        if not prev_txt:
+            parts.append(curr_txt)
+            continue
+        is_wrapped = (
+            prev_rect.width() >= block_width * 0.58
+            and prev_txt[-1] not in "。！？.!?:：;；…"
+            and not _LIST_PREFIX_RE.match(curr_txt)
+        )
+        if not is_wrapped:
+            parts.append("\n" + curr_txt)
+            continue
+        if len(prev_txt) >= 2 and prev_txt[-1] == '-' and prev_txt[-2].isascii() and curr_txt[0].isascii():
+            parts[-1] = parts[-1][:-1] + curr_txt
+        elif ('\u4e00' <= prev_txt[-1] <= '\u9fff' or '\u3040' <= prev_txt[-1] <= '\u30ff') and (
+            '\u4e00' <= curr_txt[0] <= '\u9fff' or '\u3040' <= curr_txt[0] <= '\u30ff'
+        ):
+            parts.append(curr_txt)
         else:
-            blocks.append(TranslationBlock([idx], row.rect))
-    for block in blocks:
-        lines = []
-        for i in block.row_indices:
-            cleaned = _clean_ocr_text(rows[i].text)
-            if cleaned:
-                lines.append(cleaned)
-        block.text = "\n".join(lines)
-    return [b for b in blocks if _is_meaningful_block(b.text, b.rect)]
+            parts.append(" " + curr_txt)
+    return "".join(parts)
+
+
+def _split_row_by_gaps(row):
+    """若同一 OcrRow 内存在宽空白分隔（例如 用户名   徽章   时间戳），按 char_rects 拆分为独立片段。"""
+    txt = row.text or ""
+    crs = row.char_rects or []
+    if not txt or len(crs) != len(txt):
+        return [(txt, QRect(row.rect), crs)]
+
+    gap_thresh = max(14, int(row.rect.height() * 1.45))
+    split_indices = [
+        ci for ci, ch in enumerate(txt)
+        if ch == " " and crs[ci].width() >= gap_thresh
+    ]
+    if not split_indices:
+        return [(txt, QRect(row.rect), crs)]
+
+    spans = []
+    start = 0
+    for si in split_indices:
+        if si > start:
+            spans.append((start, si))
+        start = si + 1
+    if start < len(txt):
+        spans.append((start, len(txt)))
+
+    out = []
+    for a, b in spans:
+        sub_txt = txt[a:b].strip()
+        if not sub_txt:
+            continue
+        lead_ws = len(txt[a:b]) - len(txt[a:b].lstrip())
+        trail_ws = len(txt[a:b]) - len(txt[a:b].rstrip())
+        ca, cb = a + lead_ws, b - trail_ws
+        sub_crs = crs[ca:cb]
+        if not sub_crs:
+            continue
+        u = QRect(sub_crs[0])
+        for cr in sub_crs[1:]:
+            u = u.united(cr)
+        out.append((sub_txt, u, sub_crs))
+    return out or [(txt, QRect(row.rect), crs)]
+
+
+_GUTTER_ICON_TOKEN_RE = re.compile(
+    r'^((?:[0OBDQa-z0-9]|LB|C\)|[A-Z]\)|[\u00C0-\u024F]|[口囗凵曰白国同回图目日四困团圆因网])\s+)(?=[A-Za-z0-9_.\-\u4e00-\u9fff]{2,})'
+)
+
+
+def _detect_gutter_icon_indices(segments):
+    """识别竖向列表左侧反复出现的 UI 图标误识前缀，并返回需剥离行集合及对齐文字起笔 X 坐标。"""
+    candidates = []
+    for idx, (raw_txt, rect, crs) in enumerate(segments):
+        m = _GUTTER_ICON_TOKEN_RE.match(raw_txt.strip())
+        if not m:
+            continue
+        tok_len = len(m.group(1))
+        if crs and len(crs) >= tok_len:
+            prefix_w = crs[tok_len - 1].right() - rect.left() + 1
+            text_left = crs[tok_len].left() if tok_len < len(crs) else rect.left() + prefix_w
+        else:
+            prefix_w = max(8, int(rect.width() * (tok_len / max(1, len(raw_txt)))))
+            text_left = rect.left() + prefix_w
+        if prefix_w <= max(20, rect.height() * 1.85):
+            candidates.append((idx, rect.left(), text_left))
+
+    flagged = {}
+    for i, left_i, tleft_i in candidates:
+        peers = [(j, tleft_j) for j, left_j, tleft_j in candidates if abs(left_j - left_i) <= 10 and abs(tleft_j - tleft_i) <= 14]
+        if len(peers) >= 2:
+            max_tl = max(p[1] for p in peers)
+            for j, _tl in peers:
+                flagged[j] = max_tl
+    return flagged
+
+
+def _strip_icon_prefix_segment(raw_txt, rect, char_rects, strip_gutter=False, min_text_left=None, image=None, bg_color=None):
+    """清理前缀图标噪声并将 rect.left()/top()/bottom() 精确收敛到真实文字区，绝不盖住左侧图标。"""
+    t = raw_txt or ""
+    leading_match = re.match(r'^[\s\|`~^\\]+', t)
+    lead_cut = len(leading_match.group(0)) if leading_match else 0
+    core = t[lead_cut:]
+    core = re.sub(r'[\s\|`~^\\]+$', '', core)
+
+    stripped_icon = False
+    icon_m = _LEADING_ICON_PREFIX_RE.match(core)
+    if icon_m:
+        lead_cut += len(icon_m.group(0))
+        core = core[len(icon_m.group(0)):]
+        stripped_icon = True
+    elif strip_gutter:
+        gm = _GUTTER_ICON_TOKEN_RE.match(core)
+        if gm:
+            lead_cut += len(gm.group(1))
+            core = core[len(gm.group(1)):]
+            stripped_icon = True
+
+    clean_txt = core.strip()
+    if not clean_txt:
+        return "", QRect(rect)
+
+    new_rect = QRect(rect)
+    if lead_cut > 0:
+        cand_left = new_rect.left()
+        if char_rects and len(char_rects) == len(t) and lead_cut < len(char_rects):
+            cand_left = max(cand_left, char_rects[lead_cut].left())
+        if stripped_icon:
+            # 加权字符框容易低估左侧 16~18px 方形图标宽，保证至少越过图标安全区
+            est_icon_end = new_rect.left() + max(10, min(int(new_rect.height() * 1.15), int(new_rect.width() * 0.42)))
+            cand_left = max(cand_left, est_icon_end)
+        if min_text_left is not None:
+            cand_left = max(cand_left, int(min_text_left))
+        if cand_left > new_rect.left() and (new_rect.right() - cand_left + 1) >= 6:
+            new_rect.setLeft(cand_left)
+    return clean_txt, new_rect
+
+
+def _measure_ink_line_height(image, rect, bg_color):
+    """测量文字块内实际字符笔画纵向跨度，并返回精确字高（消除图标与高亮边框虚高）。"""
+    fallback = float(max(1, rect.height()))
+    if image is None or image.isNull():
+        return fallback
+    r = rect.intersected(image.rect())
+    if r.width() < 4 or r.height() < 5:
+        return fallback
+
+    br, bg_g, bb = bg_color.red(), bg_color.green(), bg_color.blue()
+    x_step = max(1, r.width() // 28)
+    xs = list(range(r.left() + 1, r.right(), x_step))
+    if not xs:
+        return fallback
+
+    min_active = max(2 if len(xs) >= 8 else 1, int(len(xs) * 0.08))
+    active_ys = []
+    for y in range(r.top(), r.bottom() + 1):
+        hits = 0
+        for x in xs:
+            c = image.pixelColor(x, y)
+            if max(abs(c.red() - br), abs(c.green() - bg_g), abs(c.blue() - bb)) >= 24:
+                hits += 1
+        if hits >= min_active:
+            active_ys.append(y)
+
+    if len(active_ys) < 4:
+        return fallback
+    span = float(active_ys[-1] - active_ys[0] + 1)
+    return max(min(fallback, max(6.0, fallback * 0.42)), min(fallback, span))
+
+
+def _tighten_rect_vertical(image, rect, bg_color):
+    """若 OCR 框包含上下空白或高亮边线，将单行文字框垂直紧缩到真实字迹核心。"""
+    if image is None or image.isNull() or rect.height() < 12:
+        return QRect(rect)
+    r = rect.intersected(image.rect())
+    if r.width() < 4 or r.height() < 8:
+        return QRect(rect)
+    br, bg_g, bb = bg_color.red(), bg_color.green(), bg_color.blue()
+    x_step = max(1, r.width() // 24)
+    xs = list(range(r.left() + 1, r.right(), x_step))
+    if not xs:
+        return QRect(rect)
+    min_active = max(2 if len(xs) >= 8 else 1, int(len(xs) * 0.08))
+    active_ys = []
+    for y in range(r.top(), r.bottom() + 1):
+        hits = 0
+        for x in xs:
+            c = image.pixelColor(x, y)
+            if max(abs(c.red() - br), abs(c.green() - bg_g), abs(c.blue() - bb)) >= 24:
+                hits += 1
+        if hits >= min_active:
+            active_ys.append(y)
+    if len(active_ys) >= 5:
+        nt = max(r.top(), active_ys[0] - 1)
+        nb = min(r.bottom(), active_ys[-1] + 1)
+        if nb - nt + 1 >= 6 and (r.height() - (nb - nt + 1)) >= 3:
+            out = QRect(r)
+            out.setTop(nt)
+            out.setBottom(nb)
+            return out
+    return QRect(rect)
+
+
+def _bg_color_diff(c1, c2):
+    return max(abs(c1.red() - c2.red()), abs(c1.green() - c2.green()), abs(c1.blue() - c2.blue()))
+
+
+def _has_visual_divider_or_bg_jump(image, prev_rect, curr_rect, bg_prev, bg_curr):
+    """检查两行之间是否存在背景色跳变（如选中行与未选中行）或 UI 分隔线。"""
+    if image is None or image.isNull():
+        return False
+    if bg_prev is not None and bg_curr is not None and _bg_color_diff(bg_prev, bg_curr) > 28:
+        return True
+
+    y0 = prev_rect.bottom() + 1
+    y1 = curr_rect.top() - 1
+    if y1 < y0 or (y1 - y0) > 24:
+        return False
+    x0 = max(0, max(prev_rect.left(), curr_rect.left()))
+    x1 = min(image.width() - 1, min(prev_rect.right(), curr_rect.right()))
+    if x1 - x0 < 16:
+        return False
+    step = max(2, (x1 - x0) // 16)
+    xs = list(range(x0, x1 + 1, step))
+    ref = bg_curr or bg_prev or QColor(255, 255, 255)
+    rr, rg, rb = ref.red(), ref.green(), ref.blue()
+    for y in range(y0, min(image.height(), y1 + 1)):
+        diff_cnt = 0
+        for x in xs:
+            c = image.pixelColor(x, y)
+            if max(abs(c.red() - rr), abs(c.green() - rg), abs(c.blue() - rb)) >= 18:
+                diff_cnt += 1
+        if diff_cnt >= max(4, int(len(xs) * 0.60)):
+            return True
+    return False
+
+
+def build_translation_blocks(rows, image=None):
+    """按语义与版面结构切分待翻译块：剥离图标噪声、保留独立菜单/列表项、仅合并真正的连续折行正文。"""
+    has_img = (image is not None and not image.isNull())
+    raw_segments = []
+    for row_idx, row in enumerate(rows):
+        for seg_txt, seg_rect, seg_crs in _split_row_by_gaps(row):
+            raw_segments.append((seg_txt, seg_rect, seg_crs, row_idx))
+
+    gutter_map = _detect_gutter_icon_indices([(s[0], s[1], s[2]) for s in raw_segments])
+    clean_items = []
+    for seg_i, (seg_txt, seg_rect, seg_crs, row_idx) in enumerate(raw_segments):
+        cleaned, clean_rect = _strip_icon_prefix_segment(
+            seg_txt, seg_rect, seg_crs,
+            strip_gutter=(seg_i in gutter_map),
+            min_text_left=gutter_map.get(seg_i)
+        )
+        if not cleaned or not _is_meaningful_block(cleaned, clean_rect):
+            continue
+        bg = _sample_block_bg(image, clean_rect) if has_img else None
+        if has_img:
+            clean_rect = _tighten_rect_vertical(image, clean_rect, bg)
+            bg = _sample_block_bg(image, clean_rect)
+        ink_h = _measure_ink_line_height(image, clean_rect, bg) if has_img else float(max(1, clean_rect.height()))
+        is_date_or_num = bool(re.match(r'^(?:\d{1,4}[/-]\d{1,2}|\d{1,2}:\d{2}\b)', cleaned))
+        clean_items.append({
+            "raw": seg_txt,
+            "clean": cleaned,
+            "rect": clean_rect,
+            "row_idx": row_idx,
+            "bg": bg,
+            "ink_h": ink_h,
+            "is_tabular": is_date_or_num,
+            "has_row_peer": False,
+        })
+
+    # 识别横向存在其它同排独立列的表格单元（短单元或连续两行均多列并排时不跨行合并；左侧栏对右侧长段落可合并）
+    for idx_a, it_a in enumerate(clean_items):
+        ra = it_a["rect"]
+        cy_a = ra.center().y()
+        tol_y = max(6.0, ra.height() * 0.65)
+        for idx_b, it_b in enumerate(clean_items):
+            if idx_a == idx_b:
+                continue
+            rb = it_b["rect"]
+            if abs(rb.center().y() - cy_a) <= tol_y:
+                horiz_gap = max(rb.left() - ra.right(), ra.left() - rb.right())
+                if horiz_gap >= max(10, int(ra.height() * 0.8)):
+                    it_a["has_row_peer"] = True
+                    it_b["has_row_peer"] = True
+                    if len(it_a["clean"]) <= 28:
+                        it_a["is_tabular"] = True
+                    if len(it_b["clean"]) <= 28:
+                        it_b["is_tabular"] = True
+                    break
+
+    grouped = []
+    for item in clean_items:
+        curr_rect = item["rect"]
+        curr_clean = item["clean"]
+        target = None
+        if not item["is_tabular"]:
+            for grp in reversed(grouped):
+                prev_item = grp["items"][-1]
+                if prev_item["is_tabular"] or (prev_item["has_row_peer"] and item["has_row_peer"]):
+                    continue
+                prev_rect = prev_item["rect"]
+                h_ratio = curr_rect.height() / max(1.0, grp["line_height"])
+                ink_ratio = item["ink_h"] / max(1.0, grp["ink_height"])
+                if not (0.72 <= h_ratio <= 1.38 and 0.72 <= ink_ratio <= 1.38):
+                    continue
+
+                inter_x = max(0, min(grp["rect"].right(), curr_rect.right()) - max(grp["rect"].left(), curr_rect.left()) + 1)
+                min_w = max(1, min(grp["rect"].width(), curr_rect.width()))
+                overlap_ratio = inter_x / min_w
+                left_aligned = abs(curr_rect.left() - grp["rect"].left()) <= max(10.0, grp["line_height"] * 0.85)
+                center_aligned = abs(curr_rect.center().x() - grp["rect"].center().x()) <= max(10.0, grp["line_height"] * 0.85)
+                if overlap_ratio < 0.45 or not (left_aligned or center_aligned):
+                    continue
+
+                min_h = max(4.0, min(float(prev_rect.height()), float(curr_rect.height())))
+                gap = curr_rect.top() - prev_rect.bottom()
+                if not (-min_h * 0.35 <= gap <= min_h * 0.95):
+                    continue
+
+                if _is_list_or_menu_boundary(prev_item["clean"], curr_clean, prev_rect, curr_rect, item["raw"]):
+                    continue
+                if has_img and _has_visual_divider_or_bg_jump(image, prev_rect, curr_rect, prev_item["bg"], item["bg"]):
+                    continue
+
+                target = grp
+                break
+
+        if target is not None:
+            target["items"].append(item)
+            target["rect"] = target["rect"].united(curr_rect)
+            hs = sorted(max(1, it["rect"].height()) for it in target["items"])
+            ihs = sorted(max(1.0, it["ink_h"]) for it in target["items"])
+            target["line_height"] = float(hs[len(hs) // 2])
+            target["ink_height"] = float(ihs[len(ihs) // 2])
+        else:
+            grouped.append({
+                "items": [item],
+                "rect": QRect(curr_rect),
+                "line_height": float(max(1, curr_rect.height())),
+                "ink_height": float(max(1.0, item["ink_h"])),
+            })
+
+    result = []
+    for grp in grouped:
+        line_pairs = [(it["clean"], it["rect"]) for it in grp["items"]]
+        row_indices = []
+        for it in grp["items"]:
+            if it["row_idx"] not in row_indices:
+                row_indices.append(it["row_idx"])
+        blk = TranslationBlock(
+            row_indices, grp["rect"],
+            line_height=grp["line_height"],
+            line_count=len(line_pairs),
+            ink_height=grp["ink_height"]
+        )
+        blk.text = _join_block_lines(line_pairs, grp["rect"].width())
+        if _is_meaningful_block(blk.text, blk.rect):
+            result.append(blk)
+    return result
 
 
 def _sample_block_bg(image, rect):
-    """采样文字块四周的背景色，让译文底板尽量贴合原图背景。"""
-    points = [
-        (rect.left() - 4, rect.top() + 2),
-        (rect.left() - 4, rect.bottom() - 2),
-        (rect.right() + 4, rect.top() + 2),
-        (rect.right() + 4, rect.bottom() - 2),
-        (rect.center().x(), rect.top() - 4),
-        (rect.center().x(), rect.bottom() + 4),
-    ]
-    colors = []
-    for x, y in points:
-        if 0 <= x < image.width() and 0 <= y < image.height():
+    """严格在文字块内部四周边缘与角落采样主背景色，避免采到选中高亮框外部的白底形成“白条”。"""
+    iw, ih = image.width(), image.height()
+    if iw <= 0 or ih <= 0:
+        return QColor(255, 255, 255, 255)
+
+    r = rect.intersected(QRect(0, 0, iw, ih))
+    if not r.isValid() or r.width() <= 0 or r.height() <= 0:
+        return QColor(255, 255, 255, 255)
+
+    xs = sorted({
+        r.left(), min(r.right(), r.left() + 1),
+        r.left() + r.width() // 4, r.center().x(), r.right() - r.width() // 4,
+        max(r.left(), r.right() - 1), r.right(),
+    })
+    ys = sorted({
+        r.top(), min(r.bottom(), r.top() + 1),
+        r.top() + r.height() // 4, r.center().y(), r.bottom() - r.height() // 4,
+        max(r.top(), r.bottom() - 1), r.bottom(),
+    })
+    pts = []
+    for x in xs:
+        pts.append((x, r.top()))
+        pts.append((x, min(r.bottom(), r.top() + 1)))
+        pts.append((x, r.bottom()))
+        pts.append((x, max(r.top(), r.bottom() - 1)))
+    for y in ys:
+        pts.append((r.left(), y))
+        pts.append((min(r.right(), r.left() + 1), y))
+        pts.append((r.right(), y))
+        pts.append((max(r.left(), r.right() - 1), y))
+
+    samples = []
+    for x, y in pts:
+        if 0 <= x < iw and 0 <= y < ih:
             c = image.pixelColor(x, y)
             if c.alpha() > 0:
-                colors.append(c)
-    if not colors:
-        return QColor(255, 255, 255, 240)
-    mean_lum = sum(c.lightness() for c in colors) / len(colors)
-    # 亮色界面取最亮的采样点（避开文字），暗色界面取最暗的采样点
-    picked = max(colors, key=lambda c: c.lightness()) if mean_lum >= 128 \
-        else min(colors, key=lambda c: c.lightness())
-    return QColor(picked.red(), picked.green(), picked.blue(), 242)
+                samples.append((c.red(), c.green(), c.blue()))
+    if not samples:
+        return QColor(255, 255, 255, 255)
+
+    buckets = {}
+    for r_v, g_v, b_v in samples:
+        key = (r_v >> 3, g_v >> 3, b_v >> 3)
+        buckets.setdefault(key, []).append((r_v, g_v, b_v))
+    dominant = max(buckets.values(), key=len)
+    rs = sorted(p[0] for p in dominant)
+    gs = sorted(p[1] for p in dominant)
+    bs = sorted(p[2] for p in dominant)
+    mid = len(dominant) // 2
+    return QColor(rs[mid], gs[mid], bs[mid], 255)
+
+
+def _contrast_ink_for_bg(bg: QColor):
+    """按相对亮度计算高对比度前景色（深底白字 / 浅底深字）。"""
+    lum = 0.2126 * bg.red() + 0.7152 * bg.green() + 0.0722 * bg.blue()
+    return QColor(15, 23, 42) if lum >= 142 else QColor(248, 250, 252)
+
+
+def _block_visual_height(block):
+    ih = float(getattr(block, "ink_height", 0.0) or 0.0)
+    lh = float(getattr(block, "line_height", block.rect.height()) or block.rect.height())
+    return max(6.0, ih if ih > 0 else lh)
+
+
+def _snap_peer_line_heights(blocks):
+    """将全屏正文字级与紧凑列表列项统一到一致排版层级，杜绝单条因残留框边/高亮突兀放大。"""
+    if not blocks:
+        return {}
+    heights = [_block_visual_height(b) for b in blocks]
+    sorted_hs = sorted(heights)
+
+    clusters = []
+    for h in sorted_hs:
+        if clusters and h <= clusters[-1][0] * 1.32:
+            clusters[-1].append(h)
+        else:
+            clusters.append([h])
+
+    body_cluster = max(clusters, key=len)
+    body_med = body_cluster[len(body_cluster) // 2]
+
+    tier_medians = []
+    merged_body = []
+    for c in clusters:
+        c_med = c[len(c) // 2]
+        if body_med * 0.72 <= c_med <= body_med * 1.48:
+            merged_body.extend(c)
+        else:
+            tier_medians.append(c_med)
+    if merged_body:
+        merged_body.sort()
+        body_med = merged_body[len(merged_body) // 2]
+        tier_medians.append(body_med)
+    tier_medians.sort()
+
+    mapping = {}
+    for idx, bh in enumerate(heights):
+        mapping[idx] = min(tier_medians, key=lambda m: abs(m - bh))
+
+    # 同列紧凑堆叠的列表/文件/表格项：即使单行被图标残边拉高至 2.0x 以内，仍强制归齐该列主体字号
+    n = len(blocks)
+    for i in range(n):
+        col_group = [j for j in range(n) if abs(blocks[j].rect.left() - blocks[i].rect.left()) <= 28]
+        if len(col_group) >= 3:
+            sub = sorted(col_group, key=lambda k: heights[k])
+            col_med = heights[sub[len(sub) // 2]]
+            peers = [k for k in col_group if col_med * 0.65 <= heights[k] <= col_med * 1.95]
+            if len(peers) >= 2:
+                snap_val = min(tier_medians, key=lambda m: abs(m - col_med))
+                for k in peers:
+                    # 只有本身紧邻同列普通行（纵向间隙 <= max(26, 2.8 * col_med)）才归齐；孤立大标题保留
+                    gap_lim = max(26.0, col_med * 2.8)
+                    has_close_normal_peer = any(
+                        p != k and heights[p] <= col_med * 1.35 and (
+                            -4 <= blocks[p].rect.top() - blocks[k].rect.bottom() <= gap_lim
+                            or -4 <= blocks[k].rect.top() - blocks[p].rect.bottom() <= gap_lim
+                        )
+                        for p in peers
+                    )
+                    if has_close_normal_peer or heights[k] <= col_med * 1.48:
+                        mapping[k] = snap_val
+    return mapping
+
+
+def _free_right_extent(image, rect, bg_color, hard_right_limit):
+    """逐列精准扫描右侧全高像素带，碰到细图钉(📌)/1px分割线/边框立即止步。"""
+    if image is None or image.isNull() or hard_right_limit <= rect.right():
+        return min(hard_right_limit, rect.right())
+    y0 = max(0, rect.top())
+    y1 = min(image.height() - 1, rect.bottom())
+    if y1 < y0:
+        return rect.right()
+    step_y = 1 if (y1 - y0 + 1) <= 40 else max(1, (y1 - y0 + 1) // 32)
+    ys = list(range(y0, y1 + 1, step_y))
+    br, bg_g, bb = bg_color.red(), bg_color.green(), bg_color.blue()
+
+    last_safe = rect.right()
+    start_x = min(image.width() - 1, rect.right() + 1)
+    end_x = min(image.width() - 1, hard_right_limit)
+    for x in range(start_x, end_x + 1):
+        bad_cnt = 0
+        for y in ys:
+            c = image.pixelColor(x, y)
+            if max(abs(c.red() - br), abs(c.green() - bg_g), abs(c.blue() - bb)) >= 18:
+                bad_cnt += 1
+                if bad_cnt > 1:
+                    break
+        if bad_cnt <= 1:
+            last_safe = x
+        else:
+            break
+    if last_safe > rect.right() + 4:
+        return last_safe - 4
+    return rect.right()
+
+
+def _pixel_size_for_visual_height(target_visual_h, min_px=10, max_px=96):
+    """通过真实无下行部字形 tightBoundingRect('国A') 标定 pixelSize，使中文译文字高与原图自然齐平。"""
+    target = max(8.0, float(target_visual_h))
+    lo = max(min_px, int(round(target * 0.90)))
+    hi = min(max_px, max(lo + 6, int(round(target * 1.85))))
+    best_px = lo
+    best_diff = 1e9
+    for px in range(lo, hi + 1):
+        fm = QFontMetricsF(make_ui_font(pixel_size=px))
+        gh = fm.tightBoundingRect("国A").height()
+        diff = abs(gh - target)
+        if diff < best_diff:
+            best_diff = diff
+            best_px = px
+    return best_px
+
+
+def _fit_translation_box(rect, obstacles, canvas_rect, trans, line_h, line_count, scale,
+                         source_image=None, bg_color=None):
+    """
+    计算原位覆盖译文盒与精确字号：
+    1. 用视觉字高标定字号，与同级文字保持统一可读高度；
+    2. 水平扩展同时受邻居文本块及原图像素障碍物（头像/图标/边框）双约束；
+    3. 单行标签垂直方向保持紧致贴合行高，绝不膨胀遮盖上下相邻行。
+    """
+    is_single_line = (line_count <= 1 and "\n" not in trans)
+    pad_x = max(2, int(round(3 * scale)))
+    pad_y = 0 if is_single_line else max(1, int(round(2 * scale)))
+    gap = max(2, int(round(3 * scale)))
+
+    target_visual_h = max(9.5, float(line_h) * 1.12) * scale
+    ideal_px = _pixel_size_for_visual_height(
+        target_visual_h,
+        min_px=max(10, int(round(10 * scale))),
+        max_px=max(24, int(round(72 * scale))),
+    )
+    min_px = max(8, int(round(8 * scale)))
+
+    max_right = canvas_rect.right() - 2
+    max_bottom = canvas_rect.bottom() - 2
+    for ob in obstacles:
+        if ob.bottom() >= rect.top() + 2 and ob.top() <= rect.bottom() - 2:
+            if ob.left() >= rect.right() - 2:
+                max_right = min(max_right, ob.left() - gap)
+        if ob.right() >= rect.left() + 2 and ob.left() <= rect.right() - 2:
+            if ob.top() >= rect.bottom() - 2:
+                max_bottom = min(max_bottom, ob.top() - gap)
+
+    if source_image is not None and bg_color is not None:
+        max_right = min(max_right, _free_right_extent(source_image, rect, bg_color, max_right))
+
+    max_right = max(rect.right(), min(max_right, rect.left() + max(int(rect.width() * 2.4), rect.width() + int(180 * scale))))
+    if is_single_line:
+        single_v_allowance = rect.height() + max(2, int(round(3 * scale)))
+        max_bottom = max(rect.bottom(), min(max_bottom, rect.top() + single_v_allowance - 1))
+    else:
+        max_bottom = max(rect.bottom(), min(max_bottom, rect.top() + max(int(rect.height() * 1.75), rect.height() + int(36 * scale))))
+
+    avail_max_w = max(rect.width(), max_right - rect.left() + 1)
+    avail_max_h = max(rect.height(), max_bottom - rect.top() + 1)
+
+    def _measure(size_px, box_w, flags):
+        f = make_ui_font(pixel_size=size_px)
+        inner_w = max(8, box_w - pad_x * 2)
+        br = QFontMetrics(f).boundingRect(QRect(0, 0, inner_w, 10000), flags, trans)
+        return f, br
+
+    wrap_flags = Qt.TextWordWrap
+    chosen_font = None
+    chosen_w = rect.width()
+    chosen_h = rect.height()
+    used_flags = wrap_flags
+
+    if is_single_line:
+        f_ideal, br_ideal = _measure(ideal_px, avail_max_w, Qt.TextSingleLine)
+        need_w = br_ideal.width() + pad_x * 2 + 2
+        need_glyph_h = int(round(ideal_px * 1.15))
+        if need_w <= avail_max_w and need_glyph_h <= avail_max_h:
+            chosen_font = f_ideal
+            chosen_w = max(rect.width(), need_w)
+            chosen_h = max(rect.height(), min(avail_max_h, max(rect.height(), need_glyph_h + 2)))
+            used_flags = Qt.TextSingleLine
+    else:
+        f_ideal, br_ideal = _measure(ideal_px, rect.width(), wrap_flags)
+        if br_ideal.height() + pad_y * 2 <= avail_max_h and br_ideal.width() + pad_x * 2 <= rect.width():
+            chosen_font = f_ideal
+            chosen_w = rect.width()
+            chosen_h = max(rect.height(), br_ideal.height() + pad_y * 2)
+        elif avail_max_w > rect.width():
+            f_exp, br_exp = _measure(ideal_px, avail_max_w, wrap_flags)
+            if br_exp.height() + pad_y * 2 <= avail_max_h and br_exp.width() + pad_x * 2 <= avail_max_w:
+                chosen_font = f_exp
+                chosen_w = max(rect.width(), min(avail_max_w, br_exp.width() + pad_x * 2 + 2))
+                chosen_h = max(rect.height(), br_exp.height() + pad_y * 2)
+
+    if chosen_font is None:
+        for size in range(ideal_px, min_px - 1, -1):
+            if is_single_line:
+                f_try, br_try = _measure(size, avail_max_w, Qt.TextSingleLine)
+                need_w = br_try.width() + pad_x * 2 + 2
+                need_gh = int(round(size * 1.15))
+                if need_w <= avail_max_w and need_gh <= avail_max_h:
+                    chosen_font = f_try
+                    chosen_w = max(rect.width(), need_w)
+                    chosen_h = max(rect.height(), min(avail_max_h, need_gh + 2))
+                    used_flags = Qt.TextSingleLine
+                    break
+            f_try, br_try = _measure(size, avail_max_w, wrap_flags)
+            if br_try.height() + pad_y * 2 <= avail_max_h and br_try.width() + pad_x * 2 <= avail_max_w:
+                chosen_font = f_try
+                chosen_w = max(rect.width(), min(avail_max_w, br_try.width() + pad_x * 2 + 2))
+                chosen_h = max(rect.height(), br_try.height() + pad_y * 2)
+                used_flags = wrap_flags
+                break
+
+    if chosen_font is None:
+        used_flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
+        chosen_font, chosen_br = _measure(min_px, avail_max_w, used_flags)
+        chosen_w = avail_max_w
+        chosen_h = max(rect.height(), min(avail_max_h, chosen_br.height() + pad_y * 2))
+
+    cover_left = max(0, int(round(0.5 * scale))) if is_single_line else max(1, int(round(scale)))
+    cover_right = max(1, int(round(scale)))
+    cover_y = 0 if is_single_line else max(1, int(round(1 * scale)))
+    bx0 = max(0, rect.left() - cover_left)
+    by0 = max(0, rect.top() - cover_y)
+    bx1 = min(canvas_rect.right(), rect.left() + chosen_w - 1 + cover_right)
+    by1 = min(canvas_rect.bottom(), rect.top() + chosen_h - 1 + cover_y)
+    box = QRect(bx0, by0, max(1, bx1 - bx0 + 1), max(1, by1 - by0 + 1)).intersected(canvas_rect)
+    align_v = Qt.AlignVCenter if is_single_line else Qt.AlignTop
+    return box, chosen_font, used_flags | Qt.AlignLeft | align_v, pad_x, pad_y
+
+
+def _sample_band_bg(image, rect, y_rows):
+    """采样指定水平行带内的主背景簇，用于识别顶部/底部细微渐变（如选中蓝条）。"""
+    iw, ih = image.width(), image.height()
+    r = rect.intersected(QRect(0, 0, iw, ih))
+    xs = sorted({
+        r.left(), min(r.right(), r.left() + 1),
+        r.left() + r.width() // 4, r.center().x(), r.right() - r.width() // 4,
+        max(r.left(), r.right() - 1), r.right(),
+    })
+    samples = []
+    for y in y_rows:
+        if 0 <= y < ih:
+            for x in xs:
+                if 0 <= x < iw:
+                    c = image.pixelColor(x, y)
+                    if c.alpha() > 0:
+                        samples.append((c.red(), c.green(), c.blue()))
+    if not samples:
+        return None
+    buckets = {}
+    for rv, gv, bv in samples:
+        buckets.setdefault((rv >> 3, gv >> 3, bv >> 3), []).append((rv, gv, bv))
+    dom = max(buckets.values(), key=len)
+    mid = len(dom) // 2
+    return QColor(
+        sorted(p[0] for p in dom)[mid],
+        sorted(p[1] for p in dom)[mid],
+        sorted(p[2] for p in dom)[mid],
+        255,
+    )
+
+
+def _draw_translated_item(painter, item, box_f, erase_f, radius, font, pad_x, pad_y, hovered=False):
+    """共用的译文块绘制器：仅擦除原外文像素足迹（支持渐变融入），避免长白条盖住周围底色。"""
+    painter.setPen(Qt.NoPen)
+    bg_top = item.get("bg_top")
+    bg_bot = item.get("bg_bot")
+    if bg_top is not None and bg_bot is not None and _bg_color_diff(bg_top, bg_bot) >= 3:
+        grad = QLinearGradient(erase_f.topLeft(), erase_f.bottomLeft())
+        grad.setColorAt(0.0, bg_top)
+        grad.setColorAt(1.0, bg_bot)
+        painter.setBrush(QBrush(grad))
+    else:
+        painter.setBrush(item["bg"])
+    painter.drawRoundedRect(erase_f, radius, radius)
+
+    painter.setFont(font)
+    painter.setPen(item["fg"])
+    text_rect = box_f.adjusted(pad_x, pad_y, -pad_x, -pad_y)
+    if text_rect.width() >= 2.0 and text_rect.height() >= 2.0:
+        painter.save()
+        painter.setClipRect(box_f.adjusted(0.5, 0.5, -0.5, -0.5))
+        painter.drawText(text_rect, item["draw_flags"], item["trans"])
+        painter.restore()
+
+    if hovered:
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#2563EB"), 1.5))
+        painter.drawRoundedRect(box_f.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+
+
+def _compute_block_layouts(source_image, blocks, translations, scale=1.0):
+    """统一求解全屏所有译文块的位置、尺寸、字体与配色，供实时矢量画布与导出 PNG 复用。"""
+    if source_image is None or source_image.isNull() or not blocks:
+        return []
+    canvas_rect = QRect(0, 0, source_image.width(), source_image.height())
+    scaled_rects = [
+        QRect(int(round(b.rect.left() * scale)), int(round(b.rect.top() * scale)),
+              max(1, int(round(b.rect.width() * scale))), max(1, int(round(b.rect.height() * scale))))
+        for b in blocks
+    ]
+    snapped_heights = _snap_peer_line_heights(blocks)
+    render_order = sorted(range(len(blocks)), key=lambda i: (blocks[i].rect.top(), blocks[i].rect.left()))
+
+    placed_boxes = []
+    layouts = []
+    for idx in render_order:
+        if idx >= len(translations):
+            continue
+        block = blocks[idx]
+        trans = (translations[idx] or "").strip()
+        if not trans or trans == block.text.strip():
+            continue
+        if block.rect.width() < 8 or block.rect.height() < 7:
+            continue
+        rect = scaled_rects[idx].intersected(canvas_rect)
+        if rect.width() < 6 or rect.height() < 5:
+            continue
+
+        bg = _sample_block_bg(source_image, rect)
+        bg.setAlpha(255)
+        bg_top = _sample_band_bg(source_image, rect, [rect.top(), min(rect.bottom(), rect.top() + 1)]) or bg
+        bg_bot = _sample_band_bg(source_image, rect, [max(rect.top(), rect.bottom() - 1), rect.bottom()]) or bg
+        if _bg_color_diff(bg_top, bg) > 36:
+            bg_top = bg
+        if _bg_color_diff(bg_bot, bg) > 36:
+            bg_bot = bg
+        fg = _contrast_ink_for_bg(bg)
+
+        obstacles = [scaled_rects[j] for j in range(len(scaled_rects)) if j != idx and scaled_rects[j].width() > 2]
+        obstacles.extend(placed_boxes)
+
+        target_h = snapped_heights.get(idx, _block_visual_height(block))
+        line_count = int(getattr(block, "line_count", 1))
+        box, font, draw_flags, pad_x, pad_y = _fit_translation_box(
+            rect, obstacles, canvas_rect, trans, target_h, line_count, scale,
+            source_image=source_image, bg_color=bg
+        )
+        placed_boxes.append(box)
+
+        # 仅在原本外文字符占据的范围（左右微留抗锯齿缓冲）涂背景色，向右扩出的干净空白保持透明不拉白条
+        pad_r = max(2, int(round(3 * scale)))
+        is_single = (line_count <= 1 and "\n" not in trans)
+        erase_y = 0 if is_single else max(1, int(round(scale)))
+        erase_box = QRect(
+            max(box.left(), rect.left() - max(0, int(round(0.5 * scale)))),
+            max(box.top(), rect.top() - erase_y),
+            max(1, min(box.right(), rect.right() + pad_r) - max(box.left(), rect.left() - max(0, int(round(0.5 * scale)))) + 1),
+            max(1, min(box.bottom(), rect.bottom() + erase_y) - max(box.top(), rect.top() - erase_y) + 1),
+        ).intersected(box)
+
+        layouts.append({
+            "index": idx,
+            "orig": block.text,
+            "trans": trans,
+            "orig_rect": rect,
+            "box": box,
+            "erase_box": erase_box,
+            "font": font,
+            "font_px": max(8, font.pixelSize()),
+            "draw_flags": draw_flags,
+            "pad_x": pad_x,
+            "pad_y": pad_y,
+            "bg": bg,
+            "bg_top": bg_top,
+            "bg_bot": bg_bot,
+            "fg": fg,
+        })
+    return layouts
 
 
 def _render_translation_sheet(base_pixmap, blocks, translations, scale=1.0):
-    """密集界面（聊天/多气泡）改用左右两栏的干净译文卡片，避免补丁互相遮挡。"""
+    """备用两栏译文卡片布局（保留给显式调用，不再覆盖常规原位排版）。"""
     width = base_pixmap.width()
     sw = max(1, int(width * scale))
     base_h = max(1, int(base_pixmap.height() * scale))
@@ -3325,10 +4965,8 @@ def _render_translation_sheet(base_pixmap, blocks, translations, scale=1.0):
         trans = (translations[idx] or "").strip()
         if not trans or trans == block.text.strip():
             continue
-        if len(block.text.strip()) < 2 or block.rect.width() < 30 or block.rect.height() < 10:
-            continue
         col = 0 if block.rect.center().x() < width // 2 else 1
-        size = int((12 if block.rect.height() >= 34 else 11) * scale)
+        size = int((12 if getattr(block, "line_height", block.rect.height()) >= 28 else 11) * scale)
         font = make_ui_font(pixel_size=max(7, size))
         inner_w = max(40, col_w - int(12 * scale))
         bound = QFontMetrics(font).boundingRect(QRect(0, 0, inner_w, 10000), Qt.TextWordWrap, trans)
@@ -3344,7 +4982,6 @@ def _render_translation_sheet(base_pixmap, blocks, translations, scale=1.0):
     painter = QPainter(canvas)
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.TextAntialiasing, True)
-    # 原图只作为很淡的底图保留布局线索，不参与阅读
     painter.setOpacity(0.14)
     painter.drawPixmap(QRect(0, 0, sw, base_h), base_pixmap,
                        QRect(0, 0, base_pixmap.width(), base_pixmap.height()))
@@ -3365,126 +5002,282 @@ def _render_translation_sheet(base_pixmap, blocks, translations, scale=1.0):
 
 
 def render_translated_pixmap(base_pixmap, blocks, translations):
-    """把段落级译文绘制到原图副本上，生成一张可对比/可保存的译文图。"""
+    """按原生清晰分辨率原位覆盖译文：小截图整数 2x 放大，正常/大图保持 1:1 零插值模糊并矢量绘字。"""
     if base_pixmap is None or base_pixmap.isNull():
         return QPixmap()
     width = base_pixmap.width()
     height = base_pixmap.height()
-    important = [b for b in blocks
-                 if len(b.text.strip()) >= 2 and b.rect.width() >= 30 and b.rect.height() >= 10]
-    narrow = sum(1 for b in important if b.rect.width() < width * 0.6)
-    left_blocks = [b for b in important if b.rect.center().x() < width * 0.42]
-    right_blocks = [b for b in important if b.rect.center().x() > width * 0.58]
-    multi_col = len(left_blocks) >= 4 and len(right_blocks) >= 4
 
-    def _median(values):
-        values = sorted(values)
-        return values[len(values) // 2] if values else 0
+    scale = 2 if (width < 480 or height < 340) else 1
+    if scale > 1 and max(width, height) * scale > 3200:
+        scale = 1
 
-    left_max_right = max((b.rect.right() for b in left_blocks), default=0)
-    # 左侧文字都挤在窄带里 = 侧边栏 + 正文：必须原位渲染，否则正文会被分到左栏
-    sidebar_layout = len(left_blocks) >= 3 and len(right_blocks) >= 3 and left_max_right < width * 0.28
-
-    # 译文图始终按 1.25~3 倍分辨率渲染，保证文字本身清晰，不受原图模糊/窗口放大影响
-    scale = 2.0
-    if max(width, height) >= 1600:
-        scale = 1.5
-    if width < 460 or height < 300:
-        scale = 3.0
-    if max(width, height) * scale > 3200:
-        scale = max(1.0, 3200.0 / max(width, height))
-
-    if multi_col and not sidebar_layout and len(important) >= 12 and narrow >= len(important) * 0.45:
-        # 左右都有大量短块（聊天/多栏）：补丁式覆盖会互相压住，改用干净的双栏译文卡片
-        return _render_translation_sheet(base_pixmap, blocks, translations, scale)
-
-    target_w = max(1, int(width * scale))
-    target_h = max(1, int(height * scale))
-    if scale != 1.0:
-        result = base_pixmap.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    if scale > 1:
+        result = base_pixmap.scaled(width * scale, height * scale, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     else:
         result = QPixmap(base_pixmap)
     source_image = result.toImage()
-    scaled_rects = [
-        QRect(int(b.rect.left() * scale), int(b.rect.top() * scale),
-              max(1, int(b.rect.width() * scale)), max(1, int(b.rect.height() * scale)))
-        for b in blocks
-    ]
+    layouts = _compute_block_layouts(source_image, blocks, translations, scale=float(scale))
 
     painter = QPainter(result)
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.TextAntialiasing, True)
 
-    for idx, block in enumerate(blocks):
-        if idx >= len(translations):
-            break
-        trans = (translations[idx] or "").strip()
-        if not trans or trans == block.text.strip():
-            continue
-        # 过滤图标、标点、细小 UI 元素（按原图尺寸判断）
-        if block.rect.width() < 14 or block.rect.height() < 9:
-            continue
-        rect = scaled_rects[idx].intersected(result.rect())
-        if rect.width() < 8 or rect.height() < 6:
-            continue
-
-        # 优先尝试向下扩展，空间足够时允许译文换成两行，避免一句话被截断
-        layout_rect = QRect(rect)
-        for factor in (1.6, 1.3, 1.0):
-            test = QRect(rect.left(), rect.top(), rect.width(), max(rect.height(), int(rect.height() * factor)))
-            collision = any(test.intersects(other) for j, other in enumerate(scaled_rects)
-                            if j != idx and other.width() > 2)
-            if not collision:
-                layout_rect = test
-                break
-
-        max_w = max(int(12 * scale), rect.width() - int(6 * scale))
-        max_h = max(int(8 * scale), layout_rect.height() - int(4 * scale))
-        family = "Segoe UI" if all(ord(c) < 128 for c in trans) else "Microsoft YaHei UI"
-        start_size = max(int(7 * scale), min(int(16 * scale), int(rect.height() * 0.55)))
-        if rect.height() < 20 * scale:
-            start_size = min(start_size, int(10 * scale))
-        min_size = max(6, int(6 * scale))
-        font = None
-        bound = None
-        for size in range(start_size, min_size - 1, -1):
-            f = make_ui_font(pixel_size=size)
-            br = QFontMetrics(f).boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, trans)
-            if br.height() <= max_h and br.width() <= max_w:
-                font, bound = f, br
-                break
-        if font is None:
-            font = make_ui_font(pixel_size=min_size)
-            bound = QFontMetrics(font).boundingRect(QRect(0, 0, max_w, 10000), Qt.TextWordWrap, trans)
-
-        pad = max(1, int(3 * scale))
-        box = QRect(rect.left() - pad, rect.top() - pad,
-                    min(result.width() - rect.left() + pad, rect.width() + pad * 2),
-                    min(result.height() - rect.top() + pad,
-                        max(rect.height() + pad * 2,
-                            min(bound.height() + int(8 * scale), layout_rect.height() + pad * 2))))
-        box = box.intersected(result.rect())
-        bg = _sample_block_bg(source_image, rect)
-        bg.setAlpha(255)  # 原位覆盖必须完全不透明，否则原文会透出来形成重影
-        painter.setPen(Qt.NoPen)  # 无边框，尽量接近原生排版
-        painter.setBrush(bg)
-        painter.drawRoundedRect(box, max(2, int(2 * scale)), max(2, int(2 * scale)))
-        painter.setPen(QColor(15, 23, 42) if bg.lightness() > 128 else QColor(240, 244, 248))
-        painter.setFont(font)
-        painter.setClipRect(box.adjusted(1, 1, -1, -1))
-        painter.drawText(box.adjusted(int(4 * scale), int(3 * scale), -int(4 * scale), -int(3 * scale)),
-                         Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter, trans)
-        painter.setClipping(False)
-        painter.setBrush(Qt.NoBrush)
+    radius = max(1.5, float(scale))
+    for item in layouts:
+        box_f = QRectF(item["box"])
+        erase_f = QRectF(item.get("erase_box", item["box"]))
+        _draw_translated_item(
+            painter, item, box_f, erase_f, radius,
+            item["font"], float(item["pad_x"]), float(item["pad_y"]), hovered=False
+        )
 
     painter.end()
     return result
 
+def _rescale_ocr_rows(rows, src_size, dst_size):
+    """若 OCR 尺寸与显示底图尺寸存在缩放差异，先统一行框及逐字符坐标，便于精确像素采样。"""
+    if (not src_size.isValid() or src_size.width() <= 0 or src_size.height() <= 0
+            or not dst_size.isValid() or dst_size.width() <= 0 or dst_size.height() <= 0):
+        return list(rows)
+    if src_size.width() == dst_size.width() and src_size.height() == dst_size.height():
+        return list(rows)
+    sx = dst_size.width() / float(src_size.width())
+    sy = dst_size.height() / float(src_size.height())
+
+    def _map_r(r):
+        return QRect(
+            int(round(r.left() * sx)), int(round(r.top() * sy)),
+            max(1, int(round(r.width() * sx))), max(1, int(round(r.height() * sy)))
+        )
+
+    out = []
+    for row in rows:
+        out.append(OcrRow(row.text, _map_r(row.rect), [_map_r(cr) for cr in (row.char_rects or [])]))
+    return out
+
+
+class _TranslationCanvasSurface(QWidget):
+    """高分屏原生实时矢量译文画布：底图保持零模糊像素级渲染，译文直接在屏幕 DPI 上矢量绘制。"""
+
+    block_copied = pyqtSignal(str)
+    zoom_requested = pyqtSignal(float, QPoint)
+
+    def __init__(self, pixmap, interactive=False, parent=None):
+        super().__init__(parent)
+        self._pixmap = QPixmap(pixmap) if pixmap is not None else QPixmap()
+        self._interactive = interactive
+        self._layouts = []
+        self._zoom = 1.0
+        self._show_overlay = True
+        self._hover_idx = -1
+        self._press_pos = None
+        self._dragged = False
+        self.setMouseTracking(interactive)
+        self._sync_size()
+
+    def set_pixmap(self, pixmap):
+        self._pixmap = QPixmap(pixmap) if pixmap is not None else QPixmap()
+        self._sync_size()
+        self.update()
+
+    def set_layouts(self, layouts):
+        self._layouts = list(layouts or [])
+        self._hover_idx = -1
+        self.update()
+
+    def set_show_overlay(self, show):
+        self._show_overlay = bool(show)
+        self.update()
+
+    def set_zoom(self, zoom):
+        z = max(0.15, min(4.0, float(zoom)))
+        if abs(z - self._zoom) < 1e-4:
+            return
+        self._zoom = z
+        self._sync_size()
+        self.update()
+
+    def _sync_size(self):
+        if self._pixmap is None or self._pixmap.isNull():
+            self.resize(100, 100)
+            return
+        w = max(1, int(round(self._pixmap.width() * self._zoom)))
+        h = max(1, int(round(self._pixmap.height() * self._zoom)))
+        self.setFixedSize(w, h)
+
+    def _layout_at_pos(self, pos):
+        if not self._interactive or not self._show_overlay or not self._layouts or self._zoom <= 0:
+            return -1
+        ix = pos.x() / self._zoom
+        iy = pos.y() / self._zoom
+        for i in range(len(self._layouts) - 1, -1, -1):
+            box = self._layouts[i]["box"]
+            if box.left() <= ix <= box.right() + 1 and box.top() <= iy <= box.bottom() + 1:
+                return i
+        return -1
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        new_z = max(0.15, min(4.0, self._zoom * factor))
+        self.zoom_requested.emit(new_z, event.pos())
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._interactive:
+            idx = self._layout_at_pos(event.pos())
+            if idx != self._hover_idx:
+                self._hover_idx = idx
+                if idx >= 0:
+                    item = self._layouts[idx]
+                    QToolTip.showText(
+                        event.globalPos(),
+                        f"原文：{item['orig']}\n译文：{item['trans']}\n（点击可复制此段译文）",
+                        self,
+                    )
+                else:
+                    QToolTip.hideText()
+                self.update()
+        event.ignore()
+
+    def leaveEvent(self, event):
+        if self._hover_idx != -1:
+            self._hover_idx = -1
+            self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if self._interactive and event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+            self._dragged = False
+        event.ignore()
+
+    def mouseReleaseEvent(self, event):
+        if (self._interactive and event.button() == Qt.LeftButton and self._press_pos is not None
+                and (event.pos() - self._press_pos).manhattanLength() <= 5):
+            idx = self._layout_at_pos(event.pos())
+            if idx >= 0:
+                trans = self._layouts[idx]["trans"]
+                QApplication.clipboard().setText(trans)
+                self.block_copied.emit(trans)
+                event.accept()
+                return
+        event.ignore()
+
+    def paintEvent(self, event):
+        if self._pixmap is None or self._pixmap.isNull():
+            return
+        painter = QPainter(self)
+        z = self._zoom
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        # 大于等于 100% 时禁用平滑插值，保证截图像素锐利无雾感；小于 100% 缩小时开平滑防锯齿
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, z < 0.995)
+
+        target_rect = QRectF(0.0, 0.0, self._pixmap.width() * z, self._pixmap.height() * z)
+        painter.drawPixmap(target_rect, self._pixmap, QRectF(0.0, 0.0, self._pixmap.width(), self._pixmap.height()))
+
+        if self._show_overlay and self._layouts:
+            radius = max(1.0, 1.5 * z)
+            for idx, item in enumerate(self._layouts):
+                box = item["box"]
+                ebox = item.get("erase_box", box)
+                zbox = QRectF(box.left() * z, box.top() * z, box.width() * z, box.height() * z)
+                zerase = QRectF(ebox.left() * z, ebox.top() * z, ebox.width() * z, ebox.height() * z)
+
+                # 直接按目标逻辑字号使用矢量 pt 绘制，在任何缩放倍率与 HiDPI 屏幕下都清晰锐利
+                f = make_ui_font()
+                f.setPointSizeF(max(5.5, float(item["font_px"]) * z * 0.75))
+                _draw_translated_item(
+                    painter, item, zbox, zerase, radius,
+                    f, item["pad_x"] * z, item["pad_y"] * z, hovered=(idx == self._hover_idx)
+                )
+
+        painter.end()
+
+
+class _TranslationCanvasView(QScrollArea):
+    """支持同步缩放与左键拖拽平移的滚动画布容器。"""
+
+    zoom_changed = pyqtSignal(float)
+
+    def __init__(self, pixmap, interactive=False, parent=None):
+        super().__init__(parent)
+        self.setObjectName("transCanvasScroll")
+        self.setWidgetResizable(False)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFrameShape(QFrame.NoFrame)
+        self.surface = _TranslationCanvasSurface(pixmap, interactive=interactive)
+        self.setWidget(self.surface)
+        self._panning = False
+        self._pan_start = QPoint()
+        self._pan_scroll_x = 0
+        self._pan_scroll_y = 0
+        self.viewport().setCursor(Qt.OpenHandCursor)
+        self.surface.zoom_requested.connect(self._on_surface_zoom_request)
+
+    def calc_fit_zoom(self):
+        pm = self.surface._pixmap
+        if pm is None or pm.isNull():
+            return 1.0
+        vw = max(120, self.viewport().width() - 12)
+        vh = max(100, self.viewport().height() - 12)
+        z = min(vw / max(1, pm.width()), vh / max(1, pm.height()))
+        return max(0.15, min(2.0, z))
+
+    def set_zoom(self, zoom, anchor_surface_pos=None):
+        old_z = self.surface._zoom
+        new_z = max(0.15, min(4.0, float(zoom)))
+        if abs(new_z - old_z) < 1e-4:
+            return
+        if anchor_surface_pos is not None and old_z > 0:
+            vp_pos = self.surface.mapTo(self.viewport(), anchor_surface_pos)
+            img_x = anchor_surface_pos.x() / old_z
+            img_y = anchor_surface_pos.y() / old_z
+            self.surface.set_zoom(new_z)
+            self.horizontalScrollBar().setValue(int(round(img_x * new_z - vp_pos.x())))
+            self.verticalScrollBar().setValue(int(round(img_y * new_z - vp_pos.y())))
+        else:
+            self.surface.set_zoom(new_z)
+        self.zoom_changed.emit(new_z)
+
+    def _on_surface_zoom_request(self, new_z, surface_pos):
+        self.set_zoom(new_z, anchor_surface_pos=surface_pos)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._panning = True
+            self._pan_start = event.pos()
+            self._pan_scroll_x = self.horizontalScrollBar().value()
+            self._pan_scroll_y = self.verticalScrollBar().value()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.pos() - self._pan_start
+            self.horizontalScrollBar().setValue(self._pan_scroll_x - delta.x())
+            self.verticalScrollBar().setValue(self._pan_scroll_y - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._panning and event.button() == Qt.LeftButton:
+            self._panning = False
+            self.viewport().setCursor(Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+
 class TranslationResultWindow(QDialog):
     """
     一键翻译结果窗口：
-    - compare：左原图 / 右覆盖译文的图
-    - overlay：只显示覆盖译文的图
+    - 原生高分屏矢量画布（支持滚轮缩放 / 1:1 / 适应窗口 / 拖拽平移 / 双栏同步联动 / 点击复制单段译文）；
+    - 支持「对比原图」透视与导出原生无损分辨率译文图。
     """
 
     def __init__(self, original_pixmap, doc, target_lang, use_ai=False, mode="compare", parent=None):
@@ -3495,9 +5288,13 @@ class TranslationResultWindow(QDialog):
 
         self._original_pm = QPixmap(original_pixmap)
         self._translated_pm = QPixmap(original_pixmap)
+        self._original_img = self._original_pm.toImage() if not self._original_pm.isNull() else QImage()
         self.doc = doc
-        self.rows = doc.rows
-        self.blocks = build_translation_blocks(doc.rows)
+        scaled_rows = _rescale_ocr_rows(doc.rows, doc.image_size, self._original_pm.size())
+        self.rows = scaled_rows
+        self.blocks = build_translation_blocks(scaled_rows, image=self._original_img)
+        self._layouts = []
+
         self.target_lang = target_lang
         self.use_ai = use_ai
         self.mode = "overlay" if mode == "overlay" else "compare"
@@ -3505,21 +5302,23 @@ class TranslationResultWindow(QDialog):
         self._workers = []
         self._worker = None
         self._closed = False
+        self._syncing_view = False
+        self._initial_zoom_applied = False
         self.content = None
-        self.lbl_original = None
-        self.lbl_translated = None
+        self.view_original = None
+        self.view_translated = None
 
         screen = QApplication.primaryScreen().availableGeometry()
         pw, ph = self._original_pm.width(), self._original_pm.height()
         if self.mode == "compare":
-            content_w = max(820, pw * 1.9 + 96)
-            content_h = max(520, ph * 1.15 + 128)
+            content_w = max(920, pw * 2.0 + 120)
+            content_h = max(560, ph + 148)
         else:
-            content_w = max(560, pw * 1.35 + 64)
-            content_h = max(440, ph * 1.2 + 112)
-        self.resize(min(int(screen.width() * 0.92), int(content_w)),
-                    min(int(screen.height() * 0.88), int(content_h)))
-        self.setMinimumSize(560, 400)
+            content_w = max(680, pw + 96)
+            content_h = max(480, ph + 132)
+        self.resize(min(int(screen.width() * 0.94), int(content_w)),
+                    min(int(screen.height() * 0.90), int(content_h)))
+        self.setMinimumSize(640, 420)
 
         self._setup_ui()
         self._apply_style()
@@ -3547,8 +5346,8 @@ class TranslationResultWindow(QDialog):
         top_bar = QWidget()
         top_bar.setObjectName("codexTopBar")
         bar = QHBoxLayout(top_bar)
-        bar.setContentsMargins(18, 12, 18, 12)
-        bar.setSpacing(10)
+        bar.setContentsMargins(16, 10, 16, 10)
+        bar.setSpacing(8)
 
         icon_lbl = QLabel()
         icon_lbl.setPixmap(_create_codex_icon("ai", "#0D0D0D", 16).pixmap(16, 16))
@@ -3565,7 +5364,50 @@ class TranslationResultWindow(QDialog):
         bar.addWidget(self.lbl_status)
         bar.addStretch()
 
-        lbl_lang = QLabel("目标语言")
+        # 缩放与对比工具组
+        self.btn_fit = QPushButton("适应")
+        self.btn_fit.setObjectName("codexZoomBtn")
+        self.btn_fit.setCursor(Qt.PointingHandCursor)
+        self.btn_fit.setToolTip("缩放图片以完整适配当前窗口")
+        self.btn_fit.clicked.connect(self._fit_zoom)
+        bar.addWidget(self.btn_fit)
+
+        self.btn_1to1 = QPushButton("1:1")
+        self.btn_1to1.setObjectName("codexZoomBtn")
+        self.btn_1to1.setCursor(Qt.PointingHandCursor)
+        self.btn_1to1.setToolTip("按 100% 原始像素尺寸显示（最清晰）")
+        self.btn_1to1.clicked.connect(lambda: self._apply_zoom_all(1.0))
+        bar.addWidget(self.btn_1to1)
+
+        btn_zoom_out = QPushButton("-")
+        btn_zoom_out.setObjectName("codexZoomBtn")
+        btn_zoom_out.setFixedWidth(26)
+        btn_zoom_out.setCursor(Qt.PointingHandCursor)
+        btn_zoom_out.clicked.connect(lambda: self._step_zoom(1.0 / 1.18))
+        bar.addWidget(btn_zoom_out)
+
+        self.lbl_zoom = QLabel("100%")
+        self.lbl_zoom.setObjectName("codexSubtitle")
+        self.lbl_zoom.setMinimumWidth(40)
+        self.lbl_zoom.setAlignment(Qt.AlignCenter)
+        bar.addWidget(self.lbl_zoom)
+
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setObjectName("codexZoomBtn")
+        btn_zoom_in.setFixedWidth(26)
+        btn_zoom_in.setCursor(Qt.PointingHandCursor)
+        btn_zoom_in.clicked.connect(lambda: self._step_zoom(1.18))
+        bar.addWidget(btn_zoom_in)
+
+        self.btn_peek = QPushButton("对比原图")
+        self.btn_peek.setObjectName("codexZoomBtn")
+        self.btn_peek.setCheckable(True)
+        self.btn_peek.setCursor(Qt.PointingHandCursor)
+        self.btn_peek.setToolTip("临时隐藏译文覆盖层以核对原图")
+        self.btn_peek.toggled.connect(self._on_peek_toggled)
+        bar.addWidget(self.btn_peek)
+
+        lbl_lang = QLabel("目标")
         lbl_lang.setObjectName("codexSubtitle")
         bar.addWidget(lbl_lang)
 
@@ -3576,16 +5418,22 @@ class TranslationResultWindow(QDialog):
         if idx >= 0:
             self.combo_lang.setCurrentIndex(idx)
         self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
-        self.combo_lang.setMinimumWidth(164)
+        self.combo_lang.setMinimumWidth(148)
         bar.addWidget(self.combo_lang)
 
-        self.btn_copy = QPushButton("复制译文图")
+        self.btn_copy_text = QPushButton("复制文本")
+        self.btn_copy_text.setObjectName("codexSecondaryBtn")
+        self.btn_copy_text.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_text.clicked.connect(self._copy_all_text)
+        bar.addWidget(self.btn_copy_text)
+
+        self.btn_copy = QPushButton("复制图片")
         self.btn_copy.setObjectName("codexSecondaryBtn")
         self.btn_copy.setCursor(Qt.PointingHandCursor)
         self.btn_copy.clicked.connect(self._copy_image)
         bar.addWidget(self.btn_copy)
 
-        self.btn_save = QPushButton("保存译文图")
+        self.btn_save = QPushButton("保存图片")
         self.btn_save.setObjectName("codexSecondaryBtn")
         self.btn_save.setCursor(Qt.PointingHandCursor)
         self.btn_save.clicked.connect(self._save_image)
@@ -3601,23 +5449,26 @@ class TranslationResultWindow(QDialog):
         self.content = QWidget()
         self.content.setObjectName("transBody")
         content_layout = QHBoxLayout(self.content)
-        content_layout.setContentsMargins(18, 16, 18, 16)
-        content_layout.setSpacing(14)
+        content_layout.setContentsMargins(16, 14, 16, 14)
+        content_layout.setSpacing(12)
 
-        self.lbl_original = None
-        self.lbl_translated = None
         if self.mode == "compare":
-            left_card, self.lbl_original = self._make_card("原图")
-            right_card, self.lbl_translated = self._make_card("译文图")
+            left_card, self.view_original = self._make_card("原图（支持滚轮缩放 / 拖拽联动）", interactive=False)
+            right_card, self.view_translated = self._make_card("译文图（矢量清晰 · 悬停看原文 / 点击复制）", interactive=True)
             content_layout.addWidget(left_card, 1)
             content_layout.addWidget(right_card, 1)
+            self._wire_view_sync(self.view_original, self.view_translated)
         else:
-            card, self.lbl_translated = self._make_card("译文图")
+            card, self.view_translated = self._make_card("译文图（滚轮缩放 / 悬停看原文 / 点击复制）", interactive=True)
             content_layout.addWidget(card, 1)
+            self.view_translated.zoom_changed.connect(self._update_zoom_label)
 
+        self.view_translated.surface.block_copied.connect(
+            lambda txt: self._set_status(f"已复制：{txt[:18]}{'…' if len(txt) > 18 else ''}", "ok")
+        )
         main.addWidget(self.content, 1)
 
-    def _make_card(self, title_text):
+    def _make_card(self, title_text, interactive=False):
         card = QFrame()
         card.setObjectName("codexCard")
         lay = QVBoxLayout(card)
@@ -3627,7 +5478,7 @@ class TranslationResultWindow(QDialog):
         head = QWidget()
         head.setObjectName("transCardHead")
         head_lay = QHBoxLayout(head)
-        head_lay.setContentsMargins(14, 9, 14, 9)
+        head_lay.setContentsMargins(14, 8, 14, 8)
         title = QLabel(title_text)
         title.setObjectName("transCardTitle")
         head_lay.addWidget(title)
@@ -3637,15 +5488,38 @@ class TranslationResultWindow(QDialog):
         stage = QWidget()
         stage.setObjectName("transStageWrap")
         stage_lay = QVBoxLayout(stage)
-        stage_lay.setContentsMargins(10, 10, 10, 10)
-        label = QLabel()
-        label.setObjectName("transStage")
-        label.setAlignment(Qt.AlignCenter)
-        label.setMinimumSize(240, 180)
-        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        stage_lay.addWidget(label, 1)
+        stage_lay.setContentsMargins(8, 8, 8, 8)
+        view = _TranslationCanvasView(self._original_pm, interactive=interactive)
+        stage_lay.addWidget(view, 1)
         lay.addWidget(stage, 1)
-        return card, label
+        return card, view
+
+    def _wire_view_sync(self, v1, v2):
+        def _sync_zoom(src, dst, z):
+            self._update_zoom_label(z)
+            if self._syncing_view:
+                return
+            self._syncing_view = True
+            try:
+                dst.surface.set_zoom(z)
+            finally:
+                self._syncing_view = False
+
+        def _sync_sb(src_bar, dst_bar, val):
+            if self._syncing_view:
+                return
+            self._syncing_view = True
+            try:
+                dst_bar.setValue(val)
+            finally:
+                self._syncing_view = False
+
+        v1.zoom_changed.connect(lambda z: _sync_zoom(v1, v2, z))
+        v2.zoom_changed.connect(lambda z: _sync_zoom(v2, v1, z))
+        v1.horizontalScrollBar().valueChanged.connect(lambda val: _sync_sb(v1.horizontalScrollBar(), v2.horizontalScrollBar(), val))
+        v2.horizontalScrollBar().valueChanged.connect(lambda val: _sync_sb(v2.horizontalScrollBar(), v1.horizontalScrollBar(), val))
+        v1.verticalScrollBar().valueChanged.connect(lambda val: _sync_sb(v1.verticalScrollBar(), v2.verticalScrollBar(), val))
+        v2.verticalScrollBar().valueChanged.connect(lambda val: _sync_sb(v2.verticalScrollBar(), v1.verticalScrollBar(), val))
 
     def _apply_style(self):
         self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
@@ -3659,7 +5533,7 @@ class TranslationResultWindow(QDialog):
                 border-top-right-radius: 10px;
             }
             QLabel#transCardTitle {
-                font-size: 12.5px;
+                font-size: 12px;
                 font-weight: 600;
                 color: #0D0D0D;
                 background: transparent;
@@ -3669,57 +5543,80 @@ class TranslationResultWindow(QDialog):
                 border-bottom-left-radius: 10px;
                 border-bottom-right-radius: 10px;
             }
-            QLabel#transStage {
+            QScrollArea#transCanvasScroll {
                 background-color: #F4F4F5;
                 border: 1px solid #ECECEF;
                 border-radius: 7px;
+            }
+            QPushButton#codexZoomBtn {
+                background-color: #FFFFFF;
+                color: #27272A;
+                border: 1px solid #E4E4E7;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 11.5px;
+                font-weight: 500;
+            }
+            QPushButton#codexZoomBtn:hover {
+                background-color: #F4F4F5;
+            }
+            QPushButton#codexZoomBtn:checked {
+                background-color: #EEF2FF;
+                color: #2563EB;
+                border-color: #93C5FD;
             }
         """)
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._update_display()
+        if not self._initial_zoom_applied:
+            self._initial_zoom_applied = True
+            QTimer.singleShot(0, self._init_smart_zoom)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._update_display()
+    def _init_smart_zoom(self):
+        if self._closed or self.view_translated is None:
+            return
+        fit_z = self.view_translated.calc_fit_zoom()
+        # 能完整展示时默认 1:1 锐利显示，超宽/超高大图默认适应窗口（译文依然矢量高清）
+        init_z = 1.0 if fit_z >= 0.92 else fit_z
+        self._apply_zoom_all(init_z)
+
+    def _update_zoom_label(self, z):
+        if hasattr(self, "lbl_zoom") and self.lbl_zoom is not None:
+            self.lbl_zoom.setText(f"{int(round(z * 100))}%")
+
+    def _apply_zoom_all(self, z):
+        z = max(0.15, min(4.0, float(z)))
+        if self.view_translated is not None:
+            self.view_translated.set_zoom(z)
+        if self.view_original is not None:
+            self.view_original.set_zoom(z)
+        self._update_zoom_label(z)
+
+    def _fit_zoom(self):
+        if self.view_translated is not None:
+            self._apply_zoom_all(self.view_translated.calc_fit_zoom())
+
+    def _step_zoom(self, factor):
+        if self.view_translated is not None:
+            self._apply_zoom_all(self.view_translated.surface._zoom * factor)
+
+    def _on_peek_toggled(self, checked):
+        if self.view_translated is not None:
+            self.view_translated.surface.set_show_overlay(not checked)
 
     def _update_display(self):
-        if self.content is None or self.lbl_translated is None:
-            return
-        avail_w = max(120, self.content.width() - 80)
-        avail_h = max(100, self.content.height() - 100)
-        if self.mode == "compare":
-            col_w = max(120, (avail_w - 14) // 2)
-            common_h = min(avail_h, max(self._original_pm.height(), self._translated_pm.height()))
-            self._set_scaled_height(self.lbl_original, self._original_pm, col_w, common_h)
-            self._set_scaled_height(self.lbl_translated, self._translated_pm, col_w, common_h)
-        else:
-            self._set_scaled(self.lbl_translated, self._translated_pm, avail_w, avail_h)
-
-    @staticmethod
-    def _set_scaled(label, pixmap, width, height):
-        if label is None or pixmap is None or pixmap.isNull():
-            return
-        label.setPixmap(pixmap.scaled(max(50, width), max(50, height),
-                                      Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    @staticmethod
-    def _set_scaled_height(label, pixmap, width, height):
-        if label is None or pixmap is None or pixmap.isNull():
-            return
-        target_h = max(50, height)
-        scaled = pixmap.scaledToHeight(target_h, Qt.SmoothTransformation)
-        if scaled.width() > width:
-            scaled = scaled.scaledToWidth(max(50, width), Qt.SmoothTransformation)
-        label.setPixmap(scaled)
+        if self.view_translated is not None:
+            self.view_translated.surface.set_layouts(self._layouts)
 
     def _start_translation(self):
         if self._closed:
             return
         self.translations = ["" for _ in self.blocks]
+        self._layouts = []
         self._translated_pm = QPixmap(self._original_pm)
         self._set_status("正在翻译…", "info")
+        self.btn_copy_text.setEnabled(False)
         self.btn_copy.setEnabled(False)
         self.btn_save.setEnabled(False)
         self._update_display()
@@ -3769,14 +5666,22 @@ class TranslationResultWindow(QDialog):
     def _on_all_done(self, ok):
         if self._closed or self.sender() is not self._worker:
             return
+        self._layouts = _compute_block_layouts(self._original_img, self.blocks, self.translations, scale=1.0)
         self._translated_pm = render_translated_pixmap(self._original_pm, self.blocks, self.translations)
         self._update_display()
+        changed = sum(
+            1 for b, t in zip(self.blocks, self.translations)
+            if (t or "").strip() and (t or "").strip() != b.text.strip()
+        )
         if not self.translations:
             self._set_status("未识别到可翻译文字", "err")
         elif not ok:
             self._set_status("部分内容翻译失败，已保留原文", "warn")
+        elif changed == 0:
+            self._set_status("内容似与目标语言一致，可在右上角切换目标语言", "warn")
         else:
-            self._set_status("翻译完成", "ok")
+            self._set_status(f"翻译完成 · {changed} 处", "ok")
+        self.btn_copy_text.setEnabled(True)
         self.btn_copy.setEnabled(True)
         self.btn_save.setEnabled(True)
 
@@ -3788,6 +5693,16 @@ class TranslationResultWindow(QDialog):
         save_settings({"ocr_target_lang": code})
         self._stop_worker()
         self._start_translation()
+
+    def _copy_all_text(self):
+        lines = []
+        for b, t in zip(self.blocks, self.translations):
+            txt = (t or b.text or "").strip()
+            if txt:
+                lines.append(txt)
+        if lines:
+            QApplication.clipboard().setText("\n".join(lines))
+            self._set_status("全部译文已复制", "ok")
 
     def _copy_image(self):
         if self._translated_pm is None or self._translated_pm.isNull():
@@ -6969,10 +8884,14 @@ class PinnedWindow(QWidget):
                 QToolTip.hideText()
                 codes = getattr(worker, "detected_codes", [])
                 doc = getattr(worker, "ocr_doc", None)
+                warn = getattr(worker, "ocr_warning", "")
                 if (not text or not text.strip()) and not codes:
                     QMessageBox.information(None, "文字识别结果", "未能从贴图中识别到有效文字或二维码。")
                     return
-                dlg = OcrResultDialog(text, None, detected_codes=codes, ocr_doc=doc)
+                dlg = OcrResultDialog(
+                    text, None, detected_codes=codes, ocr_doc=doc,
+                    source_image=getattr(worker, "image", None), ocr_warning=warn
+                )
                 dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
                 self._temp_ocr_dialog = dlg
                 dlg.exec_()
@@ -7962,10 +9881,15 @@ class ImageEditorDialog(QDialog):
         self.btn_ocr.setChecked(False)
         codes = getattr(self.ocr_worker, "detected_codes", []) if hasattr(self, "ocr_worker") and self.ocr_worker else []
         doc = getattr(self.ocr_worker, "ocr_doc", None) if hasattr(self, "ocr_worker") and self.ocr_worker else None
+        src_img = getattr(self.ocr_worker, "image", None) if hasattr(self, "ocr_worker") and self.ocr_worker else None
+        warn = getattr(self.ocr_worker, "ocr_warning", "") if hasattr(self, "ocr_worker") and self.ocr_worker else ""
         if not text and not codes:
             QMessageBox.information(self, "OCR 结果", "未能识别到文字或二维码，请重试。")
         else:
-            dlg = OcrResultDialog(text, self, detected_codes=codes, ocr_doc=doc)
+            dlg = OcrResultDialog(
+                text, self, detected_codes=codes, ocr_doc=doc,
+                source_image=src_img, ocr_warning=warn
+            )
             dlg.exec_()
 
     def set_tool(self, tool_name, active_btn=None):
@@ -10339,6 +12263,9 @@ class SettingsDialog(QDialog):
         self.cb_ai_ocr = CodexSwitch()
         card_ocr.add_row("启用 AI 多模态识图", "开启后优先使用智谱大模型识别复杂排版、公式与代码片段", self.cb_ai_ocr)
 
+        self.cb_ocr_sea_langs = CodexSwitch()
+        card_ocr.add_row("启用东南亚语言扩展 (泰语/菲律宾语)", "默认仅使用中英引擎防误识；需离线识别泰文或菲律宾文时再开启", self.cb_ocr_sea_langs)
+
         key_ocr_wrap = QWidget()
         key_ocr_wrap.setFixedWidth(275)
         key_box_ocr = QHBoxLayout(key_ocr_wrap)
@@ -10556,6 +12483,7 @@ class SettingsDialog(QDialog):
         self.input_zhipu_key.setText(s.get("zhipu_api_key", ""))
         self.input_ocr_model.setText(s.get("glm_ocr_model", DEFAULT_ZHIPU_OCR_MODEL))
         self.cb_ai_ocr.setChecked(bool(s.get("use_ai_ocr", False)))
+        self.cb_ocr_sea_langs.setChecked(bool(s.get("ocr_enable_sea_langs", False)))
 
         self.input_volc_key.setText(s.get("volc_api_key", ""))
         self.input_volc_model.setText(s.get("volc_model", DEFAULT_VOLC_TRANS_MODEL))
@@ -10624,6 +12552,7 @@ class SettingsDialog(QDialog):
             "volc_model": self.input_volc_model.text().strip() or DEFAULT_VOLC_TRANS_MODEL,
             "use_ai_translation": self.cb_ai_trans.isChecked(),
             "use_ai_ocr": self.cb_ai_ocr.isChecked(),
+            "ocr_enable_sea_langs": self.cb_ocr_sea_langs.isChecked(),
             "translation_display_mode": self.combo_trans_display.currentData(),
             "auto_check_update": self.cb_auto_update.isChecked(),
         }
@@ -12703,10 +14632,15 @@ class ScreenshotTool(QWidget):
             worker = getattr(self, "_quick_ocr_worker", None)
             codes = getattr(worker, "detected_codes", []) if worker is not None else []
             doc = getattr(worker, "ocr_doc", None) if worker is not None else None
+            src_img = getattr(worker, "image", None) if worker is not None else None
+            warn = getattr(worker, "ocr_warning", "") if worker is not None else ""
             if (not text or not text.strip()) and not codes:
                 QMessageBox.information(None, "文字识别结果", "未能识别到有效文字或二维码，请重新框选。")
                 return
-            dlg = OcrResultDialog(text, None, detected_codes=codes, ocr_doc=doc)
+            dlg = OcrResultDialog(
+                text, None, detected_codes=codes, ocr_doc=doc,
+                source_image=src_img, ocr_warning=warn
+            )
             dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
             self._active_ocr_dialog = dlg
             dlg.activateWindow()
@@ -12790,8 +14724,13 @@ class ScreenshotTool(QWidget):
         if btn is not None:
             btn.setEnabled(not busy)
 
-    def _current_capture_image(self):
+    def _current_capture_image(self, include_annotations=True):
         self.commit_text_edit()
+        if not include_annotations and hasattr(self, 'original_screen') and self.original_screen and not self.selection_rect.isNull():
+            has_content_edit = any(e.get('type') in ('TEXT', 'MOSAIC_BLUR', 'BLUR_STROKE') for e in (self.edits or []))
+            if not has_content_edit:
+                pixmap = self.original_screen.copy(self.selection_rect)
+                return pixmap.toImage() if pixmap is not None and not pixmap.isNull() else QImage()
         pixmap = self.get_final_static_image()
         return pixmap.toImage() if pixmap is not None and not pixmap.isNull() else QImage()
 
@@ -12805,22 +14744,18 @@ class ScreenshotTool(QWidget):
         return (img.width(), img.height(), digest)
 
     def _request_ocr_doc(self, on_ready, on_no_coords=None, on_error=None, silent=False):
-        """整图 OCR（强制本地引擎以保留文字坐标），同一张图优先复用缓存。"""
+        """整图 OCR（强制本地引擎以保留文字坐标，长图自动滑窗切片不压缩），同一张图优先复用缓存。"""
         if self._ocr_running:
             self._ocr_waiters.append({"ready": on_ready, "no_coords": on_no_coords, "error": on_error})
             if not silent:
                 QToolTip.showText(QCursor.pos(), "正在识别文字，请稍候…", None, QRect(), 1500)
             return
 
-        image = self._current_capture_image()
+        image = self._current_capture_image(include_annotations=False)
         if image.isNull():
             if on_error:
                 on_error("截图区域无效")
             return
-
-        # 超大截图先缩放，显著降低 OCR 耗时；坐标会按比例映射回选区
-        if max(image.width(), image.height()) > 2600:
-            image = image.scaled(2600, 2600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
         key = self._image_digest(image)
         if self._ocr_doc is not None and self._ocr_doc_key == key and not self._ocr_doc.is_empty():
@@ -13273,8 +15208,12 @@ class ScreenshotTool(QWidget):
         def _no_coords(text):
             # 极少数本地引擎完全没有坐标时，退化为文字对照（仍携带可能检出的条码）
             self._leave_modal_layer()
-            codes = detect_codes_in_image(self.get_final_static_image())
-            dlg = OcrResultDialog(text, self, detected_codes=codes)
+            img_for_code = self.get_final_static_image()
+            codes = detect_codes_in_image(img_for_code)
+            dlg = OcrResultDialog(
+                text, self, detected_codes=codes,
+                source_image=img_for_code.toImage() if img_for_code and not img_for_code.isNull() else None
+            )
             self._active_ocr_dialog = dlg
             dlg.exec_()
 
@@ -14681,10 +16620,15 @@ class ScreenshotTool(QWidget):
         worker = getattr(self, "ocr_worker", None)
         codes = getattr(worker, "detected_codes", []) if worker is not None else []
         doc = getattr(worker, "ocr_doc", None) if worker is not None else None
+        src_img = getattr(worker, "image", None) if worker is not None else None
+        warn = getattr(worker, "ocr_warning", "") if worker is not None else ""
         if not text and not codes:
             QMessageBox.information(self, "OCR 结果", "未能识别到文字或二维码，请重试。")
         else:
-            dlg = OcrResultDialog(text, self, detected_codes=codes, ocr_doc=doc)
+            dlg = OcrResultDialog(
+                text, self, detected_codes=codes, ocr_doc=doc,
+                source_image=src_img, ocr_warning=warn
+            )
             dlg.exec_() 
             
     def show_toolbar(self):
