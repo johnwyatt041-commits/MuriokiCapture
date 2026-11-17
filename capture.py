@@ -118,13 +118,15 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QHBoxLayout, QV
                              QColorDialog, QFontDialog, QTextEdit, QMenu, QComboBox, QSpinBox,
                              QSystemTrayIcon, QAction, QFrame, QSlider, QProgressBar, QToolTip,
                              QGraphicsDropShadowEffect, QGroupBox, QGridLayout, QLineEdit, QCheckBox,
-                             QStackedWidget, QSizePolicy, QAbstractButton, QButtonGroup, QShortcut)
+                             QStackedWidget, QSizePolicy, QAbstractButton, QButtonGroup, QShortcut,
+                             QAbstractSpinBox)
 from PyQt5.QtCore import (Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QSharedMemory, QTimer,
                           QAbstractNativeEventFilter, QObject, QUrl, QMimeData, QPointF, QRectF,
                           QPropertyAnimation, QEasingCurve, pyqtProperty, QEvent, QEventLoop)
 from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QFontDatabase, QBrush, QWheelEvent,
                          QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QFontMetricsF, QRegion,
-                         QKeySequence, QLinearGradient)
+                         QKeySequence, QLinearGradient, QTextDocument, QTextOption, QAbstractTextDocumentLayout,
+                         QPalette, QTextCursor)
 
 # ==========================================
 # ENVIRONMENT & OCR SETUP
@@ -170,7 +172,7 @@ from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -184,6 +186,261 @@ ZHIPU_OCR_API_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
 # 火山引擎方舟 (Doubao 翻译) 配置
 DEFAULT_VOLC_TRANS_MODEL = "ep-20260629102203-cfllm"
 VOLC_ARK_API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+
+# 截图底部工具栏工具快捷键配置表：(设置键, 工具/动作ID, 类型['tool'|'action'], 名称, 说明)
+TOOLBAR_TOOL_HOTKEY_SPECS = [
+    ("hotkey_tool_rect_ellipse", "RECT_ELLIPSE", "tool", "矩形 / 椭圆", "截图编辑时切换矩形/椭圆标注工具"),
+    ("hotkey_tool_arrow", "ARROW", "tool", "箭头", "截图编辑时切换箭头标注工具"),
+    ("hotkey_tool_pen", "PEN", "tool", "画笔", "截图编辑时切换画笔/折线标注工具"),
+    ("hotkey_tool_marker", "MARKER", "tool", "记号笔 / 荧光笔", "截图编辑时切换记号笔/荧光笔工具"),
+    ("hotkey_tool_mosaic_blur", "MOSAIC_BLUR", "tool", "马赛克 / 高斯模糊", "截图编辑时切换马赛克/高斯模糊工具"),
+    ("hotkey_tool_text", "TEXT", "tool", "文本", "截图编辑时切换文字标注工具"),
+    ("hotkey_tool_eraser", "ERASER", "tool", "橡皮擦", "截图编辑时切换橡皮擦工具"),
+    ("hotkey_tool_crop", "CROP", "action", "裁剪选区", "截图编辑时进入或退出裁剪模式"),
+    ("hotkey_tool_translate", "TRANSLATE", "action", "一键翻译", "截图编辑时一键识别并翻译当前选区"),
+]
+
+AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_APPROVED_PATH = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+AUTOSTART_VALUE_NAME = "MuriokiCapture"
+
+_HOTKEY_KEY_NAME_MAP = {
+    Qt.Key_Space: "Space",
+    Qt.Key_Tab: "Tab",
+    Qt.Key_Backtab: "Tab",
+    Qt.Key_Return: "Enter",
+    Qt.Key_Enter: "Enter",
+    Qt.Key_Escape: "Esc",
+    Qt.Key_Backspace: "Backspace",
+    Qt.Key_Delete: "Delete",
+    Qt.Key_Print: "PrintScreen",
+    Qt.Key_Insert: "Insert",
+    Qt.Key_Home: "Home",
+    Qt.Key_End: "End",
+    Qt.Key_PageUp: "PageUp",
+    Qt.Key_PageDown: "PageDown",
+    Qt.Key_Left: "Left",
+    Qt.Key_Right: "Right",
+    Qt.Key_Up: "Up",
+    Qt.Key_Down: "Down",
+    Qt.Key_Plus: "Plus",
+    Qt.Key_Minus: "-",
+    Qt.Key_Equal: "=",
+    Qt.Key_BracketLeft: "[",
+    Qt.Key_BracketRight: "]",
+    Qt.Key_Backslash: "\\",
+    Qt.Key_Semicolon: ";",
+    Qt.Key_Apostrophe: "'",
+    Qt.Key_Comma: ",",
+    Qt.Key_Period: ".",
+    Qt.Key_Slash: "/",
+    Qt.Key_QuoteLeft: "`",
+}
+
+_HOTKEY_TOKEN_ALIASES = {
+    "ctrl": "Ctrl",
+    "control": "Ctrl",
+    "alt": "Alt",
+    "shift": "Shift",
+    "win": "Win",
+    "windows": "Win",
+    "meta": "Win",
+    "space": "Space",
+    "tab": "Tab",
+    "enter": "Enter",
+    "return": "Enter",
+    "esc": "Esc",
+    "escape": "Esc",
+    "backspace": "Backspace",
+    "del": "Delete",
+    "delete": "Delete",
+    "printscreen": "PrintScreen",
+    "prtscr": "PrintScreen",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PageUp",
+    "pagedown": "PageDown",
+    "left": "Left",
+    "right": "Right",
+    "up": "Up",
+    "down": "Down",
+    "plus": "Plus",
+}
+
+
+def normalize_hotkey_str(hotkey_str):
+    """将快捷键字符串规范化为统一格式（如 Ctrl+Shift+R），空串原样返回。"""
+    s = str(hotkey_str or "").strip()
+    if not s:
+        return ""
+    if s == "+":
+        return "Plus"
+    raw_parts = [p.strip() for p in s.split("+")]
+    if s.endswith("++"):
+        raw_parts = [p.strip() for p in s[:-1].split("+")]
+        raw_parts[-1] = "Plus"
+    mods = []
+    key_token = ""
+    for p in raw_parts:
+        if not p:
+            continue
+        low = p.lower()
+        canonical_mod = _HOTKEY_TOKEN_ALIASES.get(low)
+        if canonical_mod in ("Ctrl", "Alt", "Shift", "Win"):
+            if canonical_mod not in mods:
+                mods.append(canonical_mod)
+        elif low.startswith("f") and low[1:].isdigit() and 1 <= int(low[1:]) <= 24:
+            key_token = f"F{int(low[1:])}"
+        elif canonical_mod is not None:
+            key_token = canonical_mod
+        elif len(p) == 1:
+            key_token = p.upper()
+        else:
+            key_token = p
+    if not key_token:
+        return ""
+    mod_order = [m for m in ("Ctrl", "Alt", "Shift", "Win") if m in mods]
+    return "+".join(mod_order + [key_token])
+
+
+def key_event_to_hotkey_str(event):
+    """将 Qt QKeyEvent 转换为与 HotkeyRecorderWidget 一致的规范化快捷键字符串。"""
+    key = event.key()
+    modifiers = event.modifiers()
+    if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta, getattr(Qt, "Key_AltGr", -1)):
+        return ""
+
+    mod_names = []
+    if modifiers & Qt.ControlModifier:
+        mod_names.append("Ctrl")
+    if modifiers & Qt.AltModifier:
+        mod_names.append("Alt")
+    if modifiers & Qt.ShiftModifier:
+        mod_names.append("Shift")
+    if modifiers & Qt.MetaModifier:
+        mod_names.append("Win")
+
+    key_name = ""
+    if Qt.Key_F1 <= key <= Qt.Key_F24:
+        key_name = f"F{key - Qt.Key_F1 + 1}"
+    elif Qt.Key_A <= key <= Qt.Key_Z:
+        key_name = chr(key).upper()
+    elif Qt.Key_0 <= key <= Qt.Key_9:
+        key_name = chr(key)
+    elif key in _HOTKEY_KEY_NAME_MAP:
+        key_name = _HOTKEY_KEY_NAME_MAP[key]
+    else:
+        txt = (event.text() or "").strip()
+        if len(txt) == 1 and txt.isprintable():
+            key_name = "Plus" if txt == "+" else txt.upper()
+        elif 0x21 <= key <= 0x7E:
+            seq = QKeySequence(key).toString().strip()
+            if len(seq) == 1 and seq.isprintable():
+                key_name = "Plus" if seq == "+" else seq.upper()
+
+    if not key_name:
+        return ""
+    parts = mod_names[:]
+    if key_name not in parts:
+        parts.append(key_name)
+    return "+".join(parts)
+
+
+def get_autostart_command():
+    """生成写入 Windows 启动项的命令行（兼容打包 exe 与源码运行）"""
+    if getattr(sys, "frozen", False):
+        exe_path = os.path.abspath(sys.executable)
+        return f'"{exe_path}"'
+    py_exe = os.path.abspath(sys.executable)
+    pyw_exe = os.path.join(os.path.dirname(py_exe), "pythonw.exe")
+    if os.path.isfile(pyw_exe) and os.path.basename(py_exe).lower() == "python.exe":
+        py_exe = pyw_exe
+    script_path = os.path.abspath(__file__)
+    return f'"{py_exe}" "{script_path}"'
+
+
+def is_autostart_enabled():
+    """检查当前 Windows 用户登录自启动是否处于开启状态"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            if not str(val or "").strip():
+                return False
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        logging.warning("读取开机自启动注册表失败: %s", e)
+        return False
+
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_APPROVED_PATH, 0, winreg.KEY_READ) as key:
+            data, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            if isinstance(data, (bytes, bytearray)) and len(data) >= 1 and (data[0] % 2 == 1):
+                return False
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return True
+
+
+def set_autostart_enabled(enabled):
+    """开启或关闭当前 Windows 用户的开机自启动"""
+    if sys.platform != "win32":
+        return False, "当前系统不支持 Windows 注册表自启动"
+    try:
+        import winreg
+        if enabled:
+            cmd = get_autostart_command()
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+            # 若此前在任务管理器被禁用，同步清除禁用态以保证开关立即生效
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_APPROVED_PATH, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                    data, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+                    if isinstance(data, (bytes, bytearray)) and len(data) >= 1 and (data[0] % 2 == 1):
+                        winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_BINARY, b"\x02" + b"\x00" * 11)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        else:
+            for reg_path in (AUTOSTART_REG_PATH, AUTOSTART_APPROVED_PATH):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_SET_VALUE) as key:
+                        winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except Exception as e:
+        logging.warning("设置开机自启动失败: %s", e)
+        return False, str(e)
+
+
+def sync_autostart_path_if_enabled():
+    """若已开启自启动且原注册路径已失效（如移动了程序目录），自动刷新为当前路径"""
+    if sys.platform != "win32" or not is_autostart_enabled():
+        return
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+        val_str = str(val or "").strip()
+        target_cmd = get_autostart_command()
+        if val_str == target_cmd:
+            return
+        # 解析首个引号或空格路径，仅在旧目标不存在时自动修复
+        first_token = val_str.split('"')[1] if val_str.startswith('"') and '"' in val_str[1:] else val_str.split()[0]
+        if first_token and not os.path.exists(first_token):
+            set_autostart_enabled(True)
+    except Exception:
+        pass
+
 
 def load_settings():
     """从本地 JSON 文件加载用户设置（自动兼容迁移历史配置文件）"""
@@ -209,7 +466,10 @@ def load_settings():
         "hotkey_toggle_pins": "Ctrl+Alt+H",
         "hotkey_paste_pin": "Ctrl+Alt+V",
         "hotkey_restore_click_through": "Ctrl+Alt+T",
+        "hotkey_pin_border": "",
+        "pin_border_enabled": False,
         "drawer_hover_enabled": True,
+        "auto_start": False,
         "default_save_dir": os.path.join(os.path.expanduser("~"), "Pictures"),
         "auto_save_enabled": False,
         "save_format": "png",
@@ -219,6 +479,8 @@ def load_settings():
         "last_update_check": 0,
         "skipped_version": "",
     }
+    for _spec in TOOLBAR_TOOL_HOTKEY_SPECS:
+        defaults[_spec[0]] = ""
     try:
         cfg_file = SETTINGS_FILE
         if not os.path.exists(cfg_file) and os.path.exists(BASE_DIR):
@@ -416,6 +678,183 @@ _user32.SetForegroundWindow.restype = wintypes.BOOL
 HWND_TOPMOST = wintypes.HWND(-1)
 HWND_NOTOPMOST = wintypes.HWND(-2)
 WS_EX_TOPMOST = 0x00000008
+GW_HWNDPREV = 3
+
+_kernel32 = ctypes.windll.kernel32
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetWindow.restype = wintypes.HWND
+_user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+_user32.AllowSetForegroundWindow.restype = wintypes.BOOL
+
+class _MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+_user32.MonitorFromRect.argtypes = [ctypes.POINTER(_RECT), wintypes.DWORD]
+_user32.MonitorFromRect.restype = wintypes.HANDLE
+_user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFOEXW)]
+_user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+_kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.CreateEventW.restype = wintypes.HANDLE
+_kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.OpenEventW.restype = wintypes.HANDLE
+_kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+_kernel32.SetEvent.restype = wintypes.BOOL
+_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+
+SINGLE_INSTANCE_SNIP_EVENT = "Local\\MuriokiCapture_TriggerSnip_Event"
+
+
+def _phys_rect_to_logical_qrect(phys_left, phys_top, phys_w, phys_h):
+    """将 Windows 物理像素矩形转换为 Qt 逻辑像素 QRect（兼容 100%~200% 多屏 DPI 缩放）。"""
+    try:
+        rc = _RECT(int(phys_left), int(phys_top), int(phys_left + phys_w), int(phys_top + phys_h))
+        hmon = _user32.MonitorFromRect(ctypes.byref(rc), 2)  # MONITOR_DEFAULTTONEAREST
+        if hmon:
+            mi = _MONITORINFOEXW()
+            mi.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+            if _user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                target_screen = None
+                for s in QApplication.screens():
+                    if s.name() == mi.szDevice:
+                        target_screen = s
+                        break
+                if target_screen is None:
+                    target_screen = QApplication.primaryScreen()
+                if target_screen is not None:
+                    dpr = float(target_screen.devicePixelRatio() or 1.0)
+                    sg = target_screen.geometry()
+                    if dpr == 1.0 and sg.x() == mi.rcMonitor.left and sg.y() == mi.rcMonitor.top:
+                        return QRect(int(phys_left), int(phys_top), int(phys_w), int(phys_h))
+                    lx = sg.x() + int(round((phys_left - mi.rcMonitor.left) / dpr))
+                    ly = sg.y() + int(round((phys_top - mi.rcMonitor.top) / dpr))
+                    lw = max(1, int(round(phys_w / dpr)))
+                    lh = max(1, int(round(phys_h / dpr)))
+                    return QRect(lx, ly, lw, lh)
+    except Exception:
+        pass
+    return QRect(int(phys_left), int(phys_top), int(phys_w), int(phys_h))
+
+
+def _logical_point_to_phys(lx, ly):
+    """将 Qt 逻辑全局坐标转换为 Windows 物理坐标。"""
+    try:
+        pt = QPoint(int(lx), int(ly))
+        screen = QApplication.screenAt(pt) or QApplication.primaryScreen()
+        if screen is not None:
+            dpr = float(screen.devicePixelRatio() or 1.0)
+            if dpr == 1.0:
+                return int(lx), int(ly)
+            sg = screen.geometry()
+            # 枚举当前屏幕对应的物理监视器范围
+            _MONITORENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HANDLE, wintypes.HDC, ctypes.POINTER(_RECT), wintypes.LPARAM)
+            matched_rc = []
+
+            def _mon_cb(hmon, _hdc, _lprect, _lp):
+                mi = _MONITORINFOEXW()
+                mi.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+                if _user32.GetMonitorInfoW(hmon, ctypes.byref(mi)) and mi.szDevice == screen.name():
+                    matched_rc.append(mi.rcMonitor)
+                    return False
+                return True
+
+            _user32.EnumDisplayMonitors(None, None, _MONITORENUMPROC(_mon_cb), 0)
+            if matched_rc:
+                mr = matched_rc[0]
+                return (
+                    mr.left + int(round((lx - sg.x()) * dpr)),
+                    mr.top + int(round((ly - sg.y()) * dpr)),
+                )
+            return int(round(lx * dpr)), int(round(ly * dpr))
+    except Exception:
+        pass
+    return int(lx), int(ly)
+
+
+_NONMODAL_DIALOGS = []
+
+
+def _register_nonmodal_dialog(dlg):
+    if dlg is not None and dlg not in _NONMODAL_DIALOGS:
+        _NONMODAL_DIALOGS.append(dlg)
+
+
+def _unregister_nonmodal_dialog(dlg):
+    try:
+        _NONMODAL_DIALOGS.remove(dlg)
+    except ValueError:
+        pass
+
+
+def _get_visible_nonmodal_dialogs():
+    alive = []
+    still_valid = []
+    for dlg in list(_NONMODAL_DIALOGS):
+        try:
+            _ = dlg.isVisible()
+            still_valid.append(dlg)
+            if dlg.isVisible():
+                alive.append(dlg)
+        except RuntimeError:
+            pass
+    _NONMODAL_DIALOGS[:] = still_valid
+    return alive
+
+
+def exec_dialog_nonmodal(dlg):
+    """以非模态局部事件循环运行 QDialog，避免 Qt activeModalWidget 阻塞全局热键唤起的截图选区。"""
+    if dlg is None:
+        return QDialog.Rejected
+    dlg.setModal(False)
+    dlg.setWindowModality(Qt.NonModal)
+    _register_nonmodal_dialog(dlg)
+    loop = QEventLoop(dlg)
+    res_box = [QDialog.Rejected]
+
+    def _on_finished(r=QDialog.Rejected):
+        res_box[0] = r
+        if loop.isRunning():
+            loop.quit()
+
+    def _quit_loop(*_args):
+        if loop.isRunning():
+            loop.quit()
+
+    class _CloseWatcher(QObject):
+        def eventFilter(self, obj, ev):
+            if obj is dlg and ev.type() == QEvent.Close and ev.isAccepted():
+                QTimer.singleShot(0, _quit_loop)
+            return False
+
+    watcher = _CloseWatcher(dlg)
+    dlg.installEventFilter(watcher)
+    dlg.finished.connect(_on_finished)
+    dlg.destroyed.connect(_quit_loop)
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(_quit_loop)
+
+    dlg.show()
+    _force_activate_window(dlg)
+    if dlg.isVisible():
+        loop.exec_()
+    try:
+        dlg.removeEventFilter(watcher)
+    except RuntimeError:
+        pass
+    _unregister_nonmodal_dialog(dlg)
+    return res_box[0]
 
 
 def _force_activate_window(widget):
@@ -1288,6 +1727,281 @@ def show_pin_toast(text, pinned=True):
     _active_pin_toast.show()
 
 
+class PinnedWindowBadge(QWidget):
+    """被置顶窗口顶部的常驻大头针标志，直观指示置顶状态并支持直接点击取消置顶"""
+    unpin_requested = pyqtSignal(int)
+
+    def __init__(self, target_hwnd, title=""):
+        super().__init__(None)
+        self.target_hwnd = int(target_hwnd)
+        self.target_title = title or ""
+        self._hovered = False
+        self._pressed = False
+        self.setWindowFlags(
+            Qt.WindowStaysOnTopHint
+            | Qt.FramelessWindowHint
+            | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(84, 24)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(self._build_tooltip())
+
+    def _build_tooltip(self):
+        name = f"「{self.target_title}」" if self.target_title else "当前窗口"
+        return f"📌 {name} 已置顶（点击取消置顶）"
+
+    def set_title(self, title):
+        if title and title != self.target_title:
+            self.target_title = title
+            self.setToolTip(self._build_tooltip())
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self._pressed = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._pressed = True
+            self.update()
+            event.accept()
+            return
+        elif event.button() == Qt.RightButton:
+            menu = QMenu(self)
+            act_unpin = menu.addAction("📌 取消窗口置顶")
+            chosen = menu.exec_(event.globalPos())
+            if chosen == act_unpin:
+                self.unpin_requested.emit(self.target_hwnd)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._pressed:
+            self._pressed = False
+            self.update()
+            if self.rect().contains(event.pos()):
+                self.unpin_requested.emit(self.target_hwnd)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(2.0, 2.0, -2.0, -2.0)
+
+        if self._pressed:
+            bg = QColor(185, 28, 28, 248)
+            border = QColor(254, 202, 202, 230)
+        elif self._hovered:
+            bg = QColor(220, 38, 38, 245)
+            border = QColor(255, 255, 255, 220)
+        else:
+            bg = QColor(24, 24, 27, 234)
+            border = QColor(239, 68, 68, 225)
+
+        path = QPainterPath()
+        path.addRoundedRect(rect, rect.height() / 2.0, rect.height() / 2.0)
+        painter.fillPath(path, QBrush(bg))
+        painter.setPen(QPen(border, 1.25))
+        painter.drawPath(path)
+
+        # 绘制左侧大头针矢量图标（针尖朝下指向被置顶窗口）
+        painter.save()
+        pin_cx = rect.left() + 13.0
+        pin_cy = rect.center().y()
+        painter.translate(pin_cx, pin_cy)
+        painter.rotate(32)
+        painter.setPen(QPen(QColor(228, 228, 231), 1.4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(0.0, 2.2), QPointF(0.0, 6.2))
+        painter.setPen(Qt.NoPen)
+        head_color = QColor(255, 255, 255) if self._hovered else QColor(239, 68, 68)
+        cap_color = QColor(254, 226, 226) if self._hovered else QColor(248, 113, 113)
+        painter.setBrush(QBrush(head_color))
+        painter.drawRoundedRect(QRectF(-4.0, 0.2, 8.0, 2.2), 1.0, 1.0)
+        painter.drawRoundedRect(QRectF(-2.2, -3.4, 4.4, 3.8), 1.0, 1.0)
+        painter.setBrush(QBrush(cap_color))
+        painter.drawEllipse(QRectF(-3.6, -5.8, 7.2, 3.0))
+        painter.restore()
+
+        label_text = "取消置顶" if self._hovered else "已置顶"
+        font = make_ui_font(8, QFont.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        text_rect = QRectF(rect.left() + 21.0, rect.top(), rect.width() - 25.0, rect.height())
+        painter.drawText(text_rect, Qt.AlignCenter, label_text)
+
+
+class WindowPinManager(QObject):
+    """管理所有通过 DeskPin 置顶的外部窗口及其顶部常驻置顶标志。"""
+    _instance = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = WindowPinManager()
+        return cls._instance
+
+    def __init__(self):
+        super().__init__()
+        self._tracked = {}  # hwnd -> {'badge': PinnedWindowBadge, 'title': str}
+        self._overlay_suppressed = False
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(60)
+        self._sync_timer.timeout.connect(self._sync_all)
+
+    def track(self, hwnd, title=""):
+        hwnd = int(hwnd)
+        if not hwnd or not _user32.IsWindow(hwnd):
+            return
+        entry = self._tracked.get(hwnd)
+        if entry is None:
+            badge = PinnedWindowBadge(hwnd, title)
+            badge.unpin_requested.connect(self.unpin)
+            self._tracked[hwnd] = {'badge': badge, 'title': title or ""}
+        else:
+            if title:
+                entry['title'] = title
+                entry['badge'].set_title(title)
+        if not self._sync_timer.isActive():
+            self._sync_timer.start()
+        self._sync_all()
+
+    def untrack(self, hwnd):
+        hwnd = int(hwnd)
+        entry = self._tracked.pop(hwnd, None)
+        if entry is not None:
+            badge = entry.get('badge')
+            if badge is not None:
+                try:
+                    badge.close()
+                    badge.deleteLater()
+                except Exception:
+                    pass
+        if not self._tracked and self._sync_timer.isActive():
+            self._sync_timer.stop()
+
+    def unpin(self, hwnd):
+        hwnd = int(hwnd)
+        entry = self._tracked.get(hwnd)
+        win_name = (entry.get('title') if entry else "") or f"窗口 (HWND:{hwnd})"
+        try:
+            if _user32.IsWindow(hwnd):
+                SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+                _user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_FLAGS)
+        except Exception as e:
+            logging.error("通过置顶标志取消窗口置顶失败: %s", e)
+        self.untrack(hwnd)
+        show_pin_toast(f"📌 已取消窗口置顶: {win_name}", pinned=False)
+
+    def set_overlay_suppressed(self, suppressed: bool):
+        self._overlay_suppressed = bool(suppressed)
+        if self._overlay_suppressed:
+            for entry in list(self._tracked.values()):
+                badge = entry.get('badge')
+                if badge is not None:
+                    try:
+                        badge.hide()
+                    except Exception:
+                        pass
+        else:
+            self._sync_all()
+
+    def clear_all(self):
+        if self._sync_timer.isActive():
+            self._sync_timer.stop()
+        for hwnd in list(self._tracked.keys()):
+            self.untrack(hwnd)
+
+    @staticmethod
+    def _is_hwnd_above(target_hwnd, badge_hwnd):
+        try:
+            cur = _user32.GetWindow(badge_hwnd, GW_HWNDPREV)
+            steps = 0
+            while cur and steps < 64:
+                if int(cur) == int(target_hwnd):
+                    return True
+                cur = _user32.GetWindow(cur, GW_HWNDPREV)
+                steps += 1
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _get_target_logical_rect(hwnd):
+        r = _RECT()
+        hr = _dwmapi.DwmGetWindowAttribute(hwnd, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r))
+        if hr != 0:
+            if not _user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return None
+        w = r.right - r.left
+        h = r.bottom - r.top
+        if w <= 0 or h <= 0:
+            return None
+        return _phys_rect_to_logical_qrect(r.left, r.top, w, h)
+
+    def _sync_all(self):
+        if not self._tracked:
+            if self._sync_timer.isActive():
+                self._sync_timer.stop()
+            return
+        for hwnd in list(self._tracked.keys()):
+            entry = self._tracked.get(hwnd)
+            if entry is None:
+                continue
+            badge = entry['badge']
+            try:
+                if not _user32.IsWindow(hwnd):
+                    self.untrack(hwnd)
+                    continue
+                ex_style = _user32.GetWindowLongW(hwnd, -20)
+                if not (ex_style & WS_EX_TOPMOST):
+                    self.untrack(hwnd)
+                    continue
+                if self._overlay_suppressed or not _user32.IsWindowVisible(hwnd) or _user32.IsIconic(hwnd):
+                    if badge.isVisible():
+                        badge.hide()
+                    continue
+                win_rect = self._get_target_logical_rect(hwnd)
+                if win_rect is None or win_rect.width() < 40 or win_rect.height() < 30:
+                    if badge.isVisible():
+                        badge.hide()
+                    continue
+
+                screen = QApplication.screenAt(win_rect.center()) or QApplication.primaryScreen()
+                s_geo = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
+                bw, bh = badge.width(), badge.height()
+                bx = win_rect.left() + (win_rect.width() - bw) // 2
+                bx = max(s_geo.left() + 4, min(bx, s_geo.right() - bw - 4))
+                if win_rect.top() - bh + 5 >= s_geo.top():
+                    by = win_rect.top() - bh + 5
+                else:
+                    by = max(s_geo.top() + 3, win_rect.top() + 3)
+
+                if badge.x() != bx or badge.y() != by:
+                    badge.move(bx, by)
+                if not badge.isVisible():
+                    badge.show()
+                badge_hwnd = int(badge.winId())
+                if badge_hwnd and self._is_hwnd_above(hwnd, badge_hwnd):
+                    _user32.SetWindowPos(
+                        badge_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+                    )
+            except Exception as e:
+                logging.debug("同步置顶标志异常 (HWND=%s): %s", hwnd, e)
+
+
 class WindowPinPicker(QWidget):
     """DeskPin 窗口置顶拾取器：全屏覆盖并吸附顶层窗口，左键切换置顶，右键/ESC 退出"""
     _instance = None
@@ -1299,8 +2013,10 @@ class WindowPinPicker(QWidget):
                 cls._instance.close()
             except Exception:
                 pass
+        WindowPinManager.get_instance().set_overlay_suppressed(True)
         cls._instance = WindowPinPicker()
         cls._instance.show()
+        _force_activate_window(cls._instance)
 
     def __init__(self):
         super().__init__()
@@ -1323,10 +2039,11 @@ class WindowPinPicker(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.globalPos()
-        hwnd, rect, title = self.snapper.detect_top_level_at(pos.x(), pos.y())
+        px, py = _logical_point_to_phys(pos.x(), pos.y())
+        hwnd, rect, title = self.snapper.detect_top_level_at(px, py)
         if hwnd and hwnd != int(self.winId()):
             self.hovered_hwnd = hwnd
-            self.hovered_rect = rect
+            self.hovered_rect = _phys_rect_to_logical_qrect(rect.x(), rect.y(), rect.width(), rect.height()) if rect else None
             self.hovered_title = title
             try:
                 ex_style = _user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
@@ -1343,7 +2060,8 @@ class WindowPinPicker(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             pos = event.globalPos()
-            hwnd, rect, title = self.snapper.detect_top_level_at(pos.x(), pos.y())
+            px, py = _logical_point_to_phys(pos.x(), pos.y())
+            hwnd, rect, title = self.snapper.detect_top_level_at(px, py)
             if hwnd and hwnd != int(self.winId()):
                 self.toggle_topmost(hwnd, title)
             self.close()
@@ -1366,6 +2084,7 @@ class WindowPinPicker(QWidget):
                 ex_after = _user32.GetWindowLongW(hwnd, -20)
                 still_top = bool(ex_after & WS_EX_TOPMOST)
                 if not still_top or res:
+                    WindowPinManager.get_instance().untrack(hwnd)
                     show_pin_toast(f"📌 已取消窗口置顶: {win_name}", pinned=False)
                     logging.info("已成功取消置顶窗口 %s (HWND %d, res=%s)", win_name, hwnd, res)
                 else:
@@ -1377,6 +2096,7 @@ class WindowPinPicker(QWidget):
                 ex_after = _user32.GetWindowLongW(hwnd, -20)
                 now_top = bool(ex_after & WS_EX_TOPMOST)
                 if now_top or res:
+                    WindowPinManager.get_instance().track(hwnd, win_name)
                     show_pin_toast(f"📌 已将窗口固定置顶: {win_name}", pinned=True)
                     logging.info("已成功将窗口固定置顶 %s (HWND %d, res=%s)", win_name, hwnd, res)
                 else:
@@ -1445,6 +2165,7 @@ class WindowPinPicker(QWidget):
 
     def closeEvent(self, event):
         WindowPinPicker._instance = None
+        WindowPinManager.get_instance().set_overlay_suppressed(False)
         super().closeEvent(event)
 
 
@@ -6083,14 +6804,74 @@ def point_to_segment_dist(p, p1, p2):
     proj = QPoint(int(p1.x() + t * (p2.x() - p1.x())), int(p1.y() + t * (p2.y() - p1.y())))
     return math.hypot(p.x() - proj.x(), p.y() - proj.y())
 
-def compute_text_bounds(text, font, pos=QPointF(0, 0)):
-    metrics = QFontMetricsF(font)
-    lines = text.split('\n') if text else ['']
-    max_w = max([metrics.horizontalAdvance(line) for line in lines] or [8.0])
-    max_w = max(8.0, max_w)
-    line_spacing = metrics.lineSpacing()
-    total_h = max(8.0, line_spacing * max(1, len(lines)))
-    return QRectF(pos.x(), pos.y(), max_w, total_h)
+TEXT_BOX_BORDER_INSET = 5
+TEXT_BOX_CONTENT_PAD = 4
+TEXT_BOX_DOC_MARGIN = 2
+
+
+def _extract_edit_font(edit):
+    font = edit.get('font')
+    if isinstance(font, QFont):
+        f = QFont(font)
+    else:
+        f = QFont(edit.get('fontFamily', 'Microsoft YaHei'), edit.get('fontSize', 14))
+        f.setBold(edit.get('bold', False))
+        f.setItalic(edit.get('italic', False))
+    f.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+    return f
+
+
+def _build_text_document(text, font, content_width=None):
+    """构建与 QuickTextEdit 一致的 QTextDocument，保证编辑期与提交后的折行、行距完全一致。"""
+    doc = QTextDocument()
+    doc.setDocumentMargin(TEXT_BOX_DOC_MARGIN)
+    doc.setDefaultFont(font)
+    opt = QTextOption(Qt.AlignLeft | Qt.AlignTop)
+    if content_width is not None and content_width > 0:
+        opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        doc.setDefaultTextOption(opt)
+        doc.setPlainText(text)
+        doc.setTextWidth(float(content_width))
+    else:
+        opt.setWrapMode(QTextOption.NoWrap)
+        doc.setDefaultTextOption(opt)
+        doc.setPlainText(text)
+    return doc
+
+
+def compute_text_bounds(text, font, pos=QPointF(0, 0), content_width=None):
+    doc = _build_text_document(text, font, content_width=content_width)
+    sz = doc.size()
+    w = max(8.0, float(content_width) if (content_width is not None and content_width > 0) else math.ceil(sz.width()))
+    h = max(8.0, math.ceil(sz.height()))
+    return QRectF(pos.x(), pos.y(), w + 2 * TEXT_BOX_CONTENT_PAD, h + 2 * TEXT_BOX_CONTENT_PAD)
+
+
+def get_text_annotation_rect(edit, offset=QPoint(0, 0)):
+    """统一计算 TEXT 图元的精确外框矩形（用于绘制背景、命中检测及重新激活编辑框）。"""
+    text = edit.get('text', '')
+    font = _extract_edit_font(edit)
+    raw_rect = edit.get('rect')
+    if isinstance(raw_rect, QRect) and raw_rect.isValid() and raw_rect.width() > 4:
+        r = QRectF(raw_rect.translated(-offset))
+        cw = max(16.0, r.width() - 2 * TEXT_BOX_CONTENT_PAD)
+        doc = _build_text_document(text, font, content_width=cw)
+        doc_h = math.ceil(doc.size().height())
+        if edit.get('user_width') is not None or edit.get('fixed_width'):
+            w = max(36.0, r.width())
+        else:
+            w = r.width()
+        h = max(r.height(), float(doc_h + 2 * TEXT_BOX_CONTENT_PAD))
+        return QRectF(r.left(), r.top(), w, h)
+
+    pos_pt = QPointF(edit.get('pos', QPoint(0, 0))) - QPointF(offset)
+    uw = edit.get('user_width')
+    uh = edit.get('user_height')
+    cw = max(16.0, float(uw) - 2 * TEXT_BOX_CONTENT_PAD) if uw is not None else None
+    bounds = compute_text_bounds(text, font, pos_pt, content_width=cw)
+    w = max(36.0, float(uw)) if uw is not None else bounds.width()
+    h = max(bounds.height(), float(uh)) if uh is not None else bounds.height()
+    return QRectF(bounds.left(), bounds.top(), w, h)
 
 def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
     painter.setRenderHint(QPainter.Antialiasing, True)
@@ -6283,32 +7064,26 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
             text = edit.get('text', '')
             if text:
                 painter.save()
-                font = edit.get('font')
-                if not font:
-                    font = QFont(edit.get('fontFamily', 'Microsoft YaHei'), edit.get('fontSize', 14))
-                    font.setBold(edit.get('bold', False))
-                    font.setItalic(edit.get('italic', False))
-                painter.setFont(font)
-                metrics = QFontMetricsF(font)
-
-                pos_pt = QPointF(edit.get('pos', edit.get('rect', QRect()).topLeft() if 'rect' in edit else QPoint(0, 0))) - QPointF(offset)
-                bounds = compute_text_bounds(text, font, pos_pt)
+                font = _extract_edit_font(edit)
+                box_rect = get_text_annotation_rect(edit, offset)
 
                 bg_enabled = edit.get('bgEnabled', False)
                 bg_color = edit.get('bgColor')
                 if bg_enabled and bg_color:
                     painter.setBrush(QBrush(bg_color))
                     painter.setPen(Qt.NoPen)
-                    bg_rect = bounds.adjusted(-3.0, -3.0, 3.0, 3.0)
-                    painter.drawRoundedRect(bg_rect, 4.0, 4.0)
+                    painter.drawRoundedRect(box_rect, 4.0, 4.0)
 
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(edit.get('color', QColor(255, 0, 0))))
-                lines = text.split('\n')
-                cur_y = pos_pt.y() + metrics.ascent()
-                for line in lines:
-                    painter.drawText(QPointF(pos_pt.x(), cur_y), line)
-                    cur_y += metrics.lineSpacing()
+                inner_rect = box_rect.adjusted(
+                    TEXT_BOX_CONTENT_PAD, TEXT_BOX_CONTENT_PAD,
+                    -TEXT_BOX_CONTENT_PAD, -TEXT_BOX_CONTENT_PAD
+                )
+                doc = _build_text_document(text, font, content_width=max(12.0, inner_rect.width()))
+                ctx = QAbstractTextDocumentLayout.PaintContext()
+                ctx.palette.setColor(QPalette.Text, edit.get('color', QColor(255, 0, 0)))
+                painter.setClipRect(box_rect)
+                painter.translate(inner_rect.topLeft())
+                doc.documentLayout().draw(painter, ctx)
 
                 painter.restore()
 
@@ -6495,13 +7270,7 @@ def is_annotation_hit(edit, pos):
         elif t == 'TEXT':
             text = edit.get('text', '')
             if not text: return False
-            font = edit.get('font')
-            if not font:
-                font = QFont(edit.get('fontFamily', 'Microsoft YaHei'), edit.get('fontSize', 14))
-                font.setBold(edit.get('bold', False))
-                font.setItalic(edit.get('italic', False))
-            pos_pt = QPointF(edit.get('pos', edit.get('rect', QRect()).topLeft() if 'rect' in edit else QPoint(0, 0)))
-            bounds = compute_text_bounds(text, font, pos_pt)
+            bounds = get_text_annotation_rect(edit)
             tol = 6.0
             return bounds.adjusted(-tol, -tol, tol, tol).contains(QPointF(pos))
 
@@ -7176,6 +7945,7 @@ class SegmentedButton(QPushButton):
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self.setCheckable(True)
+        self.setFocusPolicy(Qt.NoFocus)
         self.setFixedHeight(22)
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet("""
@@ -7228,6 +7998,7 @@ class ColorPaletteWidget(QWidget):
         self.buttons = []
         for hex_col in self.presets:
             btn = QPushButton()
+            btn.setFocusPolicy(Qt.NoFocus)
             btn.setFixedSize(18, 18)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _, c=hex_col: self.set_color(QColor(c), emit=True))
@@ -7235,6 +8006,7 @@ class ColorPaletteWidget(QWidget):
             self.buttons.append((btn, hex_col))
 
         self.btn_custom = QPushButton("🎨")
+        self.btn_custom.setFocusPolicy(Qt.NoFocus)
         self.btn_custom.setFixedSize(22, 20)
         self.btn_custom.setToolTip("选择自定义颜色...")
         self.btn_custom.setCursor(Qt.PointingHandCursor)
@@ -7446,6 +8218,35 @@ class SnipasteToolbar(FrostedBarWidget):
         self.btn_copy.clicked.connect(lambda: self.action_triggered.emit('COPY'))
         layout.addWidget(self.btn_copy)
 
+        self.refresh_tooltips()
+
+    def refresh_tooltips(self, settings=None):
+        """根据最新快捷键配置动态刷新底部工具栏按钮悬浮提示"""
+        s = settings if isinstance(settings, dict) else load_settings()
+
+        def _fmt(base_tip, key_name, default_val=""):
+            hk = normalize_hotkey_str(s.get(key_name, default_val))
+            return f"{base_tip} ({hk})" if hk else base_tip
+
+        self.btn_rect_ellipse.setToolTip(_fmt("矩形 / 椭圆", "hotkey_tool_rect_ellipse"))
+        self.btn_arrow.setToolTip(_fmt("箭头", "hotkey_tool_arrow"))
+        self.btn_pen.setToolTip(_fmt("画笔 (拖拽画单条直线，点按画折线)", "hotkey_tool_pen"))
+        self.btn_marker.setToolTip(_fmt("记号笔 / 荧光笔", "hotkey_tool_marker"))
+        self.btn_mosaic_blur.setToolTip(_fmt("马赛克 / 高斯模糊", "hotkey_tool_mosaic_blur"))
+        self.btn_text.setToolTip(_fmt("文本", "hotkey_tool_text"))
+        self.btn_eraser.setToolTip(_fmt("橡皮擦 (拖拽整项擦除)", "hotkey_tool_eraser"))
+        self.btn_crop.setToolTip(_fmt("裁剪选区", "hotkey_tool_crop"))
+        self.btn_ocr.setToolTip(_fmt("文字识别与多语言翻译", "hotkey_ocr", "F2"))
+        self.btn_ocr_translate.setToolTip(_fmt("一键翻译当前截图 (结果显示方式可在设置中切换)", "hotkey_tool_translate"))
+        hk_scroll = normalize_hotkey_str(s.get("hotkey_scroll", ""))
+        self.btn_scroll.setToolTip(
+            f"滚动长截图 ({hk_scroll} · 开始后按 Space 暂停/完成)" if hk_scroll else "滚动长截图 (开始后按 Space 暂停/完成)"
+        )
+        self.btn_record.setToolTip(_fmt("屏幕录制", "hotkey_record", "F4"))
+        self.btn_history.setToolTip(_fmt("截图历史", "hotkey_history"))
+        self.btn_win_pin.setToolTip(_fmt("窗口置顶 (DeskPin: 点击任意窗口将其置顶)", "hotkey_window_pin"))
+        self.btn_pin.setToolTip(_fmt("贴图到桌面", "hotkey_pin", "F3"))
+
     def _on_tool_btn_clicked(self, tool_name):
         # 严格互斥：点击一个工具时，立即将其它工具全部反选，杜绝多工具叠加
         for name, btn in self.tool_buttons.items():
@@ -7455,6 +8256,7 @@ class SnipasteToolbar(FrostedBarWidget):
 
     def _create_btn(self, icon_name, tooltip, checkable=False):
         btn = QPushButton()
+        btn.setFocusPolicy(Qt.NoFocus)
         btn.setFixedSize(32, 32)
         btn.setIcon(VectorIconFactory.get_icon(icon_name))
         btn.setIconSize(QSize(22, 22))
@@ -7881,6 +8683,7 @@ class ToolOptionsBar(FrostedBarWidget):
         l.setSpacing(5)
 
         self.combo_text_font = QComboBox()
+        self.combo_text_font.setFocusPolicy(Qt.NoFocus)
         self.combo_text_font.addItems(["Microsoft YaHei", "Segoe UI", "Arial", "SimHei", "Consolas"])
         self.combo_text_font.currentTextChanged.connect(self.options_changed.emit)
         l.addWidget(self.combo_text_font)
@@ -7935,6 +8738,37 @@ class ToolOptionsBar(FrostedBarWidget):
             'bgColor': QColor(255, 255, 255, 230)
         }
 
+    def sync_text_options_from_edit(self, edit):
+        """选中已有文本图元时，将其字体/字号/样式/颜色/背景框状态反向同步到工具选项栏。"""
+        if not edit:
+            return
+        font = _extract_edit_font(edit)
+        family = edit.get('fontFamily') or font.family()
+        size = int(edit.get('fontSize') or (font.pointSize() if font.pointSize() > 0 else 14))
+        bold = bool(edit.get('bold', font.bold()))
+        italic = bool(edit.get('italic', font.italic()))
+        color = edit.get('color', self.text_palette.current_color)
+        bg_enabled = bool(edit.get('bgEnabled', False))
+
+        widgets = [
+            self.combo_text_font, self.spin_text_size,
+            self.btn_text_bold, self.btn_text_italic, self.btn_text_bg
+        ]
+        prev_states = [w.blockSignals(True) for w in widgets]
+        try:
+            idx = self.combo_text_font.findText(family, Qt.MatchFixedString)
+            if idx >= 0:
+                self.combo_text_font.setCurrentIndex(idx)
+            self.spin_text_size.setValue(max(self.spin_text_size.minimum(), min(self.spin_text_size.maximum(), size)))
+            self.btn_text_bold.setChecked(bold)
+            self.btn_text_italic.setChecked(italic)
+            self.btn_text_bg.setChecked(bg_enabled)
+            if isinstance(color, QColor) and color.isValid():
+                self.text_palette.set_color(color, emit=False)
+        finally:
+            for w, prev in zip(widgets, prev_states):
+                w.blockSignals(prev)
+
     # 7. 橡皮擦面板
     def _init_eraser_panel(self):
         panel = QWidget()
@@ -7965,116 +8799,640 @@ class QuickTextEdit(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.editor_parent = parent
-        self.document().setDocumentMargin(2)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setViewportMargins(0, 0, 0, 0)
+        self.document().setDocumentMargin(TEXT_BOX_DOC_MARGIN)
+        self.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            if hasattr(self.editor_parent, 'commit_edit'):
+        key = event.key()
+        mods = event.modifiers()
+        if key == Qt.Key_Escape:
+            if self.editor_parent is not None:
+                if not self.toPlainText().strip() and self.editor_parent.active_edit_ref is None:
+                    self.editor_parent.cancel_edit()
+                    event.accept()
+                    return
+                if self.editor_parent.editing_text:
+                    self.editor_parent.set_editing_text(False)
+                    event.accept()
+                    return
                 self.editor_parent.commit_edit()
+                event.accept()
                 return
+        if (mods & Qt.ControlModifier) and key in (Qt.Key_Return, Qt.Key_Enter):
+            if self.editor_parent is not None:
+                self.editor_parent.commit_edit()
+                event.accept()
+                return
+        if (mods & Qt.ControlModifier) and key == Qt.Key_Y:
+            self.redo()
+            event.accept()
+            return
         super().keyPressEvent(event)
+
+    def wheelEvent(self, event):
+        if self.editor_parent is not None:
+            pv = getattr(self.editor_parent, 'parent_view', None)
+            if pv is not None:
+                pv.wheelEvent(event)
+                return
+        super().wheelEvent(event)
 
 
 class InlineTextEditor(QWidget):
+    """PowerPoint 风格内联文本框：支持边框拖动、八向控制柄自由缩放、固定宽度自动换行及双模态编辑。"""
+    BORDER_INSET = TEXT_BOX_BORDER_INSET
+    CONTENT_PAD = TEXT_BOX_CONTENT_PAD
+    TEXT_INSET = TEXT_BOX_BORDER_INSET + TEXT_BOX_CONTENT_PAD
+    DOC_MARGIN = TEXT_BOX_DOC_MARGIN
+    HANDLE_SIZE = 7
+    HANDLE_HIT_RADIUS = 7
+    MIN_FRAME_W = 56
+    MIN_FRAME_H = 28
+
+    _HANDLE_CURSORS = {
+        'tl': Qt.SizeFDiagCursor,
+        'br': Qt.SizeFDiagCursor,
+        'tr': Qt.SizeBDiagCursor,
+        'bl': Qt.SizeBDiagCursor,
+        't': Qt.SizeVerCursor,
+        'b': Qt.SizeVerCursor,
+        'l': Qt.SizeHorCursor,
+        'r': Qt.SizeHorCursor,
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_view = parent
-        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setWindowFlags(Qt.SubWindow)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
 
         self.current_color = QColor(255, 0, 0)
+        self.bg_enabled = False
+        self.bg_color = QColor(255, 255, 255, 230)
         self.active_edit_ref = None
         self.base_pos = QPoint(0, 0)
+        self.user_width = None
+        self.user_height = None
+        self.editing_text = True
 
-        # 核心文字输入框（随文本弹性动态伸展，半透明背景，精致虚线边框）
+        self._drag_mode = None
+        self._drag_start_global = QPoint()
+        self._drag_start_frame = QRect()
+        self._drag_start_font_size = 14
+        self._drag_moved = False
+        self._hover_handle = None
+
         self.text_edit = QuickTextEdit(self)
         self.text_edit.setPlaceholderText("输入文字...")
         self.text_edit.textChanged.connect(self.adjust_size_to_content)
+        self.text_edit.viewport().installEventFilter(self)
         self.hide()
+
+    def frame_rect(self):
+        """返回控件局部坐标系下可见边框矩形。"""
+        return QRect(
+            self.BORDER_INSET,
+            self.BORDER_INSET,
+            max(1, self.width() - 2 * self.BORDER_INSET),
+            max(1, self.height() - 2 * self.BORDER_INSET),
+        )
+
+    def _parent_bounds(self):
+        pv = self.parent_view
+        if pv is not None:
+            sel = getattr(pv, 'selection_rect', None)
+            if isinstance(sel, QRect) and not sel.isNull() and sel.width() >= self.MIN_FRAME_W and sel.height() >= self.MIN_FRAME_H:
+                return QRect(sel)
+            r = pv.rect()
+            if r.isValid() and r.width() > 0 and r.height() > 0:
+                return r
+        return QRect(0, 0, 1920, 1080)
+
+    def _handle_points(self):
+        fr = self.frame_rect()
+        cx = fr.x() + fr.width() // 2
+        cy = fr.y() + fr.height() // 2
+        rx = fr.x() + fr.width() - 1
+        by = fr.y() + fr.height() - 1
+        return {
+            'tl': QPoint(fr.x(), fr.y()),
+            'tr': QPoint(rx, fr.y()),
+            'bl': QPoint(fr.x(), by),
+            'br': QPoint(rx, by),
+            't': QPoint(cx, fr.y()),
+            'b': QPoint(cx, by),
+            'l': QPoint(fr.x(), cy),
+            'r': QPoint(rx, cy),
+        }
+
+    def _hit_test(self, local_pos):
+        pts = self._handle_points()
+        r_hit = self.HANDLE_HIT_RADIUS
+        for key in ('tl', 'tr', 'bl', 'br', 't', 'b', 'l', 'r'):
+            pt = pts[key]
+            if abs(local_pos.x() - pt.x()) <= r_hit and abs(local_pos.y() - pt.y()) <= r_hit:
+                return key
+
+        fr = self.frame_rect()
+        outer = fr.adjusted(-5, -5, 5, 5)
+        inner = self.text_edit.geometry()
+        if outer.contains(local_pos) and not inner.contains(local_pos):
+            return 'move'
+        if not self.editing_text and fr.contains(local_pos):
+            return 'move'
+        return None
+
+    def _apply_hover_cursor(self, hit):
+        if hit in self._HANDLE_CURSORS:
+            cur = self._HANDLE_CURSORS[hit]
+        elif hit == 'move':
+            cur = Qt.SizeAllCursor
+        elif self.editing_text:
+            cur = Qt.IBeamCursor
+        else:
+            cur = Qt.SizeAllCursor
+        self.setCursor(cur)
+        self.text_edit.viewport().setCursor(cur if hit in self._HANDLE_CURSORS else Qt.IBeamCursor)
+
+    def _begin_drag(self, mode, global_pos):
+        self._drag_mode = mode
+        self._drag_start_global = QPoint(global_pos)
+        self._drag_start_frame = QRect(self.get_text_rect())
+        ps = self.text_edit.font().pointSize()
+        self._drag_start_font_size = ps if ps > 0 else 14
+        self._drag_moved = False
+        if mode == 'move' and self.editing_text:
+            self.set_editing_text(False)
+
+    def _sync_font_size_to_options(self, point_size):
+        f = self.text_edit.font()
+        f.setPointSize(point_size)
+        self.text_edit.setFont(f)
+        self.text_edit.document().setDefaultFont(f)
+        pv = self.parent_view
+        if pv is not None and hasattr(pv, 'options_bar') and hasattr(pv.options_bar, 'spin_text_size'):
+            sb = pv.options_bar.spin_text_size
+            prev = sb.blockSignals(True)
+            try:
+                sb.setValue(max(sb.minimum(), min(sb.maximum(), int(point_size))))
+            finally:
+                sb.blockSignals(prev)
+
+    def _handle_drag_move(self, global_pos, modifiers=Qt.NoModifier):
+        delta = global_pos - self._drag_start_global
+        if delta.manhattanLength() >= 3:
+            self._drag_moved = True
+
+        mode = self._drag_mode
+        if mode == 'move':
+            self.move_frame_to(self._drag_start_frame.topLeft() + delta)
+            return
+
+        bounds = self._parent_bounds()
+        b_left, b_top = bounds.x(), bounds.y()
+        b_right = bounds.x() + bounds.width()
+        b_bottom = bounds.y() + bounds.height()
+
+        start = self._drag_start_frame
+        sx, sy, sw, sh = start.x(), start.y(), start.width(), start.height()
+        sr, sb = sx + sw, sy + sh
+
+        if 'l' in mode:
+            nx = max(b_left, min(sr - self.MIN_FRAME_W, sx + delta.x()))
+            nw = sr - nx
+        elif 'r' in mode:
+            nx = sx
+            nw = max(self.MIN_FRAME_W, min(b_right - sx, sw + delta.x()))
+        else:
+            nx, nw = sx, sw
+
+        if (modifiers & Qt.ControlModifier) and mode in ('tl', 'tr', 'bl', 'br') and sh > 0:
+            raw_nh = (sb - (sy + delta.y())) if 't' in mode else (sh + delta.y())
+            scaled_pt = max(8, min(72, int(round(self._drag_start_font_size * max(self.MIN_FRAME_H, raw_nh) / float(sh)))))
+            if scaled_pt != self.text_edit.font().pointSize():
+                self._sync_font_size_to_options(scaled_pt)
+
+        cw = max(16, nw - 2 * self.CONTENT_PAD)
+        doc = _build_text_document(self.text_edit.toPlainText(), self.text_edit.font(), content_width=cw)
+        min_h = max(self.MIN_FRAME_H, int(math.ceil(doc.size().height()) + 2 * self.CONTENT_PAD))
+
+        if 't' in mode:
+            ny = max(b_top, min(sb - min_h, sy + delta.y()))
+            nh = sb - ny
+        elif 'b' in mode:
+            ny = sy
+            nh = max(min_h, min(b_bottom - sy, sh + delta.y()))
+        else:
+            ny = sy
+            nh = max(min_h, sh if self.user_height is not None else min_h)
+
+        if 'l' in mode or 'r' in mode:
+            self.user_width = nw
+        if 't' in mode or 'b' in mode:
+            self.user_height = nh
+
+        self.base_pos = QPoint(nx, ny)
+        self.adjust_size_to_content()
+
+    def _finish_drag(self, global_pos):
+        mode = self._drag_mode
+        moved = self._drag_moved
+        self._drag_mode = None
+        self._drag_moved = False
+
+        if mode == 'move':
+            if moved:
+                self.set_editing_text(False)
+            else:
+                local_pos = self.mapFromGlobal(global_pos)
+                if self.text_edit.geometry().contains(local_pos):
+                    self.set_editing_text(True, click_global_pos=global_pos)
+                else:
+                    self.set_editing_text(False)
+        elif mode in self._HANDLE_CURSORS:
+            if self.editing_text:
+                self.text_edit.setFocus()
+            else:
+                self.setFocus()
+
+    def move_frame_to(self, top_left):
+        bounds = self._parent_bounds()
+        fr = self.frame_rect()
+        max_x = bounds.x() + max(0, bounds.width() - fr.width())
+        max_y = bounds.y() + max(0, bounds.height() - fr.height())
+        nx = max(bounds.x(), min(top_left.x(), max_x))
+        ny = max(bounds.y(), min(top_left.y(), max_y))
+        self.base_pos = QPoint(nx, ny)
+        self.move(nx - self.BORDER_INSET, ny - self.BORDER_INSET)
+
+    def set_editing_text(self, editing, click_global_pos=None):
+        self.editing_text = bool(editing)
+        if self.editing_text:
+            self.text_edit.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            self.text_edit.setFocus()
+            if click_global_pos is not None:
+                vp_pos = self.text_edit.viewport().mapFromGlobal(click_global_pos)
+                self.text_edit.setTextCursor(self.text_edit.cursorForPosition(vp_pos))
+        else:
+            cursor = self.text_edit.textCursor()
+            cursor.clearSelection()
+            self.text_edit.setTextCursor(cursor)
+            self.text_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self.setFocus()
+        self._apply_hover_cursor(self._hover_handle)
+        self.update()
 
     def update_font_from_options(self, options=None):
         if options is None and hasattr(self.parent_view, 'options_bar'):
             options = self.parent_view.options_bar.get_text_options()
         if options:
-            self.current_color = options.get('color', QColor(255, 0, 0))
-            f = QFont(options.get('fontFamily', 'Microsoft YaHei'), options.get('fontSize', 14))
-            f.setBold(options.get('bold', False))
-            f.setItalic(options.get('italic', False))
+            self.current_color = QColor(options.get('color', QColor(255, 0, 0)))
+            self.bg_enabled = bool(options.get('bgEnabled', False))
+            self.bg_color = QColor(options.get('bgColor', QColor(255, 255, 255, 230)))
+            font_size = int(options.get('fontSize', 14) or 14)
+            f = QFont(options.get('fontFamily', 'Microsoft YaHei'), font_size)
+            f.setBold(bool(options.get('bold', False)))
+            f.setItalic(bool(options.get('italic', False)))
+            f.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
             self.text_edit.setFont(f)
+            self.text_edit.document().setDefaultFont(f)
+            opt = QTextOption(Qt.AlignLeft | Qt.AlignTop)
+            opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+            self.text_edit.document().setDefaultTextOption(opt)
             self.text_edit.setStyleSheet(
-                f"background: rgba(255, 255, 255, 0.94); "
-                f"color: {self.current_color.name()}; "
-                f"border: 1.5px dashed #B6863A; "
-                f"border-radius: 4px; "
-                f"padding: 2px;"
+                f"QTextEdit {{ background: transparent; border: none; padding: 0px; margin: 0px; color: {self.current_color.name()}; }}"
             )
+            pal = self.text_edit.palette()
+            pal.setColor(QPalette.Text, self.current_color)
+            if hasattr(QPalette, 'PlaceholderText'):
+                pal.setColor(QPalette.PlaceholderText, QColor(120, 128, 138, 175))
+            self.text_edit.setPalette(pal)
         self.adjust_size_to_content()
 
     def adjust_size_to_content(self):
         text = self.text_edit.toPlainText()
-        fm = QFontMetrics(self.text_edit.font())
-        lines = text.split('\n') if text else ['']
-        max_w = max([fm.width(line) for line in lines] or [30])
-        line_h = max(14, fm.lineSpacing())
-        total_h = line_h * len(lines)
+        font = self.text_edit.font()
+        bounds = self._parent_bounds()
+        b_w = max(self.MIN_FRAME_W, bounds.width())
+        b_h = max(self.MIN_FRAME_H, bounds.height())
 
-        box_w = max(60, max_w + 16)
-        box_h = max(24, total_h + 8)
+        if self.user_width is not None:
+            frame_w = min(b_w, max(self.MIN_FRAME_W, int(self.user_width)))
+        else:
+            doc_nowrap = _build_text_document(text, font, content_width=None)
+            fm = QFontMetricsF(font)
+            placeholder = self.text_edit.placeholderText() or "输入文字..."
+            placeholder_w = fm.horizontalAdvance(placeholder) + 2 * self.DOC_MARGIN + 6
+            ideal_cw = max(placeholder_w if not text else 20.0, math.ceil(doc_nowrap.idealWidth()) + 6)
+            anchor_x = max(bounds.x(), min(self.base_pos.x(), bounds.x() + b_w - self.MIN_FRAME_W))
+            avail_right_w = max(self.MIN_FRAME_W, (bounds.x() + b_w) - anchor_x)
+            frame_w = min(avail_right_w, max(self.MIN_FRAME_W, int(math.ceil(ideal_cw + 2 * self.CONTENT_PAD))))
 
-        parent_w = self.parent_view.width() if self.parent_view else 1920
-        parent_h = self.parent_view.height() if self.parent_view else 1080
+        cw = max(16, frame_w - 2 * self.CONTENT_PAD)
+        doc_wrapped = _build_text_document(text, font, content_width=cw)
+        doc_h = math.ceil(doc_wrapped.size().height())
+        min_frame_h = max(self.MIN_FRAME_H, int(doc_h + 2 * self.CONTENT_PAD))
 
-        pos_x = max(0, min(self.base_pos.x(), parent_w - box_w - 4))
-        pos_y = max(0, min(self.base_pos.y(), parent_h - box_h - 4))
+        if self.user_height is not None:
+            frame_h = max(min_frame_h, int(self.user_height))
+        else:
+            frame_h = min_frame_h
+        if b_h >= min_frame_h:
+            frame_h = min(b_h, frame_h)
 
-        self.text_edit.resize(box_w, box_h)
-        self.setGeometry(pos_x, pos_y, box_w, box_h)
+        max_x = bounds.x() + max(0, bounds.width() - frame_w)
+        max_y = bounds.y() + max(0, bounds.height() - frame_h)
+        frame_x = max(bounds.x(), min(self.base_pos.x(), max_x))
+        frame_y = max(bounds.y(), min(self.base_pos.y(), max_y))
 
-    def start_editing(self, pos_or_rect, existing_edit=None):
+        widget_w = frame_w + 2 * self.BORDER_INSET
+        widget_h = frame_h + 2 * self.BORDER_INSET
+        self.setGeometry(frame_x - self.BORDER_INSET, frame_y - self.BORDER_INSET, widget_w, widget_h)
+        self.text_edit.setGeometry(
+            self.TEXT_INSET,
+            self.TEXT_INSET,
+            cw,
+            max(12, frame_h - 2 * self.CONTENT_PAD),
+        )
+        self.text_edit.verticalScrollBar().setValue(0)
+        self.text_edit.horizontalScrollBar().setValue(0)
+        self.update()
+
+    def start_editing(self, pos_or_rect, existing_edit=None, start_in_text_mode=True):
+        self._drag_mode = None
+        self._hover_handle = None
+        self._drag_moved = False
+
         if isinstance(pos_or_rect, QRect):
             self.base_pos = pos_or_rect.topLeft()
         elif isinstance(pos_or_rect, QPoint):
-            self.base_pos = pos_or_rect
+            self.base_pos = QPoint(pos_or_rect)
         else:
             self.base_pos = QPoint(50, 50)
 
         self.active_edit_ref = existing_edit
-        if existing_edit:
-            self.text_edit.setPlainText(existing_edit.get('text', ''))
-            if 'font' in existing_edit:
-                self.text_edit.setFont(existing_edit['font'])
-            if 'color' in existing_edit:
-                self.current_color = existing_edit['color']
-            self.update_font_from_options({
-                'fontFamily': existing_edit.get('fontFamily', existing_edit.get('font', QFont()).family()),
-                'fontSize': existing_edit.get('fontSize', existing_edit.get('font', QFont()).pointSize()),
-                'bold': existing_edit.get('bold', False),
-                'italic': existing_edit.get('italic', False),
-                'color': self.current_color,
-                'bgEnabled': existing_edit.get('bgEnabled', False),
-                'bgColor': existing_edit.get('bgColor', QColor(255, 255, 255, 230))
-            })
-        else:
-            self.text_edit.clear()
-            self.update_font_from_options()
+        prev_block = self.text_edit.blockSignals(True)
+        try:
+            if existing_edit:
+                self.user_width = existing_edit.get('user_width')
+                self.user_height = existing_edit.get('user_height')
+                self.text_edit.setPlainText(existing_edit.get('text', ''))
+                font_obj = _extract_edit_font(existing_edit)
+                if 'color' in existing_edit:
+                    self.current_color = QColor(existing_edit['color'])
+                opts = {
+                    'fontFamily': existing_edit.get('fontFamily', font_obj.family()),
+                    'fontSize': existing_edit.get('fontSize', font_obj.pointSize() if font_obj.pointSize() > 0 else 14),
+                    'bold': existing_edit.get('bold', font_obj.bold()),
+                    'italic': existing_edit.get('italic', font_obj.italic()),
+                    'color': self.current_color,
+                    'bgEnabled': existing_edit.get('bgEnabled', False),
+                    'bgColor': existing_edit.get('bgColor', QColor(255, 255, 255, 230)),
+                }
+            else:
+                if isinstance(pos_or_rect, QRect):
+                    self.user_width = max(self.MIN_FRAME_W, pos_or_rect.width())
+                    self.user_height = max(self.MIN_FRAME_H, pos_or_rect.height())
+                else:
+                    self.user_width = None
+                    self.user_height = None
+                self.text_edit.clear()
+                if hasattr(self.parent_view, 'options_bar'):
+                    opts = self.parent_view.options_bar.get_text_options()
+                elif hasattr(self.parent_view, 'toolbar_ref'):
+                    opts = {
+                        'color': getattr(self.parent_view.toolbar_ref, 'current_color', QColor(255, 0, 0)),
+                        'fontFamily': 'Microsoft YaHei',
+                        'fontSize': 14,
+                        'bold': False,
+                        'italic': False,
+                        'bgEnabled': False,
+                        'bgColor': QColor(255, 255, 255, 230),
+                    }
+                else:
+                    opts = {
+                        'color': self.current_color,
+                        'fontFamily': 'Microsoft YaHei',
+                        'fontSize': 14,
+                        'bold': False,
+                        'italic': False,
+                        'bgEnabled': False,
+                        'bgColor': QColor(255, 255, 255, 230),
+                    }
+        finally:
+            self.text_edit.blockSignals(prev_block)
 
+        self.update_font_from_options(opts)
         self.show()
         self.raise_()
-        self.text_edit.setFocus()
+        if hasattr(self.parent_view, '_raise_floating_bars'):
+            self.parent_view._raise_floating_bars()
+
+        self.set_editing_text(start_in_text_mode)
+        if start_in_text_mode and existing_edit:
+            self.text_edit.moveCursor(QTextCursor.End)
 
     def get_text_rect(self):
-        return QRect(self.x(), self.y(), self.width(), self.height())
+        """返回父视图坐标系下的可见文本框矩形（不含外围控制柄留白）。"""
+        return QRect(
+            self.x() + self.BORDER_INSET,
+            self.y() + self.BORDER_INSET,
+            max(1, self.width() - 2 * self.BORDER_INSET),
+            max(1, self.height() - 2 * self.BORDER_INSET),
+        )
 
     def commit_edit(self):
         if hasattr(self.parent_view, 'commit_text_edit'):
             self.parent_view.commit_text_edit()
 
     def cancel_edit(self):
+        self._drag_mode = None
+        self._hover_handle = None
         self.text_edit.clear()
         self.active_edit_ref = None
+        self.user_width = None
+        self.user_height = None
         self.hide()
+        if self.parent_view is not None and self.parent_view.isVisible():
+            self.parent_view.setFocus()
+            self.parent_view.update()
+
+    def eventFilter(self, obj, event):
+        if obj is self.text_edit.viewport():
+            et = event.type()
+            if et == QEvent.MouseMove:
+                if self._drag_mode is not None:
+                    self._handle_drag_move(event.globalPos(), event.modifiers())
+                    return True
+                if self.editing_text:
+                    local_pos = self.mapFromGlobal(event.globalPos())
+                    hit = self._hit_test(local_pos)
+                    if hit in self._HANDLE_CURSORS:
+                        if self._hover_handle != hit:
+                            self._hover_handle = hit
+                            self.update()
+                        self._apply_hover_cursor(hit)
+                        return True
+                    if self._hover_handle is not None:
+                        self._hover_handle = None
+                        self._apply_hover_cursor(None)
+                        self.update()
+            elif et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton and self.editing_text:
+                local_pos = self.mapFromGlobal(event.globalPos())
+                hit = self._hit_test(local_pos)
+                if hit in self._HANDLE_CURSORS:
+                    self._begin_drag(hit, event.globalPos())
+                    return True
+            elif et == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and self._drag_mode is not None:
+                self._finish_drag(event.globalPos())
+                return True
+            elif et == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton and self.editing_text:
+                local_pos = self.mapFromGlobal(event.globalPos())
+                hit = self._hit_test(local_pos)
+                if hit in ('l', 'r'):
+                    self.user_width = None
+                    self.adjust_size_to_content()
+                    return True
+                if hit in ('t', 'b'):
+                    self.user_height = None
+                    self.adjust_size_to_content()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            if event.button() == Qt.RightButton:
+                self.commit_edit()
+                event.accept()
+                return
+            super().mousePressEvent(event)
+            return
+        hit = self._hit_test(event.pos())
+        if hit is not None:
+            self._begin_drag(hit, event.globalPos())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_mode is not None:
+            self._handle_drag_move(event.globalPos(), event.modifiers())
+            event.accept()
+            return
+        hit = self._hit_test(event.pos())
+        if self._hover_handle != hit:
+            self._hover_handle = hit
+            self.update()
+        self._apply_hover_cursor(hit)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_mode is not None:
+            self._finish_drag(event.globalPos())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            hit = self._hit_test(event.pos())
+            if hit in ('l', 'r'):
+                self.user_width = None
+                self.adjust_size_to_content()
+                event.accept()
+                return
+            if hit in ('t', 'b'):
+                self.user_height = None
+                self.adjust_size_to_content()
+                event.accept()
+                return
+            if not self.editing_text and self.frame_rect().contains(event.pos()):
+                self.set_editing_text(True, click_global_pos=event.globalPos())
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hover_handle is not None:
+            self._hover_handle = None
+            self.update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self.editing_text:
+            key = event.key()
+            mods = event.modifiers()
+            if key == Qt.Key_Escape:
+                self.commit_edit()
+                event.accept()
+                return
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                self.set_editing_text(True)
+                event.accept()
+                return
+            if key in (Qt.Key_Delete, Qt.Key_Backspace):
+                self.cancel_edit()
+                event.accept()
+                return
+            if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down) and not (mods & (Qt.ControlModifier | Qt.AltModifier)):
+                step = 10 if (mods & Qt.ShiftModifier) else 1
+                dx = -step if key == Qt.Key_Left else (step if key == Qt.Key_Right else 0)
+                dy = -step if key == Qt.Key_Up else (step if key == Qt.Key_Down else 0)
+                cur = self.get_text_rect().topLeft()
+                self.move_frame_to(QPoint(cur.x() + dx, cur.y() + dy))
+                event.accept()
+                return
+            txt = event.text()
+            if txt and not (mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) and txt.isprintable():
+                self.set_editing_text(True)
+                self.text_edit.moveCursor(QTextCursor.End)
+                self.text_edit.insertPlainText(txt)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        fr = QRectF(self.frame_rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+
+        if self.bg_enabled and self.bg_color.isValid():
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(self.bg_color))
+            painter.drawRoundedRect(fr, 4.0, 4.0)
+        else:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 55))
+            painter.drawRoundedRect(fr, 4.0, 4.0)
+
+        # 双层对比边框：外层浅色衬线 + 内层 PPT 虚线(输入态)/实线(选中态)
+        line_style = Qt.DashLine if self.editing_text else Qt.SolidLine
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 215), 2.2, line_style))
+        painter.drawRect(fr)
+        painter.setPen(QPen(QColor(200, 144, 48), 1.4, line_style))
+        painter.drawRect(fr)
+
+        # 八向 PPT 缩放控制柄
+        hs = self.HANDLE_SIZE
+        half = hs / 2.0
+        pts = self._handle_points()
+        for key, pt in pts.items():
+            is_active = (key == self._drag_mode or key == self._hover_handle)
+            hr = QRectF(pt.x() - half, pt.y() - half, hs, hs)
+            painter.setBrush(QBrush(QColor(200, 144, 48) if is_active else QColor(255, 255, 255)))
+            painter.setPen(QPen(QColor(255, 255, 255) if is_active else QColor(200, 144, 48), 1.3))
+            painter.drawRect(hr)
 
 
 
@@ -8371,7 +9729,7 @@ class PinnedWindow(QWidget):
         dlg = OcrResultDialog("", None, detected_codes=codes)
         dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self._temp_ocr_dialog = dlg
-        dlg.exec_()
+        exec_dialog_nonmodal(dlg)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -8512,6 +9870,18 @@ class PinnedWindow(QWidget):
             painter.drawText(exp_rect, Qt.AlignCenter, "展开")
         else:
             painter.drawPixmap(self.rect(), self.pixmap)
+            border_enabled = (
+                bool(getattr(self.main_app_ref, "pin_border_enabled", False))
+                if self.main_app_ref is not None
+                else bool(load_settings().get("pin_border_enabled", False))
+            )
+            if border_enabled and not getattr(self, '_click_through', False):
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor(24, 24, 27, 175), 1.0))
+                painter.drawRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5))
+                if self.width() >= 8 and self.height() >= 8:
+                    painter.setPen(QPen(QColor(182, 134, 58, 225), 1.2))
+                    painter.drawRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5))
             if getattr(self, '_click_through', False):
                 painter.setPen(QPen(QColor(182, 134, 58, 215), 1.6, Qt.DashLine))
                 painter.drawRect(QRectF(self.rect()).adjusted(1, 1, -1, -1))
@@ -8826,6 +10196,14 @@ class PinnedWindow(QWidget):
         reset_action = menu.addAction("⚖️ 1:1 原始大小与重置透明度 (1)")
         collapse_label = "📌 展开贴图 (M)" if getattr(self, '_is_collapsed', False) else "📌 折叠为紧凑标签 (M)"
         collapse_action = menu.addAction(collapse_label)
+        border_action = None
+        if self.main_app_ref and hasattr(self.main_app_ref, "toggle_pin_border"):
+            border_on = bool(getattr(self.main_app_ref, "pin_border_enabled", False))
+            hk_border = load_settings().get("hotkey_pin_border", "")
+            hk_hint = f" ({hk_border})" if hk_border else ""
+            border_action = menu.addAction(
+                f"✅ 关闭贴图边框{hk_hint}" if border_on else f"🖼️ 开启贴图边框{hk_hint}"
+            )
         click_through_action = menu.addAction("👻 鼠标穿透 (Ctrl+Shift+T · Ctrl+Alt+T 恢复)")
         menu.addSeparator()
         drawer_all_action = close_all_action = None
@@ -8848,9 +10226,17 @@ class PinnedWindow(QWidget):
         elif action == qr_action:
             self.scan_codes()
         elif action == edit_action and self.main_app_ref:
+            active_ed = getattr(self, "_active_editor", None)
+            if active_ed is not None and active_ed.isVisible():
+                _force_activate_window(active_ed)
+                return
             pinned_before = set(self.main_app_ref.pinned_windows)
             editor = ImageEditorDialog(self.pixmap, self.main_app_ref)
-            editor.exec_()
+            self._active_editor = editor
+            try:
+                editor.exec_nonmodal()
+            finally:
+                self._active_editor = None
             # 仅当用户在编辑器中执行了 Pin（创建了新 PinnedWindow）时才关闭原贴图
             # 如果用户只是按 ESC 或 Close 关闭编辑器，原贴图保留不动
             if any(p not in pinned_before for p in self.main_app_ref.pinned_windows):
@@ -8866,6 +10252,8 @@ class PinnedWindow(QWidget):
             self.reset_transform()
         elif action == collapse_action:
             self.toggle_collapse()
+        elif border_action is not None and action == border_action:
+            self.main_app_ref.toggle_pin_border()
         elif action == click_through_action:
             self.set_click_through(True)
         elif drawer_all_action is not None and action == drawer_all_action:
@@ -8894,7 +10282,7 @@ class PinnedWindow(QWidget):
                 )
                 dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
                 self._temp_ocr_dialog = dlg
-                dlg.exec_()
+                exec_dialog_nonmodal(dlg)
             worker.finished.connect(_on_done)
             worker.start()
             self._temp_ocr_worker = worker
@@ -8926,6 +10314,7 @@ class PinnedWindow(QWidget):
 class EditableImageLabel(QLabel):
     def __init__(self, pixmap, toolbar_ref):
         super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)
         self.base_pixmap = pixmap
         self.setPixmap(pixmap)
         self.toolbar_ref = toolbar_ref
@@ -8938,7 +10327,15 @@ class EditableImageLabel(QLabel):
         self.inline_editor.hide()
 
         self.is_drawing = False
+        self.drag_mode = None
+        self.text_rect = None
+        self.text_start = QPoint()
+        self._text_just_committed = False
+        self._text_move_start_global = QPoint()
+        self._text_move_start_frame = QRect()
+        self._text_move_dragged = False
         self.crop_mode = False
+        self.setMouseTracking(True)
         self.crop_rect = None
         self.crop_ratio = None
         self.crop_drag_handle = None
@@ -8960,8 +10357,11 @@ class EditableImageLabel(QLabel):
 
     def undo(self):
         try:
-            if self.undo_stack:
+            if getattr(self, 'inline_editor', None) and self.inline_editor.isVisible():
                 self.commit_text_edit()
+            if self.undo_stack:
+                if self.crop_mode and hasattr(self.toolbar_ref, 'cancel_crop'):
+                    self.toolbar_ref.cancel_crop()
                 self.redo_stack.append({
                     'edits': clone_edits(self.edits),
                     'base_pixmap': QPixmap(self.base_pixmap)
@@ -8971,14 +10371,21 @@ class EditableImageLabel(QLabel):
                 self.base_pixmap = state['base_pixmap']
                 self.setPixmap(self.base_pixmap)
                 self.resize(self.base_pixmap.size())
+                if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+                    self.toolbar_ref._sync_dim_badge()
                 self.update()
+                return True
         except Exception as e:
             logging.error("撤回操作失败: %s", e, exc_info=True)
+        return False
 
     def redo(self):
         try:
-            if self.redo_stack:
+            if getattr(self, 'inline_editor', None) and self.inline_editor.isVisible():
                 self.commit_text_edit()
+            if self.redo_stack:
+                if self.crop_mode and hasattr(self.toolbar_ref, 'cancel_crop'):
+                    self.toolbar_ref.cancel_crop()
                 self.undo_stack.append({
                     'edits': clone_edits(self.edits),
                     'base_pixmap': QPixmap(self.base_pixmap)
@@ -8988,9 +10395,13 @@ class EditableImageLabel(QLabel):
                 self.base_pixmap = state['base_pixmap']
                 self.setPixmap(self.base_pixmap)
                 self.resize(self.base_pixmap.size())
+                if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+                    self.toolbar_ref._sync_dim_badge()
                 self.update()
+                return True
         except Exception as e:
             logging.error("重做操作失败: %s", e, exc_info=True)
+        return False
 
     def erase_annotation(self, pos):
         for i in range(len(self.edits)-1, -1, -1):
@@ -9006,11 +10417,14 @@ class EditableImageLabel(QLabel):
             painter = QPainter(self)
             draw_all_edits(painter, self.edits, self.base_pixmap, QPoint(0, 0))
             
-            if self.toolbar_ref.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None):
-                painter.setPen(QPen(Qt.black, 1, Qt.DashLine))
+            if self.toolbar_ref.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None) and self.text_rect.width() > 3 and self.text_rect.height() > 3:
+                painter.save()
+                painter.fillRect(self.text_rect, QColor(255, 255, 255, 35))
+                painter.setPen(QPen(QColor(255, 255, 255, 210), 2, Qt.DashLine))
                 painter.drawRect(self.text_rect)
-                painter.setPen(QPen(Qt.white, 1, Qt.DashLine))
-                painter.drawRect(self.text_rect.adjusted(1, 1, -1, -1))
+                painter.setPen(QPen(QColor(200, 144, 48), 1.4, Qt.DashLine))
+                painter.drawRect(self.text_rect)
+                painter.restore()
 
             if self.crop_mode and self.crop_rect:
                 # 暗化裁剪框外区域
@@ -9061,18 +10475,32 @@ class EditableImageLabel(QLabel):
         if not getattr(self, 'inline_editor', None) or not self.inline_editor.isVisible():
             return
         text = self.inline_editor.text_edit.toPlainText()
-        if text.strip() or self.inline_editor.active_edit_ref:
-            self.save_state() 
+        had_existing = self.inline_editor.active_edit_ref is not None
+        if text.strip():
+            if not had_existing:
+                self.save_state()
             rect = self.inline_editor.get_text_rect()
-            if text.strip():
-                self.edits.append({
-                    'type': 'TEXT',
-                    'rect': rect,
-                    'text': text,
-                    'color': self.inline_editor.current_color,
-                    'font': self.inline_editor.text_edit.font()
-                })
+            font = self.inline_editor.text_edit.font()
+            self.edits.append({
+                'type': 'TEXT',
+                'pos': rect.topLeft(),
+                'rect': rect,
+                'text': text,
+                'color': QColor(self.inline_editor.current_color),
+                'font': QFont(font),
+                'fontFamily': font.family(),
+                'fontSize': font.pointSize() if font.pointSize() > 0 else 14,
+                'bold': font.bold(),
+                'italic': font.italic(),
+                'bgEnabled': self.inline_editor.bg_enabled,
+                'bgColor': QColor(self.inline_editor.bg_color),
+                'user_width': self.inline_editor.user_width,
+                'user_height': self.inline_editor.user_height,
+            })
+        self.inline_editor.active_edit_ref = None
         self.inline_editor.hide()
+        if self.isVisible():
+            self.setFocus()
         self.update()
 
     def wheelEvent(self, event: QWheelEvent):
@@ -9094,15 +10522,19 @@ class EditableImageLabel(QLabel):
             if self.crop_mode and self.crop_rect and self.crop_rect.contains(pos):
                 self.toolbar_ref.apply_crop()
                 return
-            if self.toolbar_ref.current_tool == 'TEXT':
-                for edit in reversed(self.edits):
-                    if edit['type'] == 'TEXT' and 'rect' in edit and edit['rect'].contains(pos):
-                        self.save_state()
-                        self.edits.remove(edit)
-                        self.inline_editor.start_editing(edit['rect'], edit)
-                        self.drag_mode = None
-                        self.update()
-                        break
+            for i in range(len(self.edits) - 1, -1, -1):
+                if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                    self.commit_text_edit()
+                    if self.toolbar_ref.current_tool != 'TEXT':
+                        self.toolbar_ref.set_tool('TEXT', getattr(self.toolbar_ref, 'btn_text', None))
+                    edit = self.edits.pop(i)
+                    self.save_state()
+                    edit_rect = get_text_annotation_rect(edit).toAlignedRect()
+                    self.inline_editor.start_editing(edit_rect, existing_edit=edit, start_in_text_mode=True)
+                    self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
+                    self.drag_mode = None
+                    self.update()
+                    break
         except Exception as e:
             logging.error("EditableImageLabel mouseDoubleClickEvent 出错: %s", e, exc_info=True)
 
@@ -9130,6 +10562,13 @@ class EditableImageLabel(QLabel):
             tool = self.toolbar_ref.current_tool
             if not tool: return
 
+            was_editing = bool(getattr(self, 'inline_editor', None) and self.inline_editor.isVisible())
+            had_text = bool(
+                was_editing and (
+                    self.inline_editor.text_edit.toPlainText().strip()
+                    or self.inline_editor.active_edit_ref is not None
+                )
+            )
             self.commit_text_edit()
 
             if tool == 'ERASE':
@@ -9139,23 +10578,29 @@ class EditableImageLabel(QLabel):
             elif tool == 'OCR':
                 self.is_drawing = True; self.ocr_start = pos; self.ocr_rect = QRect(pos, pos)
             elif tool == 'TEXT':
-                clicked_edit = None
-                for edit in reversed(self.edits):
-                    if edit['type'] == 'TEXT' and 'rect' in edit and edit['rect'].contains(pos):
-                        clicked_edit = edit; break
-                
-                if clicked_edit:
+                clicked_idx = None
+                for i in range(len(self.edits) - 1, -1, -1):
+                    if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                        clicked_idx = i
+                        break
+
+                if clicked_idx is not None:
+                    clicked_edit = self.edits.pop(clicked_idx)
                     self.save_state()
+                    edit_rect = get_text_annotation_rect(clicked_edit).toAlignedRect()
+                    self.inline_editor.start_editing(edit_rect, existing_edit=clicked_edit, start_in_text_mode=False)
+                    self.is_drawing = False
                     self.drag_mode = 'text_move'
-                    self.active_text_edit = clicked_edit
-                    self.drag_offset = pos - clicked_edit['rect'].topLeft()
+                    self._text_move_start_global = event.globalPos()
+                    self._text_move_start_frame = QRect(self.inline_editor.get_text_rect())
+                    self._text_move_dragged = False
+                    self.update()
                 else:
                     self.is_drawing = True
                     self.drag_mode = 'text_draw'
                     self.text_start = pos
                     self.text_rect = QRect(pos, pos)
-                    # 单击即可直接在点击位置激活输入框
-                    self.inline_editor.start_editing(pos)
+                    self._text_just_committed = (was_editing and had_text)
                     
             elif tool == 'BLUR':
                 self.save_state()
@@ -9240,7 +10685,11 @@ class EditableImageLabel(QLabel):
             if tool == 'ERASE':
                 self.setCursor(create_eraser_cursor())
             elif tool == 'TEXT':
-                self.setCursor(Qt.IBeamCursor)
+                hit_text = any(
+                    e.get('type') == 'TEXT' and is_annotation_hit(e, pos)
+                    for e in self.edits
+                )
+                self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
             elif tool == 'BLUR':
                 r = getattr(self.toolbar_ref, 'current_thickness', 3) * 4
                 self.setCursor(create_brush_cursor(r))
@@ -9252,16 +10701,18 @@ class EditableImageLabel(QLabel):
                 self.setCursor(Qt.ArrowCursor)
 
             if self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_move':
-                new_top_left = pos - self.drag_offset
-                self.active_text_edit['rect'].moveTo(new_top_left)
-                self.update()
+                delta = event.globalPos() - self._text_move_start_global
+                if delta.manhattanLength() >= 3:
+                    self._text_move_dragged = True
+                self.inline_editor.move_frame_to(self._text_move_start_frame.topLeft() + delta)
 
             elif self.is_drawing:
                 if self.toolbar_ref.current_tool == 'OCR':
                     rect = QRect(self.ocr_start, pos).normalized()
                     self.ocr_rect = rect.intersected(self.base_pixmap.rect()); self.update()
                 elif self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
-                    self.text_rect = QRect(self.text_start, pos).normalized(); self.update()
+                    self.text_rect = QRect(self.text_start, pos).normalized().intersected(self.rect())
+                    self.update()
                 elif self.edits and self.edits[-1].get('temp'):
                     if self.edits[-1]['type'] in ['BLUR_STROKE', 'PEN', 'HIGHLIGHTER']:
                         self.edits[-1]['points'].append(pos)
@@ -9287,6 +10738,10 @@ class EditableImageLabel(QLabel):
 
             if self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_move':
                 self.drag_mode = None
+                if self._text_move_dragged:
+                    self.inline_editor.set_editing_text(False)
+                else:
+                    self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
                 return
 
             if self.is_drawing:
@@ -9297,8 +10752,14 @@ class EditableImageLabel(QLabel):
                     self.ocr_rect = None; self.update()
                     
                 elif self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
-                    if hasattr(self, 'text_rect') and self.text_rect.width() > 20 and self.text_rect.height() > 20:
-                        self.inline_editor.start_editing(self.text_rect)
+                    rect = self.text_rect
+                    self.text_rect = None
+                    if rect is not None and rect.width() >= 18 and rect.height() >= 14:
+                        self.inline_editor.start_editing(rect)
+                    elif not getattr(self, '_text_just_committed', False):
+                        self.inline_editor.start_editing(self.text_start)
+                    self._text_just_committed = False
+                    self.update()
                     
                 if self.edits and self.edits[-1].get('temp'): self.edits[-1]['temp'] = False
                 self.is_drawing = False; self.drag_mode = None
@@ -9332,28 +10793,31 @@ class EditableImageLabel(QLabel):
         """应用裁剪"""
         if not self.crop_rect or self.crop_rect.width() < CROP_MIN_SIZE or self.crop_rect.height() < CROP_MIN_SIZE:
             return
-        self.save_state()
         valid_rect = self.crop_rect.intersected(self.base_pixmap.rect())
         if valid_rect.isEmpty():
             return
+        self.save_state()
         self.base_pixmap = self.base_pixmap.copy(valid_rect)
         offset = valid_rect.topLeft()
         for edit in self.edits:
             if 'rect' in edit and isinstance(edit['rect'], QRect):
                 edit['rect'].translate(-offset)
+            if 'pos' in edit and isinstance(edit['pos'], QPoint):
+                edit['pos'] -= offset
             if 'start' in edit and isinstance(edit['start'], QPoint):
                 edit['start'] -= offset
             if 'end' in edit and isinstance(edit['end'], QPoint):
                 edit['end'] -= offset
+            if 'p1' in edit and isinstance(edit['p1'], QPoint):
+                edit['p1'] -= offset
+            if 'p2' in edit and isinstance(edit['p2'], QPoint):
+                edit['p2'] -= offset
             if 'points' in edit and isinstance(edit['points'], list):
                 edit['points'] = [p - offset for p in edit['points']]
         self.setPixmap(self.base_pixmap)
         self.resize(self.base_pixmap.size())
-        try:
-            if self.parent() and hasattr(self.parent(), 'parent') and self.parent().parent():
-                self.parent().parent().adjustSize()
-        except Exception:
-            pass
+        if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+            self.toolbar_ref._sync_dim_badge()
         self.exit_crop_mode()
 
     def set_crop_ratio(self, ratio):
@@ -9502,6 +10966,7 @@ class CropToolbar(FrostedBarWidget):
         for name, ratio in CROP_RATIO_PRESETS:
             btn = QPushButton(name)
             btn.setCheckable(True)
+            btn.setFocusPolicy(Qt.NoFocus)
             btn.setFixedHeight(26)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
@@ -9525,6 +10990,7 @@ class CropToolbar(FrostedBarWidget):
         layout.addWidget(sep)
 
         apply_btn = QPushButton("✓ 确定", self)
+        apply_btn.setFocusPolicy(Qt.NoFocus)
         apply_btn.setFixedHeight(28)
         apply_btn.setCursor(Qt.PointingHandCursor)
         apply_btn.setStyleSheet(
@@ -9536,6 +11002,7 @@ class CropToolbar(FrostedBarWidget):
         layout.addWidget(apply_btn)
 
         cancel_btn = QPushButton("✕ 取消", self)
+        cancel_btn.setFocusPolicy(Qt.NoFocus)
         cancel_btn.setFixedHeight(28)
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.setStyleSheet(
@@ -9559,12 +11026,40 @@ class CropToolbar(FrostedBarWidget):
         for name, (btn, r) in self.ratio_buttons.items():
             btn.setChecked(r == ratio)
 
+    def keyPressEvent(self, event):
+        p = self.parent()
+        if p is not None and hasattr(p, 'keyPressEvent'):
+            p.keyPressEvent(event)
+            return
+        super().keyPressEvent(event)
+
 class ImageEditorDialog(QDialog):
+    _active_editors = []
+
+    @classmethod
+    def get_open_editors(cls):
+        alive = []
+        cleaned = []
+        for ed in list(cls._active_editors):
+            try:
+                _ = ed.isVisible()
+                cleaned.append(ed)
+                if ed.isVisible() or getattr(ed, "_temp_hidden_for_capture", False):
+                    alive.append(ed)
+            except RuntimeError:
+                pass
+        cls._active_editors[:] = cleaned
+        return alive
+
     def __init__(self, image_data, main_app_ref=None):
         super().__init__()
         self.setWindowTitle("图片编辑与预览")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.main_app_ref = main_app_ref
+        self._temp_hidden_for_capture = False
+        if self not in ImageEditorDialog._active_editors:
+            ImageEditorDialog._active_editors.append(self)
         
         if isinstance(image_data, QPixmap):
             self.base_pixmap = image_data
@@ -9706,6 +11201,94 @@ class ImageEditorDialog(QDialog):
         self.crop_toolbar.ratio_changed.connect(self.img_label.set_crop_ratio)
         self.crop_toolbar.hide()
 
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        sc_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        sc_undo.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_undo.activated.connect(self._on_shortcut_undo)
+
+        sc_redo = QShortcut(QKeySequence("Ctrl+Y"), self)
+        sc_redo.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_redo.activated.connect(self._on_shortcut_redo)
+
+        sc_redo_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        sc_redo_alt.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_redo_alt.activated.connect(self._on_shortcut_redo)
+
+        sc_copy = QShortcut(QKeySequence("Ctrl+C"), self)
+        sc_copy.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_copy.activated.connect(self._on_shortcut_copy)
+
+        sc_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        sc_save.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_save.activated.connect(self.save_image)
+
+        self._shortcuts = [sc_undo, sc_redo, sc_redo_alt, sc_copy, sc_save]
+
+    def _is_inline_text_editing(self):
+        inline = getattr(self.img_label, 'inline_editor', None)
+        if inline is None or not inline.isVisible():
+            return False
+        fw = QApplication.focusWidget()
+        return bool(
+            inline.text_edit.hasFocus()
+            or fw is inline.text_edit
+            or (fw is not None and fw.parent() is inline.text_edit)
+        )
+
+    def _on_shortcut_undo(self):
+        if self._is_inline_text_editing():
+            self.img_label.inline_editor.text_edit.undo()
+            return
+        self.undo_edit()
+
+    def _on_shortcut_redo(self):
+        if self._is_inline_text_editing():
+            self.img_label.inline_editor.text_edit.redo()
+            return
+        self.redo_edit()
+
+    def _on_shortcut_copy(self):
+        if self._is_inline_text_editing():
+            te = self.img_label.inline_editor.text_edit
+            if te.textCursor().hasSelection():
+                te.copy()
+                return
+        self.copy_to_clipboard()
+
+    def _sync_dim_badge(self):
+        if hasattr(self, "dim_badge") and getattr(self.img_label, "base_pixmap", None) is not None:
+            pm = self.img_label.base_pixmap
+            self.dim_badge.setText(f"{pm.width()} × {pm.height()} px")
+
+    def undo_edit(self):
+        self.img_label.undo()
+        self._sync_dim_badge()
+
+    def redo_edit(self):
+        self.img_label.redo()
+        self._sync_dim_badge()
+
+    def exec_nonmodal(self):
+        return exec_dialog_nonmodal(self)
+
+    def _unregister_editor(self):
+        try:
+            ImageEditorDialog._active_editors.remove(self)
+        except ValueError:
+            pass
+
+    def done(self, result):
+        self._temp_hidden_for_capture = False
+        self._unregister_editor()
+        super().done(result)
+
+    def closeEvent(self, event):
+        self._temp_hidden_for_capture = False
+        self._unregister_editor()
+        super().closeEvent(event)
+
     @staticmethod
     def _make_editor_icon(name):
         icon = QIcon()
@@ -9764,6 +11347,9 @@ class ImageEditorDialog(QDialog):
         for btn, icon_name, tip, slot in draw_Specs:
             btn.setObjectName("editorToolBtn")
             btn.setCheckable(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
             btn.setFixedSize(28, 28)
             btn.setToolTip(tip)
             btn.setCursor(Qt.PointingHandCursor)
@@ -9778,6 +11364,9 @@ class ImageEditorDialog(QDialog):
             layout.addWidget(btn)
 
         self.btn_color.setObjectName("editorColorBtn")
+        self.btn_color.setFocusPolicy(Qt.NoFocus)
+        self.btn_color.setAutoDefault(False)
+        self.btn_color.setDefault(False)
         self.btn_color.setFixedSize(28, 28)
         self.btn_color.setToolTip("选择画笔颜色")
         self.btn_color.setCursor(Qt.PointingHandCursor)
@@ -9795,6 +11384,9 @@ class ImageEditorDialog(QDialog):
         for btn, icon_name, checkable, tip, slot in util_Specs:
             btn.setObjectName("editorToolBtn")
             btn.setCheckable(checkable)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
             btn.setFixedHeight(28)
             btn.setToolTip(tip)
             btn.setCursor(Qt.PointingHandCursor)
@@ -9818,6 +11410,9 @@ class ImageEditorDialog(QDialog):
             (self.btn_close, None, "codexGhostBtn", "关闭窗口 (Esc)", self.close),
         ]:
             btn.setObjectName(obj_name)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
             btn.setFixedHeight(28)
             btn.setToolTip(tip)
             btn.setCursor(Qt.PointingHandCursor)
@@ -9834,12 +11429,13 @@ class ImageEditorDialog(QDialog):
 
     def open_history(self):
         dlg = HistoryDialog(self, self.main_app_ref)
-        dlg.exec_()
+        dlg.exec_nonmodal()
 
     def open_settings(self):
         hotkey_mgr = getattr(self.main_app_ref, 'hotkey_listener', None)
         dlg = SettingsDialog(self, hotkey_mgr)
-        dlg.exec_()
+        if exec_dialog_nonmodal(dlg) == QDialog.Accepted and hotkey_mgr:
+            hotkey_mgr.reload_hotkeys()
 
     def toggle_arrow(self):
         self.arrow_enabled = not self.arrow_enabled
@@ -9890,7 +11486,7 @@ class ImageEditorDialog(QDialog):
                 text, self, detected_codes=codes, ocr_doc=doc,
                 source_image=src_img, ocr_warning=warn
             )
-            dlg.exec_()
+            exec_dialog_nonmodal(dlg)
 
     def set_tool(self, tool_name, active_btn=None):
         if getattr(self.img_label, 'inline_editor', None) and self.img_label.inline_editor.isVisible():
@@ -9931,12 +11527,39 @@ class ImageEditorDialog(QDialog):
             self.crop_toolbar.hide()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        mods = event.modifiers()
+        key = event.key()
+        if key == Qt.Key_Escape:
+            if getattr(self.img_label, 'inline_editor', None) and self.img_label.inline_editor.isVisible():
+                self.img_label.commit_text_edit()
+                return
             if self.current_tool:
                 self.set_tool(None)
                 return
             elif self.img_label.crop_mode:
                 self.cancel_crop()
+                return
+        elif self.img_label.crop_mode and key in (Qt.Key_Return, Qt.Key_Enter):
+            self.apply_crop()
+            return
+        elif key == Qt.Key_F2 and not (mods & (Qt.ControlModifier | Qt.AltModifier)):
+            self.set_tool('OCR', self.btn_ocr)
+            return
+        elif mods & Qt.ControlModifier:
+            if key == Qt.Key_Z:
+                if mods & Qt.ShiftModifier:
+                    self._on_shortcut_redo()
+                else:
+                    self._on_shortcut_undo()
+                return
+            elif key == Qt.Key_Y:
+                self._on_shortcut_redo()
+                return
+            elif key == Qt.Key_C:
+                self._on_shortcut_copy()
+                return
+            elif key == Qt.Key_S:
+                self.save_image()
                 return
         super().keyPressEvent(event)
 
@@ -10390,9 +12013,13 @@ class _HistoryImagePreviewDialog(QDialog):
         self.img_label.installEventFilter(self)
         root.addWidget(self.scroll, 1)
 
-        footer = QLabel("滚轮缩放 · 双击画面切换 适应 / 1:1 · 按住左键拖拽平移 · Esc 关闭")
+        footer = QLabel("滚轮缩放 · 双击画面切换 适应 / 1:1 · 按住左键拖拽平移 · Ctrl+C 复制 · Esc 关闭")
         footer.setObjectName("pvFooter")
         root.addWidget(footer)
+
+        self._sc_copy = QShortcut(QKeySequence("Ctrl+C"), self)
+        self._sc_copy.setContext(Qt.WidgetWithChildrenShortcut)
+        self._sc_copy.activated.connect(self._on_copy)
 
         if self._pixmap.isNull():
             self.img_label.setText("图片文件不存在或无法读取")
@@ -10438,6 +12065,10 @@ class _HistoryImagePreviewDialog(QDialog):
             self.close()
             event.accept()
             return
+        if (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_C:
+            self._on_copy()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
@@ -10476,6 +12107,8 @@ class _HistoryImagePreviewDialog(QDialog):
     def _on_copy(self):
         if self._parent_dialog:
             self._parent_dialog._copy_item(self._item)
+        elif not self._pixmap.isNull():
+            QApplication.clipboard().setPixmap(self._pixmap)
 
     def _on_copy_file(self):
         if self._parent_dialog:
@@ -11009,7 +12642,7 @@ class HistoryDialog(QDialog):
             QToolTip.showText(QCursor.pos(), "图片文件不存在或已被移除", None, QRect(), 2000)
             return
         dlg = _HistoryImagePreviewDialog(item, parent_dialog=self)
-        dlg.exec_()
+        exec_dialog_nonmodal(dlg)
 
     def _finish_drag_to_pin(self, pix, drop_pos):
         main_ref = self._resolve_main_app_ref()
@@ -11063,7 +12696,7 @@ class HistoryDialog(QDialog):
                 self._hide_hover_preview()
                 self.close()
                 editor = ImageEditorDialog(pix, self._resolve_main_app_ref())
-                editor.exec_()
+                editor.exec_nonmodal()
 
     def _pin_item(self, item):
         fpath = item.get('filepath', '')
@@ -11106,6 +12739,7 @@ class HistoryDialog(QDialog):
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
         self._really_closed_emitted = False
+        _register_nonmodal_dialog(self)
         loop = QEventLoop(self)
         self.really_closed.connect(loop.quit)
         app = QApplication.instance()
@@ -11115,6 +12749,7 @@ class HistoryDialog(QDialog):
         _force_activate_window(self)
         if not self._really_closed_emitted:
             loop.exec_()
+        _unregister_nonmodal_dialog(self)
         return 0
 
     def done(self, r):
@@ -11130,24 +12765,29 @@ class HistoryDialog(QDialog):
 class _HotkeyInnerEdit(QLineEdit):
     keyRecorded = pyqtSignal(str)
     recordingCancelled = pyqtSignal()
+    recordingStateChanged = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
+        self.setAttribute(Qt.WA_InputMethodEnabled, False)
         self._recording = False
         self._original_val = ""
         self.setCursor(Qt.PointingHandCursor)
 
     def mousePressEvent(self, event):
+        super().mousePressEvent(event)
         if event.button() == Qt.LeftButton:
             self.start_recording()
-        super().mousePressEvent(event)
 
     def start_recording(self):
+        if self._recording:
+            return
         self._recording = True
         self._original_val = self.text()
         self.setText("按下快捷键...")
         self.setStyleSheet("border: 1.5px solid #0D0D0D; background: #F4F4F5; color: #0D0D0D; font-weight: 600; border-radius: 7px;")
+        self.recordingStateChanged.emit(True)
 
     def stop_recording(self, restore=True):
         if self._recording:
@@ -11156,6 +12796,7 @@ class _HotkeyInnerEdit(QLineEdit):
             if restore:
                 self.setText(self._original_val)
                 self.recordingCancelled.emit()
+            self.recordingStateChanged.emit(False)
 
     def focusOutEvent(self, event):
         if self._recording:
@@ -11180,17 +12821,18 @@ class _HotkeyInnerEdit(QLineEdit):
             self.setStyleSheet("")
             self.setText("")
             self.keyRecorded.emit("")
+            self.recordingStateChanged.emit(False)
             return
 
         # Modifier key only -> show feedback
         mod_names = []
-        if modifiers & Qt.ControlModifier:
+        if (modifiers & Qt.ControlModifier) or key == Qt.Key_Control:
             mod_names.append("Ctrl")
-        if modifiers & Qt.AltModifier:
+        if (modifiers & Qt.AltModifier) or key == Qt.Key_Alt:
             mod_names.append("Alt")
-        if modifiers & Qt.ShiftModifier:
+        if (modifiers & Qt.ShiftModifier) or key == Qt.Key_Shift:
             mod_names.append("Shift")
-        if modifiers & Qt.MetaModifier:
+        if (modifiers & Qt.MetaModifier) or key == Qt.Key_Meta:
             mod_names.append("Win")
 
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
@@ -11198,63 +12840,18 @@ class _HotkeyInnerEdit(QLineEdit):
                 self.setText(" + ".join(mod_names) + " + ...")
             return
 
-        # Regular or function key
-        key_name = ""
-        if Qt.Key_F1 <= key <= Qt.Key_F24:
-            f_num = key - Qt.Key_F1 + 1
-            key_name = f"F{f_num}"
-        elif Qt.Key_A <= key <= Qt.Key_Z:
-            key_name = chr(key).upper()
-        elif Qt.Key_0 <= key <= Qt.Key_9:
-            key_name = chr(key)
-        else:
-            KEY_NAME_MAP = {
-                Qt.Key_Space: "Space",
-                Qt.Key_Tab: "Tab",
-                Qt.Key_Return: "Enter",
-                Qt.Key_Enter: "Enter",
-                Qt.Key_Print: "PrintScreen",
-                Qt.Key_Insert: "Insert",
-                Qt.Key_Home: "Home",
-                Qt.Key_End: "End",
-                Qt.Key_PageUp: "PageUp",
-                Qt.Key_PageDown: "PageDown",
-                Qt.Key_Left: "Left",
-                Qt.Key_Right: "Right",
-                Qt.Key_Up: "Up",
-                Qt.Key_Down: "Down",
-                Qt.Key_Minus: "-",
-                Qt.Key_Equal: "=",
-                Qt.Key_BracketLeft: "[",
-                Qt.Key_BracketRight: "]",
-                Qt.Key_Backslash: "\\",
-                Qt.Key_Semicolon: ";",
-                Qt.Key_Apostrophe: "'",
-                Qt.Key_Comma: ",",
-                Qt.Key_Period: ".",
-                Qt.Key_Slash: "/",
-                Qt.Key_QuoteLeft: "`",
-            }
-            key_name = KEY_NAME_MAP.get(key, "")
-
-        if not key_name:
-            txt = event.text().strip().upper()
-            if txt and len(txt) == 1:
-                key_name = txt
-
-        if key_name:
-            parts = mod_names[:]
-            if key_name not in parts:
-                parts.append(key_name)
-            final_hotkey = "+".join(parts)
+        final_hotkey = key_event_to_hotkey_str(event)
+        if final_hotkey:
             self._recording = False
             self.setStyleSheet("")
             self.setText(final_hotkey)
             self.keyRecorded.emit(final_hotkey)
+            self.recordingStateChanged.emit(False)
 
 
 class HotkeyRecorderWidget(QWidget):
     hotkeyChanged = pyqtSignal(str)
+    recordingStateChanged = pyqtSignal(bool)
 
     def __init__(self, placeholder="点击录制", parent=None):
         super().__init__(parent)
@@ -11270,6 +12867,7 @@ class HotkeyRecorderWidget(QWidget):
         self.edit.setPlaceholderText(placeholder)
         self.edit.keyRecorded.connect(self._on_recorded)
         self.edit.recordingCancelled.connect(self._update_clear_btn)
+        self.edit.recordingStateChanged.connect(self.recordingStateChanged)
         layout.addWidget(self.edit, 1)
 
         self.btn_clear = QPushButton("×")
@@ -11316,6 +12914,8 @@ class HotkeyRecorderWidget(QWidget):
         self._update_clear_btn()
 
     def clear(self):
+        if self.edit._recording:
+            self.edit.stop_recording(restore=False)
         self.edit.setText("")
         self._update_clear_btn()
         self.hotkeyChanged.emit("")
@@ -12050,8 +13650,8 @@ class SettingsDialog(QDialog):
 
         # 导航菜单项
         self._nav_specs = [
-            ("shortcuts", "快捷键", "全局快捷键", "点击右侧按键槽后直接按下组合键完成录制，按 Delete 或 × 清除", True),
-            ("general", "通用与保存", "通用与保存", "管理默认存储路径、导出图像编码格式与工作区交互偏好", False),
+            ("shortcuts", "快捷键", "快捷键", "点击右侧按键槽后直接按下按键或组合键完成录制，按 Delete 或 × 清除", True),
+            ("general", "通用与保存", "通用与保存", "管理开机启动、默认存储路径、导出格式与工作区交互偏好", False),
             ("ai", "AI 与翻译", "AI 与翻译", "配置智谱 GLM-OCR 多模态识别与火山方舟豆包大模型翻译", False),
             ("update", "软件更新", "软件更新", "查看版本信息、自动检测策略与 GitHub 官方发行页", False),
         ]
@@ -12168,6 +13768,9 @@ class SettingsDialog(QDialog):
         self.input_hk_restore_click_through = HotkeyRecorderWidget("默认 Ctrl+Alt+T")
         card_hk_tools.add_row("解除贴图鼠标穿透", "一键恢复所有开启鼠标穿透的桌面贴图，防止无法点击关闭", self.input_hk_restore_click_through)
 
+        self.input_hk_pin_border = HotkeyRecorderWidget("点击录制")
+        card_hk_tools.add_row("切换贴图边框", "一键开启或关闭全部桌面贴图的轮廓边框", self.input_hk_pin_border)
+
         self.input_hk_win_pin = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("窗口置顶 (DeskPin)", "将当前鼠标所在应用窗口固定在最前端", self.input_hk_win_pin)
 
@@ -12180,6 +13783,22 @@ class SettingsDialog(QDialog):
         self.input_hk_settings = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("打开系统设置", "从后台随时快速唤出设置面板", self.input_hk_settings)
         p0_lay.addWidget(card_hk_tools)
+
+        lbl_sec_toolbar = QLabel("截图底部工具栏工具（仅截图编辑时生效，默认不绑定）")
+        lbl_sec_toolbar.setObjectName("codexSectionLabel")
+        p0_lay.addWidget(lbl_sec_toolbar)
+
+        card_hk_toolbar = CodexCard()
+        self.toolbar_hk_inputs = {}
+        for cfg_key, _action_id, _kind, label, desc in TOOLBAR_TOOL_HOTKEY_SPECS:
+            recorder = HotkeyRecorderWidget("点击录制")
+            card_hk_toolbar.add_row(label, desc, recorder)
+            self.toolbar_hk_inputs[cfg_key] = recorder
+        p0_lay.addWidget(card_hk_toolbar)
+
+        for _hk_widget in self._all_hotkey_widgets():
+            _hk_widget.recordingStateChanged.connect(self._on_hotkey_recording_state_changed)
+
         p0_lay.addStretch(1)
         self.pages.addWidget(p0_scroll)
 
@@ -12238,16 +13857,22 @@ class SettingsDialog(QDialog):
         card_save.add_row("有损压缩画质", "应用于 JPEG / WebP 格式输出质量（70% - 100%）", qual_wrap)
         p1_lay.addWidget(card_save)
 
-        lbl_sec_ux = QLabel("工作区交互")
+        lbl_sec_ux = QLabel("启动与工作区交互")
         lbl_sec_ux.setObjectName("codexSectionLabel")
         p1_lay.addWidget(lbl_sec_ux)
 
         card_ux = CodexCard()
+        self.cb_auto_start = CodexSwitch()
+        card_ux.add_row("开机自启动", "随 Windows 系统登录自动在后台静默启动（仅写入当前用户启动项）", self.cb_auto_start)
+
         self.cb_show_mode_hints = CodexSwitch()
         card_ux.add_row("快捷操作指引条", "识图或录屏模式显示顶部提示条（支持智能避让与拖拽隐藏）", self.cb_show_mode_hints)
 
         self.cb_drawer_hover = CodexSwitch()
         card_ux.add_row("开启贴图储藏柜", "在屏幕边缘启用磁吸贴图抽屉，可随时按快捷键彻底开关", self.cb_drawer_hover)
+
+        self.cb_pin_border = CodexSwitch()
+        card_ux.add_row("显示贴图边框", "为所有桌面贴图绘制清晰轮廓边框，便于与背景窗口区分", self.cb_pin_border)
         p1_lay.addWidget(card_ux)
         p1_lay.addStretch(1)
         self.pages.addWidget(p1_scroll)
@@ -12449,6 +14074,42 @@ class SettingsDialog(QDialog):
             for idx, (btn, icon_key) in enumerate(self._nav_buttons):
                 btn.setIcon(_create_codex_icon(icon_key, "#0D0D0D" if idx == index else "#52525B", 16))
 
+    def _all_hotkey_widgets(self):
+        widgets = [
+            self.input_hk_snip,
+            self.input_hk_ocr,
+            self.input_hk_pin,
+            self.input_hk_rec,
+            self.input_hk_drawer,
+            self.input_hk_toggle_pins,
+            self.input_hk_paste_pin,
+            self.input_hk_restore_click_through,
+            self.input_hk_pin_border,
+            self.input_hk_win_pin,
+            self.input_hk_scroll,
+            self.input_hk_history,
+            self.input_hk_settings,
+        ]
+        widgets.extend(self.toolbar_hk_inputs.values())
+        return widgets
+
+    def _on_hotkey_recording_state_changed(self, _recording):
+        if not self.hotkey_mgr:
+            return
+        any_recording = any(w.edit._recording for w in self._all_hotkey_widgets())
+        if any_recording:
+            self.hotkey_mgr.suspend_hotkeys()
+        else:
+            self.hotkey_mgr.resume_hotkeys()
+
+    def done(self, result):
+        for w in self._all_hotkey_widgets():
+            if w.edit._recording:
+                w.edit.stop_recording(restore=True)
+        if self.hotkey_mgr:
+            self.hotkey_mgr.resume_hotkeys()
+        super().done(result)
+
     def _load_current_values(self):
         s = load_settings()
         self.input_hk_snip.setText(s.get("hotkey_snip", "F1"))
@@ -12463,12 +14124,17 @@ class SettingsDialog(QDialog):
         self.input_hk_toggle_pins.setText(s.get("hotkey_toggle_pins", "Ctrl+Alt+H"))
         self.input_hk_paste_pin.setText(s.get("hotkey_paste_pin", "Ctrl+Alt+V"))
         self.input_hk_restore_click_through.setText(s.get("hotkey_restore_click_through", "Ctrl+Alt+T"))
+        self.input_hk_pin_border.setText(s.get("hotkey_pin_border", ""))
+        for cfg_key, recorder in self.toolbar_hk_inputs.items():
+            recorder.setText(s.get(cfg_key, ""))
 
         self.input_save_dir.setText(s.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Pictures")))
         self.input_save_dir.setCursorPosition(0)
         self.cb_auto_save.setChecked(bool(s.get("auto_save_enabled", False)))
+        self.cb_auto_start.setChecked(is_autostart_enabled() if sys.platform == "win32" else bool(s.get("auto_start", False)))
         self.cb_show_mode_hints.setChecked(bool(s.get("show_mode_hints", True)))
         self.cb_drawer_hover.setChecked(bool(s.get("drawer_hover_enabled", True)))
+        self.cb_pin_border.setChecked(bool(s.get("pin_border_enabled", False)))
         self.cb_auto_update.setChecked(bool(s.get("auto_check_update", True)))
 
         fmt = s.get("save_format", "png").lower()
@@ -12507,6 +14173,9 @@ class SettingsDialog(QDialog):
         self.input_hk_toggle_pins.setText("Ctrl+Alt+H")
         self.input_hk_paste_pin.setText("Ctrl+Alt+V")
         self.input_hk_restore_click_through.setText("Ctrl+Alt+T")
+        self.input_hk_pin_border.setText("")
+        for recorder in self.toolbar_hk_inputs.values():
+            recorder.setText("")
 
     def _browse_save_dir(self):
         chosen = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.input_save_dir.text())
@@ -12527,23 +14196,77 @@ class SettingsDialog(QDialog):
         fmt_idx = self.combo_format.currentIndex()
         fmt_str = "png" if fmt_idx == 0 else ("jpg" if fmt_idx == 1 else "webp")
 
+        global_entries = [
+            ("hotkey_snip", "屏幕截图", normalize_hotkey_str(self.input_hk_snip.text()) or "F1"),
+            ("hotkey_ocr", "识图与翻译", normalize_hotkey_str(self.input_hk_ocr.text()) or "F2"),
+            ("hotkey_pin", "贴图置顶", normalize_hotkey_str(self.input_hk_pin.text()) or "F3"),
+            ("hotkey_record", "屏幕录制", normalize_hotkey_str(self.input_hk_rec.text()) or "F4"),
+            ("hotkey_window_pin", "窗口置顶 (DeskPin)", normalize_hotkey_str(self.input_hk_win_pin.text())),
+            ("hotkey_scroll", "滚动长截图", normalize_hotkey_str(self.input_hk_scroll.text())),
+            ("hotkey_history", "截图历史记录", normalize_hotkey_str(self.input_hk_history.text())),
+            ("hotkey_settings", "打开系统设置", normalize_hotkey_str(self.input_hk_settings.text())),
+            ("hotkey_drawer", "贴图储藏柜总开关", normalize_hotkey_str(self.input_hk_drawer.text()) or "Ctrl+1"),
+            ("hotkey_toggle_pins", "隐藏/恢复全部贴图", normalize_hotkey_str(self.input_hk_toggle_pins.text())),
+            ("hotkey_paste_pin", "剪贴板图片直接贴图", normalize_hotkey_str(self.input_hk_paste_pin.text())),
+            ("hotkey_restore_click_through", "解除贴图鼠标穿透", normalize_hotkey_str(self.input_hk_restore_click_through.text()) or "Ctrl+Alt+T"),
+            ("hotkey_pin_border", "切换贴图边框", normalize_hotkey_str(self.input_hk_pin_border.text())),
+        ]
+
+        seen_global = {}
+        for _k, g_label, hk in global_entries:
+            if not hk:
+                continue
+            if hk in seen_global:
+                QMessageBox.warning(
+                    self, "快捷键冲突",
+                    f"全局快捷键「{hk}」被同时分配给了「{seen_global[hk]}」和「{g_label}」，请修改其中一个。"
+                )
+                return
+            seen_global[hk] = g_label
+
+        reserved_screenshot_keys = {"Esc", "Ctrl+C", "Ctrl+Z", "Ctrl+Y", "Ctrl+S", "Ctrl+A", "Enter"}
+        toolbar_entries = []
+        seen_toolbar = {}
+        for cfg_key, _action_id, _kind, t_label, _desc in TOOLBAR_TOOL_HOTKEY_SPECS:
+            hk = normalize_hotkey_str(self.toolbar_hk_inputs[cfg_key].text())
+            if hk:
+                if hk in seen_toolbar:
+                    QMessageBox.warning(
+                        self, "快捷键冲突",
+                        f"截图工具栏快捷键「{hk}」被同时分配给了「{seen_toolbar[hk]}」和「{t_label}」，请修改其中一个。"
+                    )
+                    return
+                if hk in seen_global:
+                    QMessageBox.warning(
+                        self, "快捷键冲突",
+                        f"截图工具「{t_label}」的快捷键「{hk}」与全局快捷键「{seen_global[hk]}」冲突（会被全局热键优先拦截），请更换其它快捷键。"
+                    )
+                    return
+                if hk in reserved_screenshot_keys:
+                    QMessageBox.warning(
+                        self, "快捷键冲突",
+                        f"截图工具「{t_label}」的快捷键「{hk}」与系统内置截图快捷键冲突，请更换其它快捷键。"
+                    )
+                    return
+                seen_toolbar[hk] = t_label
+            toolbar_entries.append((cfg_key, hk))
+
+        want_autostart = self.cb_auto_start.isChecked()
+        actual_autostart = want_autostart
+        if sys.platform == "win32":
+            ok_auto, err_auto = set_autostart_enabled(want_autostart)
+            if not ok_auto:
+                QMessageBox.warning(self, "开机自启动设置失败", f"无法修改系统开机自启动设置：\n{err_auto}")
+                actual_autostart = is_autostart_enabled()
+                self.cb_auto_start.setChecked(actual_autostart)
+
         new_settings = {
-            "hotkey_snip": self.input_hk_snip.text().strip() or "F1",
-            "hotkey_ocr": self.input_hk_ocr.text().strip() or "F2",
-            "hotkey_pin": self.input_hk_pin.text().strip() or "F3",
-            "hotkey_record": self.input_hk_rec.text().strip() or "F4",
-            "hotkey_window_pin": self.input_hk_win_pin.text().strip(),
-            "hotkey_scroll": self.input_hk_scroll.text().strip(),
-            "hotkey_history": self.input_hk_history.text().strip(),
-            "hotkey_settings": self.input_hk_settings.text().strip(),
-            "hotkey_drawer": self.input_hk_drawer.text().strip() or "Ctrl+1",
-            "hotkey_toggle_pins": self.input_hk_toggle_pins.text().strip(),
-            "hotkey_paste_pin": self.input_hk_paste_pin.text().strip(),
-            "hotkey_restore_click_through": self.input_hk_restore_click_through.text().strip() or "Ctrl+Alt+T",
             "default_save_dir": self.input_save_dir.text().strip(),
             "auto_save_enabled": self.cb_auto_save.isChecked(),
+            "auto_start": actual_autostart,
             "show_mode_hints": self.cb_show_mode_hints.isChecked(),
             "drawer_hover_enabled": self.cb_drawer_hover.isChecked(),
+            "pin_border_enabled": self.cb_pin_border.isChecked(),
             "save_format": fmt_str,
             "save_quality": self.slider_quality.value(),
             "zhipu_api_key": self.input_zhipu_key.text().strip(),
@@ -12556,12 +14279,23 @@ class SettingsDialog(QDialog):
             "translation_display_mode": self.combo_trans_display.currentData(),
             "auto_check_update": self.cb_auto_update.isChecked(),
         }
+        for k, _label, val in global_entries:
+            new_settings[k] = val
+        for k, val in toolbar_entries:
+            new_settings[k] = val
+
         save_settings(new_settings)
         main_app = self.parent()
         if main_app is not None and not hasattr(main_app, "pin_drawer") and hasattr(main_app, "main_app_ref"):
             main_app = main_app.main_app_ref
         if main_app is not None and hasattr(main_app, "pin_drawer") and main_app.pin_drawer:
             main_app.pin_drawer.set_feature_enabled(self.cb_drawer_hover.isChecked())
+        if main_app is not None and hasattr(main_app, "set_pin_border_enabled"):
+            main_app.set_pin_border_enabled(self.cb_pin_border.isChecked(), show_toast=False)
+        if main_app is not None and hasattr(main_app, "toolbar") and isinstance(main_app.toolbar, SnipasteToolbar):
+            main_app.toolbar.refresh_tooltips(new_settings)
+        if main_app is not None and hasattr(main_app, "_reload_toolbar_shortcuts"):
+            main_app._reload_toolbar_shortcuts(new_settings)
         if self.hotkey_mgr:
             self.hotkey_mgr.reload_hotkeys()
         QMessageBox.information(self, "设置已保存", "偏好设置已成功保存并立即生效！")
@@ -13571,7 +15305,7 @@ def parse_hotkey_to_native(hotkey_str):
         'insert': 0x2D, 'delete': 0x2E, 'del': 0x2E, 'help': 0x2F,
         'multiply': 0x6A, 'add': 0x6B, 'separator': 0x6C, 'subtract': 0x6D,
         'decimal': 0x6E, 'divide': 0x6F,
-        ';': 0xBA, '=': 0xBB, ',': 0xBC, '-': 0xBD, '.': 0xBE, '/': 0xBF, '`': 0xC0,
+        ';': 0xBA, '=': 0xBB, 'plus': 0xBB, ',': 0xBC, '-': 0xBD, '.': 0xBE, '/': 0xBF, '`': 0xC0,
         '[': 0xDB, '\\': 0xDC, ']': 0xDD, "'": 0xDE,
     }
     for p in parts:
@@ -13618,6 +15352,7 @@ class GlobalHotkeyManager(QObject):
     on_toggle_pins_pressed = pyqtSignal()  # 隐藏/恢复全部贴图与抽屉 (默认 Ctrl+Alt+H)
     on_paste_pin_pressed = pyqtSignal()    # 剪贴板图片直接贴图 (默认 Ctrl+Alt+V)
     on_restore_click_through_pressed = pyqtSignal()  # 解除所有贴图鼠标穿透 (默认 Ctrl+Alt+T)
+    on_pin_border_pressed = pyqtSignal()   # 切换贴图边框开关
 
     HOTKEY_F1_ID = 101
     HOTKEY_F3_ID = 102
@@ -13633,6 +15368,7 @@ class GlobalHotkeyManager(QObject):
     HOTKEY_TOGGLE_PINS_ID = 112
     HOTKEY_PASTE_PIN_ID = 113
     HOTKEY_RESTORE_CT_ID = 114
+    HOTKEY_PIN_BORDER_ID = 115
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -13643,6 +15379,35 @@ class GlobalHotkeyManager(QObject):
         self._esc_registered = False
         self._scroll_esc_active = False
         self._recording_esc_active = False
+        self._suspended = False
+
+    def suspend_hotkeys(self):
+        """在设置面板录制快捷键期间暂时挂起全局热键，避免按键被拦截"""
+        if self._suspended:
+            return
+        self._suspended = True
+        self._unregister_all_active()
+
+    def resume_hotkeys(self):
+        """恢复全局热键监听"""
+        if not self._suspended:
+            return
+        self._suspended = False
+        self.reload_hotkeys()
+
+    def _unregister_all_active(self):
+        for hid in list(self._registered_native_ids):
+            try:
+                self._user32.UnregisterHotKey(None, hid)
+            except Exception:
+                pass
+        self._registered_native_ids.clear()
+        self._space_registered = False
+        self._esc_registered = False
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
 
     def install(self, app):
         """安装 Qt 全局原生事件过滤器并注册基础热键"""
@@ -13691,6 +15456,7 @@ class GlobalHotkeyManager(QObject):
         hk_toggle_pins = settings.get("hotkey_toggle_pins", "Ctrl+Alt+H")
         hk_paste_pin = settings.get("hotkey_paste_pin", "Ctrl+Alt+V")
         hk_restore_ct = settings.get("hotkey_restore_click_through", "Ctrl+Alt+T")
+        hk_pin_border = settings.get("hotkey_pin_border", "")
 
         self._register_one_hotkey(self.HOTKEY_F1_ID, hk_snip, self.trigger_snip)
         self._register_one_hotkey(self.HOTKEY_F2_ID, hk_ocr, self.trigger_ocr)
@@ -13704,20 +15470,11 @@ class GlobalHotkeyManager(QObject):
         self._register_one_hotkey(self.HOTKEY_TOGGLE_PINS_ID, hk_toggle_pins, self.trigger_toggle_pins)
         self._register_one_hotkey(self.HOTKEY_PASTE_PIN_ID, hk_paste_pin, self.trigger_paste_pin)
         self._register_one_hotkey(self.HOTKEY_RESTORE_CT_ID, hk_restore_ct, self.trigger_restore_click_through)
+        self._register_one_hotkey(self.HOTKEY_PIN_BORDER_ID, hk_pin_border, self.trigger_pin_border)
 
     def reload_hotkeys(self):
-        for hid in list(self._registered_native_ids):
-            try:
-                self._user32.UnregisterHotKey(None, hid)
-            except Exception:
-                pass
-        self._registered_native_ids.clear()
-        self._space_registered = False
-        self._esc_registered = False
-        try:
-            keyboard.unhook_all()
-        except Exception:
-            pass
+        self._suspended = False
+        self._unregister_all_active()
         self._register_static_hotkeys()
         if self._space_registered or self._scroll_esc_active:
             self.register_space_hotkey()
@@ -13822,6 +15579,8 @@ class GlobalHotkeyManager(QObject):
             self.trigger_paste_pin()
         elif hotkey_id == self.HOTKEY_RESTORE_CT_ID:
             self.trigger_restore_click_through()
+        elif hotkey_id == self.HOTKEY_PIN_BORDER_ID:
+            self.trigger_pin_border()
         elif hotkey_id == self.HOTKEY_SPACE_ID:
             self.trigger_space()
         elif hotkey_id == self.HOTKEY_ESC_ID:
@@ -13911,6 +15670,13 @@ class GlobalHotkeyManager(QObject):
         except Exception as e:
             logging.error("解除鼠标穿透热键触发异常: %s", e)
 
+    def trigger_pin_border(self):
+        try:
+            logging.info("触发贴图边框开关热键 at %s", time.strftime('%H:%M:%S'))
+            self.on_pin_border_pressed.emit()
+        except Exception as e:
+            logging.error("贴图边框开关热键触发异常: %s", e)
+
     def trigger_space(self):
         try:
             logging.debug("触发滚动热键 Space")
@@ -13947,15 +15713,29 @@ HotkeyListener = GlobalHotkeyManager
 
 
 class ScreenshotTool(QWidget):
-    def __init__(self, hotkey_listener=None):
+    def __init__(self, hotkey_listener=None, parent_tool=None):
         super().__init__()
         ensure_high_dpi_and_fonts()
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_InputMethodEnabled, False)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
-        
+
+        self.parent_tool = parent_tool
+        self.root_tool = parent_tool.root_tool if parent_tool is not None else self
+        self._capture_active = False
+        self._secondary_capture = None
+        self._temp_hidden_dialogs = []
+        self._temp_hidden_parent_info = None
+        self._suppressed_pin_overlay = False
+        self._active_settings_dialog = None
+        self._history_dialog_open = False
+        self._active_history_dialog = None
+
         self.hotkey_listener = hotkey_listener
+        self._toolbar_shortcut_map = {}
+        self._reload_toolbar_shortcuts()
         
         self.scroll_thread = None
         self.border_frame = None
@@ -14044,15 +15824,25 @@ class ScreenshotTool(QWidget):
         self.color_output_hex = False
         self.color_output_hex = False
         self.eraser_state_saved = False
-        
-        self.capture_history = [] 
-        self.pinned_windows = [] 
-        self._pins_boss_hidden = False
-        self._boss_hidden_pins = []
-        self._boss_hidden_drawer = False
-        self.pin_drawer = PinDrawerWindow(main_app=self)
-        self.pin_drawer.set_feature_enabled(load_settings().get("drawer_hover_enabled", True))  
-        
+
+        if self.parent_tool is None:
+            self.pin_border_enabled = bool(load_settings().get("pin_border_enabled", False))
+            self.capture_history = []
+            self.pinned_windows = []
+            self._pins_boss_hidden = False
+            self._boss_hidden_pins = []
+            self._boss_hidden_drawer = False
+            self.pin_drawer = PinDrawerWindow(main_app=self)
+            self.pin_drawer.set_feature_enabled(load_settings().get("drawer_hover_enabled", True))
+        else:
+            self.pin_border_enabled = self.root_tool.pin_border_enabled
+            self.capture_history = self.root_tool.capture_history
+            self.pinned_windows = self.root_tool.pinned_windows
+            self._pins_boss_hidden = False
+            self._boss_hidden_pins = []
+            self._boss_hidden_drawer = False
+            self.pin_drawer = None
+
         self.inline_editor = InlineTextEditor(self)
         self.crop_toolbar = CropToolbar(self)
         self.crop_toolbar.apply_clicked.connect(self.apply_crop)
@@ -14063,12 +15853,67 @@ class ScreenshotTool(QWidget):
         self.color_timer = QTimer(self)
         self.color_timer.setInterval(30)
         self.color_timer.timeout.connect(self.update_color_picker_from_cursor)
-        
+
         self.setup_toolbar()
-        QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
+        if self.parent_tool is None:
+            QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
+
+    def get_active_capture_layer_depth(self):
+        """统计当前同时叠加的截图编辑层数（活动 ScreenshotTool 层 + 打开的图片编辑与预览窗口）。"""
+        root = getattr(self, "root_tool", self)
+        depth = 1 if getattr(root, "_capture_active", False) else 0
+        sec = getattr(root, "_secondary_capture", None)
+        if sec is not None and getattr(sec, "_capture_active", False):
+            depth += 1
+        try:
+            depth += len(ImageEditorDialog.get_open_editors())
+        except Exception:
+            pass
+        return depth
+
+    def _ensure_secondary_capture(self):
+        root = getattr(self, "root_tool", self)
+        if root._secondary_capture is None:
+            root._secondary_capture = ScreenshotTool(
+                hotkey_listener=root.hotkey_listener,
+                parent_tool=root,
+            )
+        return root._secondary_capture
+
+    def set_pin_border_enabled(self, enabled, show_toast=True):
+        """设置并持久化桌面贴图边框开关，同时刷新全部已有贴图窗口。"""
+        if self.parent_tool is not None:
+            return self.root_tool.set_pin_border_enabled(enabled, show_toast=show_toast)
+        enabled = bool(enabled)
+        self.pin_border_enabled = enabled
+        if self._secondary_capture is not None:
+            self._secondary_capture.pin_border_enabled = enabled
+        save_settings({"pin_border_enabled": enabled})
+        for pw in list(self.pinned_windows):
+            try:
+                if pw is not None:
+                    pw.update()
+            except RuntimeError:
+                pass
+        if show_toast:
+            try:
+                msg = "🖼️ 已开启桌面贴图边框" if enabled else "🖼️ 已关闭桌面贴图边框"
+                self._border_toast = PinToast(msg, pinned=enabled)
+                self._border_toast.show()
+            except Exception:
+                pass
+        return enabled
+
+    def toggle_pin_border(self):
+        """热键 / 托盘 / 右键菜单切换桌面贴图边框。"""
+        if self.parent_tool is not None:
+            return self.root_tool.toggle_pin_border()
+        return self.set_pin_border_enabled(not bool(getattr(self, "pin_border_enabled", False)), show_toast=True)
 
     def toggle_drawer(self):
         """Ctrl+1 快捷键：彻底开启或关闭贴图储藏柜功能"""
+        if self.parent_tool is not None:
+            return self.root_tool.toggle_drawer()
         if hasattr(self, 'pin_drawer') and self.pin_drawer:
             enabled = self.pin_drawer.toggle()
             save_settings({"drawer_hover_enabled": enabled})
@@ -14081,6 +15926,8 @@ class ScreenshotTool(QWidget):
 
     def toggle_all_pins_visibility(self):
         """老板键（Ctrl+Alt+H / 托盘）：一键临时隐藏全部桌面贴图与抽屉，再次触发全部恢复。"""
+        if self.parent_tool is not None:
+            return self.root_tool.toggle_all_pins_visibility()
         drawer = getattr(self, "pin_drawer", None)
         if not self._pins_boss_hidden:
             hidden_list = []
@@ -14123,6 +15970,8 @@ class ScreenshotTool(QWidget):
 
     def paste_clipboard_as_pin(self):
         """将剪贴板最新的图片（位图或复制的图片文件）直接贴到鼠标所在屏幕位置。"""
+        if self.parent_tool is not None:
+            return self.root_tool.paste_clipboard_as_pin()
         cb = QApplication.clipboard()
         if cb is None:
             return None
@@ -14145,6 +15994,8 @@ class ScreenshotTool(QWidget):
 
     def restore_all_click_through(self):
         """解除所有置顶贴图的鼠标穿透锁定。"""
+        if self.parent_tool is not None:
+            return self.root_tool.restore_all_click_through()
         restored = 0
         for pw in list(self.pinned_windows):
             try:
@@ -14159,6 +16010,8 @@ class ScreenshotTool(QWidget):
 
     def pin_all_to_drawer(self):
         """一键将当前桌面上的所有贴图批量收入右侧抽屉。"""
+        if self.parent_tool is not None:
+            return self.root_tool.pin_all_to_drawer()
         drawer = getattr(self, "pin_drawer", None)
         if not drawer:
             return
@@ -14181,6 +16034,8 @@ class ScreenshotTool(QWidget):
 
     def close_all_pins(self):
         """关闭全部当前显示的桌面贴图（记录仍可按 F3 找回）。"""
+        if self.parent_tool is not None:
+            return self.root_tool.close_all_pins()
         for pw in list(self.pinned_windows):
             try:
                 if pw is not None:
@@ -14404,10 +16259,50 @@ class ScreenshotTool(QWidget):
             self.options_bar.raise_()
             self.options_bar.update_frosted_bg()
 
+    def _raise_floating_bars(self):
+        if hasattr(self, 'toolbar') and self.toolbar and self.toolbar.isVisible():
+            self.toolbar.raise_()
+        if hasattr(self, 'options_bar') and self.options_bar and self.options_bar.isVisible():
+            self.options_bar.raise_()
+
+
+    def _show_layer_limit_toast(self):
+        try:
+            self._layer_limit_toast = PinToast(
+                "⚠️ 截图功能最多支持同时叠加两层，请先完成或关闭当前窗口",
+                pinned=False,
+            )
+            self._layer_limit_toast.show()
+            self._layer_limit_toast.raise_()
+        except Exception:
+            pass
 
     def activate_capture(self, ocr_intent=False, recording_intent=False):
         import time as _time
         t0 = _time.time()
+
+        active_modal = QApplication.activeModalWidget()
+        if active_modal is not None and active_modal is not self:
+            try:
+                active_modal.raise_()
+                active_modal.activateWindow()
+            except Exception:
+                pass
+            return
+
+        root = getattr(self, "root_tool", self)
+        if self.parent_tool is None and self._capture_active:
+            if root.get_active_capture_layer_depth() >= 2:
+                root._show_layer_limit_toast()
+                return
+            sec = root._ensure_secondary_capture()
+            return sec.activate_capture(ocr_intent=ocr_intent, recording_intent=recording_intent)
+
+        if root.get_active_capture_layer_depth() >= 2:
+            root._show_layer_limit_toast()
+            return
+
+        self._capture_active = True
 
         if self.scroll_thread is not None:
             if self.scroll_thread.is_recording:
@@ -14428,7 +16323,8 @@ class ScreenshotTool(QWidget):
         self._scroll_cancelled = False
 
         t1 = _time.time()
-        logging.info("activate_capture() 被调用，开始进入截图模式 (清理耗时 %.0fms)" % ((t1 - t0) * 1000))
+        logging.info("activate_capture() 被调用，开始进入截图模式 (layer=%d, 清理耗时 %.0fms)" % (
+            root.get_active_capture_layer_depth(), (t1 - t0) * 1000))
         self.state = "SELECTING"
         self.current_tool = None
         self.current_step_num = 1
@@ -14451,7 +16347,13 @@ class ScreenshotTool(QWidget):
         self.hovered_window_title = ""
         if hasattr(self, 'window_snapper') and self.window_snapper:
             try:
-                self.window_snapper.exclude_hwnds = {int(self.winId())}
+                excl = {int(self.winId())}
+                if self.parent_tool is not None:
+                    try:
+                        excl.add(int(self.parent_tool.winId()))
+                    except Exception:
+                        pass
+                self.window_snapper.exclude_hwnds = excl
                 self.window_snapper.refresh_window_tree()
             except Exception as e:
                 logging.warning("刷新吸附窗口树异常: %s", e)
@@ -14468,19 +16370,21 @@ class ScreenshotTool(QWidget):
         self._auto_ocr_pending = False
         self._text_flash = ""
         self._invalidate_text_doc()
+        self._reload_toolbar_shortcuts()
+        if hasattr(self, 'toolbar') and isinstance(self.toolbar, SnipasteToolbar):
+            self.toolbar.refresh_tooltips()
+            self.toolbar.set_active_tool(None)
         self.toolbar.hide()
         if hasattr(self, 'options_bar'):
             self.options_bar.hide()
             self.options_bar.set_tool(None)
-        if hasattr(self, 'toolbar') and isinstance(self.toolbar, SnipasteToolbar):
-            self.toolbar.set_active_tool(None)
         self.update_undo_redo_states()
         self.inline_editor.hide()
         if hasattr(self, 'crop_toolbar'):
             self.crop_toolbar.hide()
         self.reset_button_styles()
 
-        drawer = getattr(self, "pin_drawer", None)
+        drawer = getattr(root, "pin_drawer", None)
         drawer_temporarily_hidden = False
         if drawer is not None:
             if hasattr(drawer, "_hide_hover_preview"):
@@ -14495,6 +16399,40 @@ class ScreenshotTool(QWidget):
         t2 = _time.time()
         screen = QApplication.primaryScreen()
         self.original_screen = screen.grabWindow(0)
+
+        # 截屏完成之后再临时隐藏活动中的父截图层、非模态弹窗及窗口置顶徽章，避免遮挡/抢占焦点
+        self._temp_hidden_parent_info = None
+        if self.parent_tool is not None and self.parent_tool.isVisible():
+            pt = self.parent_tool
+            tb_vis = bool(getattr(pt, "toolbar", None) and pt.toolbar.isVisible())
+            opt_vis = bool(getattr(pt, "options_bar", None) and pt.options_bar.isVisible())
+            crop_vis = bool(getattr(pt, "crop_toolbar", None) and pt.crop_toolbar.isVisible())
+            if tb_vis:
+                pt.toolbar.hide()
+            if opt_vis:
+                pt.options_bar.hide()
+            if crop_vis:
+                pt.crop_toolbar.hide()
+            pt.hide()
+            self._temp_hidden_parent_info = (pt, tb_vis, opt_vis, crop_vis)
+
+        hidden_dlgs = []
+        for dlg in _get_visible_nonmodal_dialogs():
+            if dlg is self:
+                continue
+            try:
+                if dlg.isVisible():
+                    if isinstance(dlg, ImageEditorDialog):
+                        dlg._temp_hidden_for_capture = True
+                    dlg.hide()
+                    hidden_dlgs.append(dlg)
+            except RuntimeError:
+                pass
+        self._temp_hidden_dialogs = hidden_dlgs
+
+        WindowPinManager.get_instance().set_overlay_suppressed(True)
+        self._suppressed_pin_overlay = True
+
         if drawer_temporarily_hidden and drawer is not None and not getattr(drawer, "_boss_hidden", False):
             drawer.ensure_on_top()
         t3 = _time.time()
@@ -14504,6 +16442,8 @@ class ScreenshotTool(QWidget):
         self.setGeometry(0, 0, self.original_screen.width(), self.original_screen.height())
         self.setMouseTracking(True)
         self.showFullScreen()
+        _force_activate_window(self)
+        self.setFocus()
         self.setCursor(Qt.CrossCursor)
         if not (ocr_intent or recording_intent):
             self.color_timer.start()
@@ -14547,26 +16487,92 @@ class ScreenshotTool(QWidget):
             self.original_screen_image = None
             self.blurred_screen = None
         finally:
+            self._capture_active = False
             if hasattr(self, 'toolbar') and self.toolbar:
                 self.toolbar.hide()
             if hasattr(self, 'options_bar') and self.options_bar:
                 self.options_bar.hide()
             self.hide()
-            if hasattr(self, 'pin_drawer') and self.pin_drawer:
-                self.pin_drawer.ensure_on_top(force=True)
+
+            root = getattr(self, "root_tool", self)
+            parent_info = getattr(self, "_temp_hidden_parent_info", None)
+            self._temp_hidden_parent_info = None
+            if parent_info is not None:
+                pt, tb_vis, opt_vis, crop_vis = parent_info
+                try:
+                    if pt is not None and getattr(pt, "_capture_active", False):
+                        pt.showFullScreen()
+                        _force_activate_window(pt)
+                        if tb_vis and getattr(pt, "toolbar", None):
+                            pt.toolbar.show()
+                            pt.toolbar.raise_()
+                        if opt_vis and getattr(pt, "options_bar", None):
+                            pt.options_bar.show()
+                            pt.options_bar.raise_()
+                        if crop_vis and getattr(pt, "crop_toolbar", None):
+                            pt.crop_toolbar.show()
+                            pt.crop_toolbar.raise_()
+                        QTimer.singleShot(30, lambda w=pt: _force_activate_window(w) if w.isVisible() else None)
+                except RuntimeError:
+                    pass
+
+            hidden_dlgs = list(getattr(self, "_temp_hidden_dialogs", []) or [])
+            self._temp_hidden_dialogs = []
+            top_restored = None
+            for dlg in hidden_dlgs:
+                try:
+                    if isinstance(dlg, ImageEditorDialog):
+                        dlg._temp_hidden_for_capture = False
+                    if not getattr(dlg, "_really_closed_emitted", False):
+                        dlg.show()
+                        dlg.raise_()
+                        top_restored = dlg
+                except RuntimeError:
+                    pass
+            if top_restored is not None:
+                try:
+                    _force_activate_window(top_restored)
+                except RuntimeError:
+                    pass
+
+            sec = getattr(root, "_secondary_capture", None)
+            still_capturing = bool(getattr(root, "_capture_active", False) or (sec is not None and getattr(sec, "_capture_active", False)))
+            if getattr(self, "_suppressed_pin_overlay", False):
+                self._suppressed_pin_overlay = False
+                if not still_capturing:
+                    WindowPinManager.get_instance().set_overlay_suppressed(False)
+
+            drawer = getattr(root, "pin_drawer", None)
+            if drawer is not None and not still_capturing:
+                drawer.ensure_on_top(force=True)
 
     def activate_recording(self):
         """激活屏幕录制模式 (F4)"""
+        if self.parent_tool is None:
+            sec = getattr(self, "_secondary_capture", None)
+            if sec is not None and getattr(sec, "_capture_active", False):
+                return sec.activate_recording()
+
         # 1. 若正在录屏中，再次按下快捷键直接完成录制
-        if self.recording_thread and self.recording_thread.isRunning():
-            self._on_stop_record()
+        root = getattr(self, "root_tool", self)
+        if root.recording_thread and root.recording_thread.isRunning():
+            root._on_stop_record()
             return
 
         # 2. 若已有有效选区正在编辑，直接以该选区开启录制
         if self.state == "EDITING" and hasattr(self, 'selection_rect') and not self.selection_rect.isNull() and self.selection_rect.width() > 10:
             rect = QRect(self.selection_rect)
             self.hide_app(keep_history=False)
-            self.start_recording_session(rect)
+            root.start_recording_session(rect)
+            return
+
+        # 若当前已在选区中，就地切换为录屏意图，避免多叠一层截图
+        if self.isVisible() and self.state == "SELECTING":
+            self.recording_intent = True
+            self.ocr_intent = False
+            self.color_picker_visible = False
+            self.mode_banner_dismissed = False
+            self.update()
             return
 
         # 3. 否则进入录屏选区模式 (完全免除深色遮罩)
@@ -14574,6 +16580,11 @@ class ScreenshotTool(QWidget):
 
     def activate_ocr(self):
         """激活快速文字识别与翻译模式 (F2)"""
+        if self.parent_tool is None:
+            sec = getattr(self, "_secondary_capture", None)
+            if sec is not None and getattr(sec, "_capture_active", False):
+                return sec.activate_ocr()
+
         # 1. 若已有有效选区正在编辑，直接以该选区开启 OCR
         if self.state == "EDITING" and hasattr(self, 'selection_rect') and not self.selection_rect.isNull() and self.selection_rect.width() > 10:
             rect = QRect(self.selection_rect)
@@ -14582,17 +16593,34 @@ class ScreenshotTool(QWidget):
             self.start_quick_ocr_session(rect, sub_pixmap)
             return
 
+        # 若当前已在选区中，就地切换为识图意图，避免多叠一层截图
+        if self.isVisible() and self.state == "SELECTING":
+            self.ocr_intent = True
+            self.recording_intent = False
+            self.color_picker_visible = False
+            self.mode_banner_dismissed = False
+            self.update()
+            return
+
         # 2. 否则进入快速文字识别选区模式 (完全免除深色遮罩)
         self.activate_capture(ocr_intent=True)
 
     def activate_window_pin(self):
         """激活窗口置顶拾取模式 (DeskPin)"""
+        if self.parent_tool is None:
+            sec = getattr(self, "_secondary_capture", None)
+            if sec is not None and getattr(sec, "_capture_active", False) and sec.isVisible():
+                sec.hide_app(keep_history=False)
         if self.isVisible():
             self.hide_app(keep_history=False)
         WindowPinPicker.start_picking()
 
     def activate_scroll_capture(self):
         """激活滚动长截图模式"""
+        if self.parent_tool is None:
+            sec = getattr(self, "_secondary_capture", None)
+            if sec is not None and getattr(sec, "_capture_active", False):
+                return sec.activate_scroll_capture()
         if self.state == "EDITING" and hasattr(self, 'selection_rect') and not self.selection_rect.isNull() and self.selection_rect.width() >= SCROLL_MIN_CAPTURE_SIZE and self.selection_rect.height() >= SCROLL_MIN_CAPTURE_SIZE:
             self.start_scroll()
             return
@@ -14645,7 +16673,9 @@ class ScreenshotTool(QWidget):
             self._active_ocr_dialog = dlg
             dlg.activateWindow()
             dlg.raise_()
-            dlg.exec_()
+            exec_dialog_nonmodal(dlg)
+            if self._active_ocr_dialog is dlg:
+                self._active_ocr_dialog = None
         except Exception as e:
             logging.error("_on_quick_ocr_finished 异常: %s", e, exc_info=True)
 
@@ -15202,12 +17232,18 @@ class ScreenshotTool(QWidget):
                 window.destroyed.connect(self._on_translation_window_destroyed)
             except Exception:
                 pass
-            window.exec_()
-            self._leave_modal_layer()
+            try:
+                exec_dialog_nonmodal(window)
+            finally:
+                if self._active_translation_window is window:
+                    self._active_translation_window = None
+                if self.isVisible():
+                    self._leave_modal_layer()
 
         def _no_coords(text):
             # 极少数本地引擎完全没有坐标时，退化为文字对照（仍携带可能检出的条码）
-            self._leave_modal_layer()
+            if self.isVisible():
+                self._leave_modal_layer()
             img_for_code = self.get_final_static_image()
             codes = detect_codes_in_image(img_for_code)
             dlg = OcrResultDialog(
@@ -15215,7 +17251,9 @@ class ScreenshotTool(QWidget):
                 source_image=img_for_code.toImage() if img_for_code and not img_for_code.isNull() else None
             )
             self._active_ocr_dialog = dlg
-            dlg.exec_()
+            exec_dialog_nonmodal(dlg)
+            if self._active_ocr_dialog is dlg:
+                self._active_ocr_dialog = None
 
         def _error(err):
             self._leave_modal_layer()
@@ -15225,6 +17263,8 @@ class ScreenshotTool(QWidget):
 
     def start_recording_session(self, target_rect):
         """开启录屏准备会话（显示红框与悬浮控制条）"""
+        if self.parent_tool is not None:
+            return self.root_tool.start_recording_session(target_rect)
         self._cleanup_recording_ui()
 
         target_rect = target_rect.normalized()
@@ -15335,7 +17375,7 @@ class ScreenshotTool(QWidget):
         try:
             logging.info("正在打开录制导出预览窗口: %s", video_path)
             dialog = RecordingExportDialog(info, parent=None)
-            dialog.exec_()
+            exec_dialog_nonmodal(dialog)
         except Exception as e:
             logging.error("打开 RecordingExportDialog 异常: %s", e, exc_info=True)
             QMessageBox.critical(None, "导出错误", f"无法打开录屏导出窗口:\n{e}")
@@ -15392,7 +17432,12 @@ class ScreenshotTool(QWidget):
         if self.current_tool in ['ERASER', 'ERASE']:
             self.setCursor(create_eraser_cursor())
         elif self.current_tool == 'TEXT':
-            self.setCursor(Qt.IBeamCursor)
+            hit_text = (
+                pos is not None
+                and self.state == "EDITING"
+                and any(e.get('type') == 'TEXT' and is_annotation_hit(e, pos) for e in self.edits)
+            )
+            self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
         elif self.current_tool in ['MOSAIC_BLUR', 'BLUR']:
             opts = self.options_bar.get_mosaic_options() if hasattr(self, 'options_bar') else {}
             r = opts.get('brushWidth', self.current_thickness * 4)
@@ -15466,6 +17511,32 @@ class ScreenshotTool(QWidget):
             self.start_scroll()
         elif self.crop_mode:
             self.exit_crop_mode()
+        if self.isVisible() and not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible()):
+            self.setFocus()
+
+    def _reload_toolbar_shortcuts(self, settings=None):
+        """从配置加载截图底部工具栏工具的快捷键映射表"""
+        s = settings if isinstance(settings, dict) else load_settings()
+        mapping = {}
+        for cfg_key, action_id, kind, _label, _desc in TOOLBAR_TOOL_HOTKEY_SPECS:
+            hk = normalize_hotkey_str(s.get(cfg_key, ""))
+            if hk:
+                mapping[hk] = (action_id, kind)
+        self._toolbar_shortcut_map = mapping
+
+    def _trigger_toolbar_hotkey_action(self, action_id, kind):
+        """执行截图底部工具栏工具的绑定快捷键动作"""
+        if kind == "tool":
+            self.on_tool_triggered(action_id)
+        elif action_id == "CROP":
+            if self.crop_mode:
+                self.cancel_crop()
+            else:
+                self.on_action_triggered("CROP")
+        elif action_id == "TRANSLATE":
+            if self.crop_mode:
+                self.cancel_crop()
+            self.on_action_triggered("TRANSLATE")
 
     def get_resize_edge(self, pos, allow_move=True):
         r = self.selection_rect
@@ -15495,27 +17566,33 @@ class ScreenshotTool(QWidget):
         if not hasattr(self, 'inline_editor') or not self.inline_editor.isVisible():
             return
         text = self.inline_editor.text_edit.toPlainText()
-        if text.strip() or self.inline_editor.active_edit_ref:
-            self.save_state()
+        had_existing = self.inline_editor.active_edit_ref is not None
+        if text.strip():
+            if not had_existing:
+                self.save_state()
             rect = self.inline_editor.get_text_rect()
-            if text.strip():
-                opts = self.options_bar.get_text_options() if hasattr(self, 'options_bar') else {}
-                font = self.inline_editor.text_edit.font()
-                self.edits.append({
-                    'type': 'TEXT',
-                    'pos': rect.topLeft(),
-                    'rect': rect,
-                    'text': text,
-                    'color': opts.get('color', self.inline_editor.current_color),
-                    'font': font,
-                    'fontFamily': opts.get('fontFamily', font.family()),
-                    'fontSize': opts.get('fontSize', font.pointSize()),
-                    'bold': opts.get('bold', font.bold()),
-                    'italic': opts.get('italic', font.italic()),
-                    'bgEnabled': opts.get('bgEnabled', False),
-                    'bgColor': opts.get('bgColor', QColor(255, 255, 255, 230))
-                })
+            opts = self.options_bar.get_text_options() if hasattr(self, 'options_bar') else {}
+            font = self.inline_editor.text_edit.font()
+            self.edits.append({
+                'type': 'TEXT',
+                'pos': rect.topLeft(),
+                'rect': rect,
+                'text': text,
+                'color': QColor(opts.get('color', self.inline_editor.current_color)),
+                'font': QFont(font),
+                'fontFamily': opts.get('fontFamily', font.family()),
+                'fontSize': opts.get('fontSize', font.pointSize() if font.pointSize() > 0 else 14),
+                'bold': opts.get('bold', font.bold()),
+                'italic': opts.get('italic', font.italic()),
+                'bgEnabled': opts.get('bgEnabled', self.inline_editor.bg_enabled),
+                'bgColor': QColor(opts.get('bgColor', self.inline_editor.bg_color)),
+                'user_width': self.inline_editor.user_width,
+                'user_height': self.inline_editor.user_height,
+            })
+        self.inline_editor.active_edit_ref = None
         self.inline_editor.hide()
+        if self.isVisible():
+            self.setFocus()
         self.update()
 
     def sample_screen_color(self, pos):
@@ -15638,45 +17715,82 @@ class ScreenshotTool(QWidget):
             active_layer.keyPressEvent(event)
             return
 
-        if self.state == "EDITING" and not self.crop_mode:
-            if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier and self._text_selected:
-                if self._copy_selected_text():
+        fw = self.focusWidget() or QApplication.focusWidget()
+        is_inline_editing = (
+            hasattr(self, 'inline_editor')
+            and self.inline_editor.isVisible()
+            and (
+                fw is self.inline_editor
+                or (fw is not None and self.inline_editor.isAncestorOf(fw))
+                or self.inline_editor.text_edit.hasFocus()
+                or fw is self.inline_editor.text_edit
+                or (fw is not None and fw.parent() is self.inline_editor.text_edit)
+            )
+        )
+        in_spinbox = isinstance(fw, QAbstractSpinBox) or (fw is not None and isinstance(fw.parent(), QAbstractSpinBox))
+
+        if self.state == "EDITING":
+            if not self.crop_mode:
+                if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier and self._text_selected:
+                    if self._copy_selected_text():
+                        return
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._text_selected:
+                    if self._copy_selected_text():
+                        return
+                if event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier and self._text_doc_ready():
+                    self._select_all_text()
                     return
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._text_selected:
-                if self._copy_selected_text():
+                if event.key() == Qt.Key_Escape and self._text_selected:
+                    self._clear_text_selection()
                     return
-            if event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier and self._text_doc_ready():
-                self._select_all_text()
-                return
-            if event.key() == Qt.Key_Escape and self._text_selected:
-                self._clear_text_selection()
-                return
-            if (not self.selection_rect.isNull()
-                    and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier))
-                    and not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible())):
-                step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
-                dx, dy = 0, 0
-                if event.key() == Qt.Key_Left:
-                    dx = -step
-                elif event.key() == Qt.Key_Right:
-                    dx = step
-                elif event.key() == Qt.Key_Up:
-                    dy = -step
-                elif event.key() == Qt.Key_Down:
-                    dy = step
-                if dx or dy:
-                    r = QRect(self.selection_rect)
-                    nx = max(0, min(max(0, self.width() - r.width()), r.x() + dx))
-                    ny = max(0, min(max(0, self.height() - r.height()), r.y() + dy))
-                    if nx != r.x() or ny != r.y():
-                        r.moveTo(nx, ny)
-                        self.selection_rect = r
-                        self._reset_text_selection_state()
-                        self._invalidate_text_doc()
-                        self._schedule_auto_text_ocr()
-                        self.update_toolbar_positions()
-                        self.update()
+
+            # 截图底部工具栏工具绑定快捷键（默认不绑定；仅在截图编辑时生效）
+            allow_toolbar_hk = not (is_inline_editing and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)))
+            if allow_toolbar_hk and self._toolbar_shortcut_map:
+                hk_pressed = key_event_to_hotkey_str(event)
+                if hk_pressed and hk_pressed in self._toolbar_shortcut_map:
+                    if not event.isAutoRepeat():
+                        action_id, kind = self._toolbar_shortcut_map[hk_pressed]
+                        self._trigger_toolbar_hotkey_action(action_id, kind)
                     return
+
+            if not self.crop_mode:
+                if in_spinbox and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    fw.clearFocus()
+                    if hasattr(self, 'inline_editor') and self.inline_editor.isVisible():
+                        if self.inline_editor.editing_text:
+                            self.inline_editor.text_edit.setFocus()
+                        else:
+                            self.inline_editor.setFocus()
+                    else:
+                        self.setFocus()
+                    return
+                if (not self.selection_rect.isNull()
+                        and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier))
+                        and not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible())):
+                    step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
+                    dx, dy = 0, 0
+                    if event.key() == Qt.Key_Left:
+                        dx = -step
+                    elif event.key() == Qt.Key_Right:
+                        dx = step
+                    elif event.key() == Qt.Key_Up:
+                        dy = -step
+                    elif event.key() == Qt.Key_Down:
+                        dy = step
+                    if dx or dy:
+                        r = QRect(self.selection_rect)
+                        nx = max(0, min(max(0, self.width() - r.width()), r.x() + dx))
+                        ny = max(0, min(max(0, self.height() - r.height()), r.y() + dy))
+                        if nx != r.x() or ny != r.y():
+                            r.moveTo(nx, ny)
+                            self.selection_rect = r
+                            self._reset_text_selection_state()
+                            self._invalidate_text_doc()
+                            self._schedule_auto_text_ocr()
+                            self.update_toolbar_positions()
+                            self.update()
+                        return
 
         if getattr(self, 'ocr_intent', False):
             if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
@@ -15696,14 +17810,14 @@ class ScreenshotTool(QWidget):
                 self.recording_intent = False
                 rect = self.selection_rect if (not self.selection_rect.isNull() and self.selection_rect.width() > 10) else QApplication.primaryScreen().geometry()
                 self.hide_app(keep_history=False)
-                self.start_recording_session(rect)
+                getattr(self, "root_tool", self).start_recording_session(rect)
                 return
             elif event.key() == Qt.Key_Escape:
                 self.recording_intent = False
                 self.hide_app(keep_history=False)
                 return
 
-        if event.key() == Qt.Key_F2:
+        if event.key() == Qt.Key_F2 and normalize_hotkey_str(load_settings().get("hotkey_ocr", "F2")) == "F2":
             self.activate_ocr()
             return
 
@@ -15742,15 +17856,19 @@ class ScreenshotTool(QWidget):
             if event.key() == Qt.Key_C:
                 if self.state == "EDITING":
                     self.copy_image()
-            elif event.key() == Qt.Key_1:
-                if self.state == "EDITING":
-                    self.set_tool('RECTANGLE', self.btn_rect)
+            elif event.key() == Qt.Key_S:
+                if self.state == "EDITING" and not self.crop_mode:
+                    self.save_image()
             elif event.key() == Qt.Key_Z:
                 if self.state == "EDITING":
                     self.undo()
             elif event.key() == Qt.Key_Y:
                 if self.state == "EDITING":
                     self.redo()
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & (Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)):
+            if self.state == "EDITING" and not self.crop_mode and not is_inline_editing and not self._text_selected and not in_spinbox:
+                self.copy_image()
+                return
         elif event.key() == Qt.Key_Escape: 
             if self.current_tool is not None:
                 self.set_tool(None)
@@ -15936,11 +18054,14 @@ class ScreenshotTool(QWidget):
                     painter.setClipRect(self.selection_rect)
                     draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
 
-                    if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw':
-                        painter.setPen(QPen(Qt.black, 1, Qt.DashLine))
+                    if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None) and self.text_rect.width() > 3 and self.text_rect.height() > 3:
+                        painter.save()
+                        painter.fillRect(self.text_rect, QColor(255, 255, 255, 35))
+                        painter.setPen(QPen(QColor(255, 255, 255, 210), 2, Qt.DashLine))
                         painter.drawRect(self.text_rect)
-                        painter.setPen(QPen(Qt.white, 1, Qt.DashLine))
-                        painter.drawRect(self.text_rect.adjusted(1, 1, -1, -1))
+                        painter.setPen(QPen(QColor(200, 144, 48), 1.4, Qt.DashLine))
+                        painter.drawRect(self.text_rect)
+                        painter.restore()
 
                     painter.setClipping(False)
                     if not self.crop_mode:
@@ -16001,6 +18122,24 @@ class ScreenshotTool(QWidget):
         if event.button() != Qt.LeftButton: return
         pos = event.pos()
 
+        # 双击已添加的 TEXT 标注图元：自动切入文字工具并就地编辑
+        if self.state == "EDITING" and not self.crop_mode:
+            for i in range(len(self.edits) - 1, -1, -1):
+                if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                    self.commit_text_edit()
+                    if self.current_tool != 'TEXT':
+                        self.set_tool('TEXT')
+                    edit = self.edits.pop(i)
+                    self.save_state()
+                    if hasattr(self, 'options_bar') and self.options_bar:
+                        self.options_bar.sync_text_options_from_edit(edit)
+                    edit_rect = get_text_annotation_rect(edit).toAlignedRect()
+                    self.inline_editor.start_editing(edit_rect, existing_edit=edit, start_in_text_mode=True)
+                    self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
+                    self.drag_mode = None
+                    self.update()
+                    return
+
         # 双击文字：复制整行（单击只清选区，不复制）
         if (self.state == "EDITING" and not self.crop_mode
                 and self.current_tool is None and self._text_doc_ready()):
@@ -16045,16 +18184,6 @@ class ScreenshotTool(QWidget):
             self.apply_crop()
             return
 
-        if self.state == "EDITING" and self.current_tool == 'TEXT':
-            for edit in reversed(self.edits):
-                if edit['type'] == 'TEXT' and 'rect' in edit and edit['rect'].contains(pos):
-                    self.save_state()
-                    self.edits.remove(edit)
-                    self.inline_editor.start_editing(edit['rect'], edit)
-                    self.drag_mode = None
-                    self.update()
-                    break
-
     def mousePressEvent(self, event):
         # 取字 / 译文层打开时，点击选区外先退出该层，避免误触发新的框选
         if self._text_select_layer is not None:
@@ -16098,6 +18227,13 @@ class ScreenshotTool(QWidget):
             
         elif self.state == "EDITING":
             self.color_picker_visible = False
+            was_editing = bool(hasattr(self, 'inline_editor') and self.inline_editor.isVisible())
+            had_text = bool(
+                was_editing and (
+                    self.inline_editor.text_edit.toPlainText().strip()
+                    or self.inline_editor.active_edit_ref is not None
+                )
+            )
             self.commit_text_edit()
 
             if self.crop_mode:
@@ -16125,13 +18261,28 @@ class ScreenshotTool(QWidget):
             elif self.current_tool == 'OCR':
                 self.drag_mode = 'ocr'; self.ocr_start = pos; self.ocr_rect = QRect(pos, pos)
             elif self.current_tool == 'TEXT':
-                clicked_edit = None
+                clicked_idx = None
                 for i in range(len(self.edits) - 1, -1, -1):
                     if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
-                        clicked_edit = self.edits.pop(i)
-                        self.save_state()
+                        clicked_idx = i
                         break
-                self.inline_editor.start_editing(pos, existing_edit=clicked_edit)
+                if clicked_idx is not None:
+                    clicked_edit = self.edits.pop(clicked_idx)
+                    self.save_state()
+                    if hasattr(self, 'options_bar') and self.options_bar:
+                        self.options_bar.sync_text_options_from_edit(clicked_edit)
+                    edit_rect = get_text_annotation_rect(clicked_edit).toAlignedRect()
+                    self.inline_editor.start_editing(edit_rect, existing_edit=clicked_edit, start_in_text_mode=False)
+                    self.drag_mode = 'text_move'
+                    self._text_move_start_global = event.globalPos()
+                    self._text_move_start_frame = QRect(self.inline_editor.get_text_rect())
+                    self._text_move_dragged = False
+                    self.update()
+                    return
+                self.drag_mode = 'text_draw'
+                self.text_start = pos
+                self.text_rect = QRect(pos, pos)
+                self._text_just_committed = (was_editing and had_text)
                 return
             elif self.current_tool == 'RECT_ELLIPSE':
                 self.save_state()
@@ -16366,9 +18517,10 @@ class ScreenshotTool(QWidget):
                 return
 
             if self.current_tool == 'TEXT' and self.drag_mode == 'text_move':
-                new_top_left = pos - self.drag_offset
-                self.active_text_edit['rect'].moveTo(new_top_left)
-                self.update()
+                delta = event.globalPos() - self._text_move_start_global
+                if delta.manhattanLength() >= 3:
+                    self._text_move_dragged = True
+                self.inline_editor.move_frame_to(self._text_move_start_frame.topLeft() + delta)
                 
             elif self.current_tool == 'OCR' and self.drag_mode == 'ocr':
                 rect = QRect(self.ocr_start, pos).normalized()
@@ -16376,7 +18528,7 @@ class ScreenshotTool(QWidget):
                 self.update()
 
             elif self.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
-                self.text_rect = QRect(self.text_start, pos).normalized()
+                self.text_rect = QRect(self.text_start, pos).normalized().intersected(self.selection_rect)
                 self.update()
 
             elif self.current_tool == 'RECT_ELLIPSE' and len(self.edits) > 0 and self.edits[-1].get('temp'):
@@ -16575,6 +18727,11 @@ class ScreenshotTool(QWidget):
                 elif self.drag_mode:
                     if self.current_tool == 'TEXT' and self.drag_mode == 'text_move':
                         self.drag_mode = None
+                        if getattr(self, '_text_move_dragged', False):
+                            self.inline_editor.set_editing_text(False)
+                        else:
+                            self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
+                        self.show_toolbar()
                         return
 
                     if self.current_tool == 'OCR' and getattr(self, 'ocr_rect', None):
@@ -16590,8 +18747,13 @@ class ScreenshotTool(QWidget):
                         self.update()
 
                     elif self.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
-                        if self.text_rect.width() > 10 and self.text_rect.height() > 10:
-                            self.inline_editor.start_editing(self.text_rect)
+                        rect = self.text_rect
+                        self.text_rect = None
+                        if rect is not None and rect.width() >= 18 and rect.height() >= 14:
+                            self.inline_editor.start_editing(rect)
+                        elif not getattr(self, '_text_just_committed', False):
+                            self.inline_editor.start_editing(self.text_start)
+                        self._text_just_committed = False
 
                     if self.drag_mode in ('move', 'left', 'right', 'top', 'bottom',
                                           'topleft', 'topright', 'bottomleft', 'bottomright'):
@@ -16603,7 +18765,8 @@ class ScreenshotTool(QWidget):
                     self._selection_before_drag = None
 
                     self.drag_mode = None
-                    self.setFocus()
+                    if not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible()):
+                        self.setFocus()
                     self.show_toolbar()
                     self.update_cursor_for_tool(event.pos())
                     self.update()
@@ -16629,7 +18792,7 @@ class ScreenshotTool(QWidget):
                 text, self, detected_codes=codes, ocr_doc=doc,
                 source_image=src_img, ocr_warning=warn
             )
-            dlg.exec_() 
+            exec_dialog_nonmodal(dlg)
             
     def show_toolbar(self):
         self.update_toolbar_positions()
@@ -16827,6 +18990,10 @@ class ScreenshotTool(QWidget):
 
     def add_to_capture_history(self, pixmap, pos=None, is_pinned=False, pin_window=None, zoom_factor=1.0):
         """统一管理截图与贴图历史，支持去重和顺序维护 (LIFO 栈顶在末尾)"""
+        if self.parent_tool is not None:
+            return self.root_tool.add_to_capture_history(
+                pixmap, pos=pos, is_pinned=is_pinned, pin_window=pin_window, zoom_factor=zoom_factor
+            )
         if pixmap is None or pixmap.isNull():
             return None
         if pos is None:
@@ -16859,6 +19026,8 @@ class ScreenshotTool(QWidget):
 
     def create_pinned_window(self, pixmap, initial_pos=None, zoom_factor=1.0):
         """创建贴图窗口并注册到历史与活跃贴图列表"""
+        if self.parent_tool is not None:
+            return self.root_tool.create_pinned_window(pixmap, initial_pos=initial_pos, zoom_factor=zoom_factor)
         if pixmap is None or pixmap.isNull():
             return None
         try:
@@ -16872,6 +19041,8 @@ class ScreenshotTool(QWidget):
 
     def on_pin_closed(self, pin_window):
         """当贴图被关闭时触发：将贴图标记为未激活，并将其更新至历史栈顶 (LIFO)，以便下次按 F3 优先重新贴出"""
+        if self.parent_tool is not None:
+            return self.root_tool.on_pin_closed(pin_window)
         try:
             if pin_window in self.pinned_windows:
                 self.pinned_windows.remove(pin_window)
@@ -16931,6 +19102,11 @@ class ScreenshotTool(QWidget):
         3. 若历史贴图全已在屏幕上或历史为空：尝试从剪贴板贴图；
         4. 若均无可用图片：弹出友好浮动提示。
         """
+        if self.parent_tool is None:
+            sec = getattr(self, "_secondary_capture", None)
+            if sec is not None and getattr(sec, "_capture_active", False) and sec.isVisible() and sec.state == "EDITING":
+                sec.hotkey_pin()
+                return
         if self.isVisible() and self.state == "EDITING":
             self.pin_image()
             return
@@ -17015,13 +19191,14 @@ class ScreenshotTool(QWidget):
         self.hide_app(keep_history=False)
 
     def show_history_dialog(self):
-        if getattr(self, "_history_dialog_open", False):
-            active_dlg = getattr(self, "_active_history_dialog", None)
+        root = getattr(self, "root_tool", self)
+        if getattr(root, "_history_dialog_open", False):
+            active_dlg = getattr(root, "_active_history_dialog", None)
             if active_dlg is not None and not getattr(active_dlg, "_really_closed_emitted", True):
                 active_dlg.show()
                 _force_activate_window(active_dlg)
             return
-        self._history_dialog_open = True
+        root._history_dialog_open = True
         was_capturing = self.isVisible()
         tb_was_visible = bool(getattr(self, "toolbar", None) and self.toolbar.isVisible())
         opt_was_visible = bool(getattr(self, "options_bar", None) and self.options_bar.isVisible())
@@ -17038,15 +19215,15 @@ class ScreenshotTool(QWidget):
                     self.crop_toolbar.hide()
                 self.hide()
                 QApplication.processEvents()
-            dlg = HistoryDialog(parent=None, main_app_ref=self)
-            self._active_history_dialog = dlg
+            dlg = HistoryDialog(parent=None, main_app_ref=root)
+            root._active_history_dialog = dlg
             dlg.exec_nonmodal()
         except Exception as e:
             logging.error("打开历史窗口失败: %s", e, exc_info=True)
             QMessageBox.warning(None, "截图历史", f"无法打开截图历史:\n{e}")
         finally:
-            self._active_history_dialog = None
-            self._history_dialog_open = False
+            root._active_history_dialog = None
+            root._history_dialog_open = False
             if was_capturing:
                 if dlg is not None and getattr(dlg, "_did_commit_action", False):
                     self.hide_app(keep_history=False)
@@ -17221,14 +19398,26 @@ class ScreenshotTool(QWidget):
         QTimer.singleShot(250, QApplication.quit)
 
     def show_settings_dialog(self):
+        if self.parent_tool is not None:
+            return self.root_tool.show_settings_dialog()
+        active_dlg = getattr(self, "_active_settings_dialog", None)
+        if active_dlg is not None and not getattr(active_dlg, "_really_closed_emitted", True):
+            active_dlg.show()
+            _force_activate_window(active_dlg)
+            return
+        dlg = None
         try:
             dlg = SettingsDialog(self, hotkey_mgr=getattr(self, 'hotkey_listener', None))
-            if dlg.exec_() == QDialog.Accepted:
+            self._active_settings_dialog = dlg
+            if exec_dialog_nonmodal(dlg) == QDialog.Accepted:
                 if hasattr(self, 'hotkey_listener') and self.hotkey_listener:
                     self.hotkey_listener.reload_hotkeys()
         except Exception as e:
             logging.error("打开设置窗口失败: %s", e, exc_info=True)
             QMessageBox.warning(self, "系统设置", f"无法打开设置窗口:\n{e}")
+        finally:
+            if dlg is not None and getattr(self, "_active_settings_dialog", None) is dlg:
+                self._active_settings_dialog = None
 
     def start_scroll(self):
         scroll_rect = QRect(self.selection_rect)
@@ -17237,15 +19426,18 @@ class ScreenshotTool(QWidget):
             self.set_tool(None, self.btn_scroll)
             return
 
+        self.hide_app(keep_history=False)
+        getattr(self, "root_tool", self)._begin_scroll_session(scroll_rect)
+
+    def _begin_scroll_session(self, scroll_rect):
         clear_scroll_temp_folder(TEMP_FOLDER)
-        self.active_scroll_rect = scroll_rect
+        self.active_scroll_rect = QRect(scroll_rect)
         self.scroll_waiting = True
         self._scroll_cancelled = False
-        self.hide_app(keep_history=False)
         QApplication.processEvents()
         time.sleep(0.12)
 
-        self.border_frame = CaptureFrame(scroll_rect)
+        self.border_frame = CaptureFrame(self.active_scroll_rect)
         if self.hotkey_listener is not None:
             self.hotkey_listener.register_space_hotkey()
 
@@ -17264,8 +19456,8 @@ class ScreenshotTool(QWidget):
             f"font-weight: 400; border: 1px solid rgba(255, 255, 255, 0.14);"
         )
         hint.adjustSize()
-        hint_x = scroll_rect.left() + max(0, (scroll_rect.width() - hint.width()) // 2)
-        hint_y = max(0, scroll_rect.top() - hint.height() - 8)
+        hint_x = self.active_scroll_rect.left() + max(0, (self.active_scroll_rect.width() - hint.width()) // 2)
+        hint_y = max(0, self.active_scroll_rect.top() - hint.height() - 8)
         hint.move(hint_x, hint_y)
         hint.show()
         self._scroll_hint = hint
@@ -17306,6 +19498,11 @@ class ScreenshotTool(QWidget):
         self.scroll_waiting = False
 
     def stop_trigger(self):
+        if self.parent_tool is None:
+            sec = getattr(self, "_secondary_capture", None)
+            if sec is not None and getattr(sec, "_capture_active", False) and sec.isVisible():
+                sec.hide_app(keep_history=False)
+                return
         if (
             (self.recording_thread and self.recording_thread.isRunning())
             or self.recording_toolbar is not None
@@ -17363,8 +19560,8 @@ class ScreenshotTool(QWidget):
                 return
 
             logging.info("滚动截图全内存拼接完成: %s", stats)
-            preview = ImageEditorDialog(base_img, self)
-            preview.exec_()
+            preview = ImageEditorDialog(base_img, getattr(self, "root_tool", self))
+            preview.exec_nonmodal()
         except Exception as e:
             logging.error("滚动截图拼接失败: %s", e, exc_info=True)
             QMessageBox.warning(self, "Scroll Capture Error", f"Could not stitch the scroll capture:\n{e}")
@@ -17426,6 +19623,10 @@ class AppTrayIcon(QSystemTrayIcon):
         restore_ct_action.triggered.connect(self.main_app.restore_all_click_through)
         menu.addAction(restore_ct_action)
         self._restore_ct_action = restore_ct_action
+        pin_border_action = QAction("🖼️ 贴图边框", menu)
+        pin_border_action.triggered.connect(self.main_app.toggle_pin_border)
+        menu.addAction(pin_border_action)
+        self._pin_border_action = pin_border_action
         menu.aboutToShow.connect(self._refresh_menu_labels)
         drawer_action = QAction("🗄️ 贴图抽屉 (Ctrl+1)", menu)
         drawer_action.triggered.connect(self.main_app.toggle_drawer)
@@ -17444,6 +19645,10 @@ class AppTrayIcon(QSystemTrayIcon):
         update_action = QAction("🔄 检查更新", menu)
         update_action.triggered.connect(lambda: self.main_app.check_for_updates(manual=True))
         menu.addAction(update_action)
+        autostart_action = QAction("🚀 开机自启动", menu)
+        autostart_action.triggered.connect(self.toggle_autostart)
+        menu.addAction(autostart_action)
+        self._autostart_action = autostart_action
         settings_action = QAction("⚙ 系统设置 (Settings)", menu)
         settings_action.triggered.connect(self.main_app.show_settings_dialog)
         menu.addAction(settings_action)
@@ -17474,8 +19679,31 @@ class AppTrayIcon(QSystemTrayIcon):
                     self._restore_ct_action.setText(f"🖱️ 解除鼠标穿透 ({ct_count} 张穿透中 · {hk_ct})")
                 else:
                     self._restore_ct_action.setText(f"🖱️ 恢复贴图点击 (无穿透 · {hk_ct})")
+            if getattr(self, "_pin_border_action", None) is not None:
+                border_on = bool(getattr(self.main_app, "pin_border_enabled", False))
+                hk_border = s.get("hotkey_pin_border", "") or ""
+                state_txt = "已开启" if border_on else "未开启"
+                hk_suffix = f" · {hk_border}" if hk_border else ""
+                self._pin_border_action.setText(f"🖼️ 贴图边框 ({state_txt}{hk_suffix})")
+            if getattr(self, "_autostart_action", None) is not None:
+                enabled = is_autostart_enabled()
+                self._autostart_action.setText("✅ 开机自启动 (已开启)" if enabled else "🚀 开机自启动 (未开启)")
         except Exception:
             pass
+
+    def toggle_autostart(self):
+        new_state = not is_autostart_enabled()
+        ok, err = set_autostart_enabled(new_state)
+        if ok:
+            save_settings({"auto_start": new_state})
+            try:
+                msg = "🚀 已开启开机自启动" if new_state else "🛑 已关闭开机自启动"
+                self._autostart_toast = PinToast(msg, pinned=new_state)
+                self._autostart_toast.show()
+            except Exception:
+                pass
+        else:
+            QMessageBox.warning(None, "开机自启动设置失败", f"无法修改系统开机自启动设置：\n{err}")
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick: self.main_app.activate_capture()
@@ -17507,8 +19735,70 @@ class AppTrayIcon(QSystemTrayIcon):
         QApplication.quit()
 
 
+class SingleInstanceTriggerListener(QThread):
+    """监听单实例唤醒命名事件，收到再次启动信号时通知主线程立即进入截图。"""
+    capture_requested = pyqtSignal()
+
+    def __init__(self, event_handle=None, parent=None):
+        super().__init__(parent)
+        self._event_handle = event_handle
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+        if self._event_handle:
+            try:
+                _kernel32.SetEvent(self._event_handle)
+            except Exception:
+                pass
+
+    def close_handle(self):
+        if self._event_handle:
+            try:
+                _kernel32.CloseHandle(self._event_handle)
+            except Exception:
+                pass
+            self._event_handle = None
+
+    def run(self):
+        INFINITE = 0xFFFFFFFF
+        WAIT_OBJECT_0 = 0
+        while not self._stop and self._event_handle:
+            res = _kernel32.WaitForSingleObject(self._event_handle, INFINITE)
+            if self._stop:
+                break
+            if res == WAIT_OBJECT_0:
+                self.capture_requested.emit()
+
+
+def _signal_running_instance_to_capture():
+    """向已在运行的实例发送唤醒事件以立即触发截图，无需弹出重复运行提示框。"""
+    try:
+        _user32.AllowSetForegroundWindow(0xFFFFFFFF)
+    except Exception:
+        pass
+    EVENT_MODIFY_STATE = 0x0002
+    for attempt in range(4):
+        h_event = _kernel32.OpenEventW(EVENT_MODIFY_STATE, False, SINGLE_INSTANCE_SNIP_EVENT)
+        if h_event:
+            try:
+                ok = bool(_kernel32.SetEvent(h_event))
+                logging.info("检测到已有实例在运行，已发送触发截图事件 (ok=%s)", ok)
+                return ok
+            finally:
+                try:
+                    _kernel32.CloseHandle(h_event)
+                except Exception:
+                    pass
+        if attempt < 3:
+            time.sleep(0.03)
+    logging.warning("检测到已有实例在运行，但未能打开唤醒事件 %s", SINGLE_INSTANCE_SNIP_EVENT)
+    return False
+
+
 if __name__ == '__main__':
     app = None
+    single_instance_listener = None
     try:
         if hasattr(Qt, 'AA_EnableHighDpiScaling'): QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         if hasattr(Qt, 'AA_UseHighDpiPixmaps'): QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -17533,13 +19823,12 @@ if __name__ == '__main__':
 
         shared_memory = QSharedMemory("ScreenCaptureTool_SingleInstance")
         if shared_memory.attach():
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Information)
-            msg.setWindowTitle("Already Running")
-            msg.setText("The screenshot tool is already running in the background.\n\nPress F1 to capture, F2 for OCR/Translate, F4 to record, F3 to pin!")
-            msg.exec_()
+            _signal_running_instance_to_capture()
+            shared_memory.detach()
             sys.exit(0)
         shared_memory.create(1)
+
+        single_instance_event = _kernel32.CreateEventW(None, False, False, SINGLE_INSTANCE_SNIP_EVENT)
 
         if check_for_snipaste():
             msg = QMessageBox()
@@ -17552,11 +19841,20 @@ if __name__ == '__main__':
         except Exception:
             pass
 
+        sync_autostart_path_if_enabled()
+
         hotkey_mgr = GlobalHotkeyManager()
         hotkey_mgr.install(app)
 
         ex = ScreenshotTool(hotkey_listener=hotkey_mgr)
         app.aboutToQuit.connect(ex._shutdown_update_workers)
+        app.aboutToQuit.connect(WindowPinManager.get_instance().clear_all)
+        if single_instance_event:
+            single_instance_listener = SingleInstanceTriggerListener(single_instance_event)
+            single_instance_listener.capture_requested.connect(ex.activate_capture, Qt.QueuedConnection)
+            app.aboutToQuit.connect(single_instance_listener.stop)
+            single_instance_listener.start()
+
         tray = AppTrayIcon(ex, hotkey_listener=hotkey_mgr)
         tray.show()
 
@@ -17574,6 +19872,7 @@ if __name__ == '__main__':
         hotkey_mgr.on_toggle_pins_pressed.connect(ex.toggle_all_pins_visibility)
         hotkey_mgr.on_paste_pin_pressed.connect(ex.paste_clipboard_as_pin)
         hotkey_mgr.on_restore_click_through_pressed.connect(ex.restore_all_click_through)
+        hotkey_mgr.on_pin_border_pressed.connect(ex.toggle_pin_border)
 
         sys.exit(app.exec_())
     except Exception as e:
@@ -17581,3 +19880,8 @@ if __name__ == '__main__':
         if app is not None:
             QMessageBox.critical(None, "Startup Error", f"The screenshot tool failed to start:\n{e}")
         raise
+    finally:
+        if single_instance_listener is not None:
+            single_instance_listener.stop()
+            single_instance_listener.wait(1000)
+            single_instance_listener.close_handle()
