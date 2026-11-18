@@ -126,7 +126,7 @@ from PyQt5.QtCore import (Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QShared
 from PyQt5.QtGui import (QPainter, QColor, QPen, QImage, QPixmap, QFont, QFontDatabase, QBrush, QWheelEvent,
                          QIcon, QCursor, QPainterPath, QPainterPathStroker, QFontMetrics, QFontMetricsF, QRegion,
                          QKeySequence, QLinearGradient, QTextDocument, QTextOption, QAbstractTextDocumentLayout,
-                         QPalette, QTextCursor)
+                         QPalette, QTextCursor, QTransform)
 
 # ==========================================
 # ENVIRONMENT & OCR SETUP
@@ -172,7 +172,7 @@ from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -197,6 +197,7 @@ TOOLBAR_TOOL_HOTKEY_SPECS = [
     ("hotkey_tool_text", "TEXT", "tool", "文本", "截图编辑时切换文字标注工具"),
     ("hotkey_tool_eraser", "ERASER", "tool", "橡皮擦", "截图编辑时切换橡皮擦工具"),
     ("hotkey_tool_crop", "CROP", "action", "裁剪选区", "截图编辑时进入或退出裁剪模式"),
+    ("hotkey_tool_rotate", "ROTATE", "tool", "旋转 / 翻转", "截图编辑时打开或关闭旋转与翻转选项"),
     ("hotkey_tool_translate", "TRANSLATE", "action", "一键翻译", "截图编辑时一键识别并翻译当前选区"),
 ]
 
@@ -2230,6 +2231,242 @@ def clone_edits(edits):
             else: new_e[k] = v
         cloned.append(new_e)
     return cloned
+
+
+def transform_pixmap_op(pixmap, op):
+    """对 QPixmap 执行无损正交旋转或镜像翻转。"""
+    if pixmap is None or pixmap.isNull():
+        return pixmap
+    if op == 'cw90':
+        return pixmap.transformed(QTransform().rotate(90), Qt.FastTransformation)
+    if op == 'ccw90':
+        return pixmap.transformed(QTransform().rotate(-90), Qt.FastTransformation)
+    if op == 'rot180':
+        return pixmap.transformed(QTransform().rotate(180), Qt.FastTransformation)
+    if op == 'flip_h':
+        return pixmap.transformed(QTransform().scale(-1, 1), Qt.FastTransformation)
+    if op == 'flip_v':
+        return pixmap.transformed(QTransform().scale(1, -1), Qt.FastTransformation)
+    return QPixmap(pixmap)
+
+
+def rotate_pixmap_angle(pixmap, angle_deg):
+    """按任意角度（顺时针为正）旋转 QPixmap；90° 倍数自动走无损快路径。"""
+    if pixmap is None or pixmap.isNull():
+        return pixmap
+    norm = float(angle_deg) % 360.0
+    if abs(norm) < 1e-6 or abs(norm - 360.0) < 1e-6:
+        return QPixmap(pixmap)
+    if abs(norm - 90.0) < 1e-6:
+        return transform_pixmap_op(pixmap, 'cw90')
+    if abs(norm - 180.0) < 1e-6:
+        return transform_pixmap_op(pixmap, 'rot180')
+    if abs(norm - 270.0) < 1e-6:
+        return transform_pixmap_op(pixmap, 'ccw90')
+    return pixmap.transformed(QTransform().rotate(float(angle_deg)), Qt.SmoothTransformation)
+
+
+def _transform_point_op_f(x, y, src_w, src_h, op):
+    # 标注坐标为连续几何坐标（像素边界），因此使用 W - x 而不是像素索引的 W - 1 - x
+    sw = max(1.0, float(src_w))
+    sh = max(1.0, float(src_h))
+    if op == 'cw90':
+        return (sh - y, x)
+    if op == 'ccw90':
+        return (y, sw - x)
+    if op == 'rot180':
+        return (sw - x, sh - y)
+    if op == 'flip_h':
+        return (sw - x, y)
+    if op == 'flip_v':
+        return (x, sh - y)
+    return (x, y)
+
+
+def _map_pointf_between(x, y, old_origin, old_disp_size, old_true_size,
+                        new_origin, new_disp_size, new_true_size, op=None):
+    lx = float(x) - float(old_origin.x())
+    ly = float(y) - float(old_origin.y())
+    if op is not None:
+        if old_disp_size != old_true_size and old_disp_size.width() > 0 and old_disp_size.height() > 0:
+            lx *= float(old_true_size.width()) / float(old_disp_size.width())
+            ly *= float(old_true_size.height()) / float(old_disp_size.height())
+        rx, ry = _transform_point_op_f(lx, ly, old_true_size.width(), old_true_size.height(), op)
+        if new_disp_size != new_true_size and new_true_size.width() > 0 and new_true_size.height() > 0:
+            rx *= float(new_disp_size.width()) / float(new_true_size.width())
+            ry *= float(new_disp_size.height()) / float(new_true_size.height())
+    else:
+        rx = lx * (float(new_disp_size.width()) / max(1.0, float(old_disp_size.width())))
+        ry = ly * (float(new_disp_size.height()) / max(1.0, float(old_disp_size.height())))
+    return (float(new_origin.x()) + rx, float(new_origin.y()) + ry)
+
+
+def _map_point_between(pt, old_origin, old_disp_size, old_true_size,
+                       new_origin, new_disp_size, new_true_size, op=None):
+    nx, ny = _map_pointf_between(
+        pt.x(), pt.y(),
+        old_origin, old_disp_size, old_true_size,
+        new_origin, new_disp_size, new_true_size,
+        op=op
+    )
+    return QPoint(int(round(nx)), int(round(ny)))
+
+
+def translate_edits(edits, delta):
+    """原地安全平移所有标注图元坐标，避免共享 QPoint 引用重复偏移。"""
+    if not edits or delta.isNull():
+        return
+    dx, dy = delta.x(), delta.y()
+    d = QPoint(dx, dy)
+    for edit in edits:
+        if 'rect' in edit and isinstance(edit['rect'], QRect):
+            edit['rect'] = edit['rect'].translated(d)
+        for key in ('pos', 'center', 'start', 'end', 'p1', 'p2'):
+            if key in edit and isinstance(edit[key], QPoint):
+                edit[key] = QPoint(edit[key].x() + dx, edit[key].y() + dy)
+        if 'points' in edit and isinstance(edit['points'], list):
+            edit['points'] = [QPoint(p.x() + dx, p.y() + dy) for p in edit['points']]
+
+
+def scale_edits(edits, old_origin, old_size, new_origin, new_size):
+    """将标注图元按比例从旧矩形映射到新矩形（用于超大图展示与导出分辨率映射）。"""
+    cloned = clone_edits(edits)
+    if not cloned:
+        return cloned
+    sx = float(new_size.width()) / max(1.0, float(old_size.width()))
+    sy = float(new_size.height()) / max(1.0, float(old_size.height()))
+    s_avg = (sx + sy) * 0.5
+
+    def _mp(pt):
+        return _map_point_between(pt, old_origin, old_size, old_size, new_origin, new_size, new_size, op=None)
+
+    for edit in cloned:
+        for key in ('pos', 'center', 'start', 'end', 'p1', 'p2'):
+            if key in edit and isinstance(edit[key], QPoint):
+                edit[key] = _mp(edit[key])
+        if 'points' in edit and isinstance(edit['points'], list):
+            edit['points'] = [_mp(p) for p in edit['points']]
+        if 'rect' in edit and isinstance(edit['rect'], QRect):
+            r = edit['rect']
+            p1 = _mp(r.topLeft())
+            p2 = _mp(r.bottomRight())
+            edit['rect'] = QRect(p1, p2).normalized()
+        for wk in ('thickness', 'strokeWidth', 'width', 'brushWidth', 'blockSize', 'cornerRadius', 'radius'):
+            if wk in edit and isinstance(edit[wk], (int, float)) and edit[wk] > 0:
+                edit[wk] = max(1, int(round(edit[wk] * s_avg)))
+        if edit.get('type') == 'TEXT':
+            fs = edit.get('fontSize')
+            if isinstance(fs, (int, float)) and fs > 0:
+                new_fs = max(6, int(round(fs * s_avg)))
+                edit['fontSize'] = new_fs
+                if isinstance(edit.get('font'), QFont):
+                    f = QFont(edit['font'])
+                    f.setPointSize(new_fs)
+                    edit['font'] = f
+            if edit.get('user_width') is not None:
+                edit['user_width'] = max(16, int(round(edit['user_width'] * sx)))
+            if edit.get('user_height') is not None:
+                edit['user_height'] = max(12, int(round(edit['user_height'] * sy)))
+    return cloned
+
+
+def transform_edits_op(edits, old_origin, old_disp_size, old_true_size,
+                       new_origin, new_disp_size, new_true_size, op):
+    """对全部矢量/位图标注执行正交旋转或翻转坐标映射，保持可编辑与可擦除。"""
+    cloned = clone_edits(edits)
+    if not cloned:
+        return cloned
+
+    def _mp(pt):
+        return _map_point_between(
+            pt, old_origin, old_disp_size, old_true_size,
+            new_origin, new_disp_size, new_true_size, op=op
+        )
+
+    old_scale_x = float(old_disp_size.width()) / max(1.0, float(old_true_size.width()))
+    new_scale_x = float(new_disp_size.width()) / max(1.0, float(new_true_size.width()))
+    disp_ratio = new_scale_x / max(1e-6, old_scale_x)
+
+    for edit in cloned:
+        t = edit.get('type')
+        if t == 'TEXT':
+            box_rect = get_text_annotation_rect(edit, QPoint(0, 0))
+            cx, cy = box_rect.center().x(), box_rect.center().y()
+            ncx, ncy = _map_pointf_between(
+                cx, cy, old_origin, old_disp_size, old_true_size,
+                new_origin, new_disp_size, new_true_size, op=op
+            )
+            bw = box_rect.width() * disp_ratio
+            bh = box_rect.height() * disp_ratio
+            rot = int(edit.get('rotation', 0)) % 360
+            if op == 'cw90':
+                new_rot = (rot + 90) % 360
+            elif op == 'ccw90':
+                new_rot = (rot - 90) % 360
+            elif op == 'rot180':
+                new_rot = (rot + 180) % 360
+            elif op in ('flip_h', 'flip_v'):
+                new_rot = (360 - rot) % 360 if rot in (90, 270) else rot
+            else:
+                new_rot = rot
+            new_rect = QRect(
+                int(round(ncx - bw * 0.5)),
+                int(round(ncy - bh * 0.5)),
+                max(8, int(round(bw))),
+                max(8, int(round(bh)))
+            )
+            edit['rect'] = new_rect
+            edit['pos'] = new_rect.topLeft()
+            edit['rotation'] = new_rot
+            if abs(disp_ratio - 1.0) > 1e-3:
+                fs = edit.get('fontSize')
+                if isinstance(fs, (int, float)) and fs > 0:
+                    new_fs = max(6, int(round(fs * disp_ratio)))
+                    edit['fontSize'] = new_fs
+                    if isinstance(edit.get('font'), QFont):
+                        f = QFont(edit['font'])
+                        f.setPointSize(new_fs)
+                        edit['font'] = f
+                if edit.get('user_width') is not None:
+                    edit['user_width'] = max(16, int(round(edit['user_width'] * disp_ratio)))
+                if edit.get('user_height') is not None:
+                    edit['user_height'] = max(12, int(round(edit['user_height'] * disp_ratio)))
+            continue
+
+        if 'rect' in edit and isinstance(edit['rect'], QRect):
+            r = edit['rect']
+            p1 = _mp(r.topLeft())
+            p2 = _mp(r.bottomRight())
+            edit['rect'] = QRect(p1, p2).normalized()
+        for key in ('pos', 'center', 'start', 'end', 'p1', 'p2'):
+            if key in edit and isinstance(edit[key], QPoint):
+                edit[key] = _mp(edit[key])
+        if 'points' in edit and isinstance(edit['points'], list):
+            edit['points'] = [_mp(p) for p in edit['points']]
+        if abs(disp_ratio - 1.0) > 1e-3:
+            for wk in ('thickness', 'strokeWidth', 'width', 'brushWidth', 'blockSize', 'cornerRadius', 'radius'):
+                if wk in edit and isinstance(edit[wk], (int, float)) and edit[wk] > 0:
+                    edit[wk] = max(1, int(round(edit[wk] * disp_ratio)))
+    return cloned
+
+
+def composite_pixmap_with_edits(base_pixmap, edits, origin=QPoint(0, 0), disp_size=None,
+                                base_source=None, base_origin=QPoint(0, 0)):
+    """将底图与当前标注合成为独立 QPixmap。"""
+    if base_pixmap is None or base_pixmap.isNull():
+        return QPixmap()
+    if not edits:
+        return QPixmap(base_pixmap)
+    final_img = QPixmap(base_pixmap)
+    src = base_source if (base_source is not None and not base_source.isNull()) else base_pixmap
+    painter = QPainter(final_img)
+    if disp_size is not None and disp_size != base_pixmap.size() and disp_size.width() > 0 and disp_size.height() > 0:
+        scaled = scale_edits(edits, origin, disp_size, QPoint(0, 0), base_pixmap.size())
+        draw_all_edits(painter, scaled, base_pixmap, QPoint(0, 0), base_origin=QPoint(0, 0))
+    else:
+        draw_all_edits(painter, edits, src, origin, base_origin=base_origin)
+    painter.end()
+    return final_img
 
 # ==========================================
 # 在线多语言翻译服务与工作线程 (支持中文、英文、菲律宾语、泰语)
@@ -6873,7 +7110,7 @@ def get_text_annotation_rect(edit, offset=QPoint(0, 0)):
     h = max(bounds.height(), float(uh)) if uh is not None else bounds.height()
     return QRectF(bounds.left(), bounds.top(), w, h)
 
-def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
+def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0), base_origin=QPoint(0, 0)):
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
     painter.setBrush(Qt.NoBrush)
@@ -6989,7 +7226,8 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 max_x = max(p.x() for p in points) + radius
                 min_y = min(p.y() for p in points) - radius
                 max_y = max(p.y() for p in points) + radius
-                bbox = QRect(QPoint(min_x, min_y), QPoint(max_x, max_y)).intersected(base_pixmap.rect())
+                world_bbox = QRect(QPoint(min_x, min_y), QPoint(max_x, max_y))
+                bbox = world_bbox.translated(-base_origin).intersected(base_pixmap.rect())
 
                 if not bbox.isEmpty() and bbox.width() > 0 and bbox.height() > 0:
                     sub_pix = base_pixmap.copy(bbox)
@@ -7035,7 +7273,7 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                     clip_path = stroker.createStroke(line_path)
 
                     painter.setClipPath(clip_path)
-                    painter.drawPixmap(bbox.translated(-offset).topLeft(), proc_pix)
+                    painter.drawPixmap(bbox.translated(base_origin - offset).topLeft(), proc_pix)
                     painter.restore()
 
         # 5. 画笔图元 (PenPaintItem)
@@ -7066,6 +7304,12 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 painter.save()
                 font = _extract_edit_font(edit)
                 box_rect = get_text_annotation_rect(edit, offset)
+                rot = int(edit.get('rotation', 0)) % 360
+                if rot:
+                    center = box_rect.center()
+                    painter.translate(center)
+                    painter.rotate(rot)
+                    painter.translate(-center)
 
                 bg_enabled = edit.get('bgEnabled', False)
                 bg_color = edit.get('bgColor')
@@ -7109,11 +7353,11 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 painter.drawPolygon(p2, p3, p4)
                 painter.setBrush(Qt.NoBrush)
         elif t == 'BLUR':
-            source_rect = edit['rect']
+            source_rect = edit['rect'].translated(-base_origin)
             if base_pixmap is not None:
                 source_rect = source_rect.intersected(base_pixmap.rect())
             if base_pixmap is not None and not source_rect.isEmpty():
-                draw_rect = source_rect.translated(-offset)
+                draw_rect = source_rect.translated(base_origin - offset)
                 tile_size = max(6, thickness * 3)
                 sw, sh = source_rect.width(), source_rect.height()
                 gw = max(1, sw // tile_size)
@@ -7130,7 +7374,8 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                 max_x = max(p.x() for p in points) + radius
                 min_y = min(p.y() for p in points) - radius
                 max_y = max(p.y() for p in points) + radius
-                bbox = QRect(QPoint(min_x, min_y), QPoint(max_x, max_y)).intersected(base_pixmap.rect())
+                world_bbox = QRect(QPoint(min_x, min_y), QPoint(max_x, max_y))
+                bbox = world_bbox.translated(-base_origin).intersected(base_pixmap.rect())
                 if not bbox.isEmpty():
                     tile_size = max(6, thickness * 3)
                     bw, bh = bbox.width(), bbox.height()
@@ -7150,7 +7395,7 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0)):
                         line_path.lineTo(pt - offset)
                     clip_path = stroker.createStroke(line_path)
                     painter.setClipPath(clip_path)
-                    painter.drawPixmap(bbox.translated(-offset).topLeft(), mosaic)
+                    painter.drawPixmap(bbox.translated(base_origin - offset).topLeft(), mosaic)
                     painter.restore()
         elif t == 'ELLIPSE':
             painter.setBrush(Qt.NoBrush)
@@ -7271,8 +7516,18 @@ def is_annotation_hit(edit, pos):
             text = edit.get('text', '')
             if not text: return False
             bounds = get_text_annotation_rect(edit)
+            rot = int(edit.get('rotation', 0)) % 360
+            test_pt = QPointF(pos)
+            if rot:
+                c = bounds.center()
+                rad = math.radians(-rot)
+                dx, dy = test_pt.x() - c.x(), test_pt.y() - c.y()
+                test_pt = QPointF(
+                    c.x() + dx * math.cos(rad) - dy * math.sin(rad),
+                    c.y() + dx * math.sin(rad) + dy * math.cos(rad)
+                )
             tol = 6.0
-            return bounds.adjusted(-tol, -tol, tol, tol).contains(QPointF(pos))
+            return bounds.adjusted(-tol, -tol, tol, tol).contains(test_pt)
 
         elif t in ['RECTANGLE', 'BLUR']:
             return 'rect' in edit and edit['rect'].contains(pos)
@@ -7928,6 +8183,99 @@ class VectorIconFactory:
             arr.lineTo(13.5, 11.8)
             arr.lineTo(16.8, 15.2)
             p.drawPath(arr)
+        elif name == 'rotate':
+            # SF Symbols rotate.right 风格：画布框 + 顺时针绕角旋转箭头
+            p.drawRoundedRect(QRectF(4.4, 11.2, 11.2, 11.2), 2.2, 2.2)
+            arc = QPainterPath()
+            arc.arcMoveTo(QRectF(7.6, 4.4, 14.0, 14.0), 112)
+            arc.arcTo(QRectF(7.6, 4.4, 14.0, 14.0), 112, -122)
+            p.drawPath(arc)
+            head = QPainterPath()
+            head.moveTo(18.2, 10.6)
+            head.lineTo(21.4, 13.0)
+            head.lineTo(23.6, 9.6)
+            p.drawPath(head)
+        elif name == 'rotate_ccw':
+            arc = QPainterPath()
+            arc.arcMoveTo(QRectF(5.5, 5.5, 16.0, 16.0), -45)
+            arc.arcTo(QRectF(5.5, 5.5, 16.0, 16.0), -45, 225)
+            p.drawPath(arc)
+            head = QPainterPath()
+            head.moveTo(3.4, 10.6)
+            head.lineTo(5.5, 14.2)
+            head.lineTo(8.6, 11.4)
+            p.drawPath(head)
+        elif name == 'rotate_cw':
+            arc = QPainterPath()
+            arc.arcMoveTo(QRectF(5.5, 5.5, 16.0, 16.0), 225)
+            arc.arcTo(QRectF(5.5, 5.5, 16.0, 16.0), 225, -225)
+            p.drawPath(arc)
+            head = QPainterPath()
+            head.moveTo(18.4, 11.4)
+            head.lineTo(21.5, 14.2)
+            head.lineTo(23.6, 10.6)
+            p.drawPath(head)
+        elif name == 'rotate_180':
+            top_arc = QPainterPath()
+            top_arc.arcMoveTo(QRectF(5.2, 5.2, 16.6, 16.6), 155)
+            top_arc.arcTo(QRectF(5.2, 5.2, 16.6, 16.6), 155, -130)
+            p.drawPath(top_arc)
+            h1 = QPainterPath()
+            h1.moveTo(18.6, 8.2)
+            h1.lineTo(21.4, 10.4)
+            h1.lineTo(22.6, 6.8)
+            p.drawPath(h1)
+            bot_arc = QPainterPath()
+            bot_arc.arcMoveTo(QRectF(5.2, 5.2, 16.6, 16.6), -25)
+            bot_arc.arcTo(QRectF(5.2, 5.2, 16.6, 16.6), -25, -130)
+            p.drawPath(bot_arc)
+            h2 = QPainterPath()
+            h2.moveTo(4.4, 20.2)
+            h2.lineTo(5.6, 16.6)
+            h2.lineTo(8.4, 18.8)
+            p.drawPath(h2)
+        elif name == 'flip_h':
+            dash_pen = QPen(color, max(1.6, stroke * 0.85), Qt.DashLine, Qt.RoundCap)
+            p.save()
+            p.setPen(dash_pen)
+            p.drawLine(QPointF(13.5, 4.5), QPointF(13.5, 22.5))
+            p.restore()
+            left_tri = QPainterPath()
+            left_tri.moveTo(10.5, 7.2)
+            left_tri.lineTo(4.6, 13.5)
+            left_tri.lineTo(10.5, 19.8)
+            left_tri.closeSubpath()
+            p.drawPath(left_tri)
+            right_tri = QPainterPath()
+            right_tri.moveTo(16.5, 7.2)
+            right_tri.lineTo(22.4, 13.5)
+            right_tri.lineTo(16.5, 19.8)
+            right_tri.closeSubpath()
+            p.save()
+            p.setBrush(QBrush(color))
+            p.drawPath(right_tri)
+            p.restore()
+        elif name == 'flip_v':
+            dash_pen = QPen(color, max(1.6, stroke * 0.85), Qt.DashLine, Qt.RoundCap)
+            p.save()
+            p.setPen(dash_pen)
+            p.drawLine(QPointF(4.5, 13.5), QPointF(22.5, 13.5))
+            p.restore()
+            top_tri = QPainterPath()
+            top_tri.moveTo(7.2, 10.5)
+            top_tri.lineTo(13.5, 4.6)
+            top_tri.lineTo(19.8, 10.5)
+            top_tri.closeSubpath()
+            p.drawPath(top_tri)
+            bot_tri = QPainterPath()
+            bot_tri.moveTo(7.2, 16.5)
+            bot_tri.lineTo(13.5, 22.4)
+            bot_tri.lineTo(19.8, 16.5)
+            bot_tri.closeSubpath()
+            p.save()
+            p.setBrush(QBrush(color))
+            p.drawPath(bot_tri)
+            p.restore()
 
         p.end()
         return pm
@@ -7963,13 +8311,218 @@ class SegmentedButton(QPushButton):
                 border: 1.2px solid rgba(182, 134, 58, 0.82);
                 color: #7A5110;
             }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(245, 233, 206, 0.95), stop:1 rgba(235, 217, 178, 0.92));
+                border: 1.5px solid #B6863A;
+                color: #6B450C;
+            }
             QPushButton:checked {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(250, 241, 222, 0.95), stop:1 rgba(240, 224, 190, 0.88));
                 color: #7A5110;
                 border: 1.5px solid #B6863A;
                 font-weight: 600;
             }
+            QPushButton:disabled {
+                background: rgba(244, 244, 245, 0.55);
+                color: #9CA3AF;
+                border: 1px solid rgba(203, 213, 225, 0.55);
+            }
         """)
+
+
+class RotateControlsWidget(QWidget):
+    """共享的旋转与镜像翻转选项面板（支持截图磨砂条与独立图片编辑窗两种风格）。"""
+    op_triggered = pyqtSignal(str)       # 'ccw90', 'cw90', 'rot180', 'flip_h', 'flip_v'
+    angle_changed = pyqtSignal(int)      # -180..180
+    angle_drag_finished = pyqtSignal()
+    apply_clicked = pyqtSignal()
+    reset_clicked = pyqtSignal()
+
+    def __init__(self, theme="frosted", parent=None):
+        super().__init__(parent)
+        self._theme = theme
+        l = QHBoxLayout(self)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        def _make_btn(icon_name, label, tip, accent=False):
+            if theme == "frosted":
+                btn = SegmentedButton(label, self)
+                btn.setCheckable(False)
+            else:
+                btn = QPushButton(label, self)
+                btn.setObjectName("codexPrimaryBtn" if accent else "editorToolBtn")
+                btn.setFocusPolicy(Qt.NoFocus)
+                btn.setAutoDefault(False)
+                btn.setDefault(False)
+                btn.setFixedHeight(26)
+                btn.setCursor(Qt.PointingHandCursor)
+            if icon_name:
+                fg = "#FFFFFF" if (theme != "frosted" and accent) else "#1D1D1F"
+                ico = QIcon()
+                ico.addPixmap(VectorIconFactory.create_pixmap(icon_name, QColor(fg)), QIcon.Normal, QIcon.Off)
+                ico.addPixmap(VectorIconFactory.create_pixmap(icon_name, QColor("#9CA3AF")), QIcon.Disabled, QIcon.Off)
+                btn.setIcon(ico)
+                btn.setIconSize(QSize(13, 13))
+            if tip:
+                btn.setToolTip(tip)
+            return btn
+
+        def _add_sep():
+            sep = QFrame(self)
+            sep.setFixedSize(1, 16)
+            sep.setStyleSheet(
+                "background: rgba(148, 163, 184, 0.35); border: none; margin: 0 2px;"
+                if theme == "frosted"
+                else "background: #E4E4E7; border: none; margin: 0 2px;"
+            )
+            l.addWidget(sep)
+
+        self.btn_ccw90 = _make_btn("rotate_ccw", "左转90°", "逆时针旋转 90°")
+        self.btn_cw90 = _make_btn("rotate_cw", "右转90°", "顺时针旋转 90°")
+        self.btn_180 = _make_btn("rotate_180", "180°", "旋转 180°")
+        self.btn_ccw90.clicked.connect(lambda: self.op_triggered.emit("ccw90"))
+        self.btn_cw90.clicked.connect(lambda: self.op_triggered.emit("cw90"))
+        self.btn_180.clicked.connect(lambda: self.op_triggered.emit("rot180"))
+        l.addWidget(self.btn_ccw90)
+        l.addWidget(self.btn_cw90)
+        l.addWidget(self.btn_180)
+
+        _add_sep()
+
+        self.btn_flip_h = _make_btn("flip_h", "水平翻转", "左右镜像翻转")
+        self.btn_flip_v = _make_btn("flip_v", "垂直翻转", "上下镜像翻转")
+        self.btn_flip_h.clicked.connect(lambda: self.op_triggered.emit("flip_h"))
+        self.btn_flip_v.clicked.connect(lambda: self.op_triggered.emit("flip_v"))
+        l.addWidget(self.btn_flip_h)
+        l.addWidget(self.btn_flip_v)
+
+        _add_sep()
+
+        lbl_ang = QLabel("角度:", self)
+        if theme != "frosted":
+            lbl_ang.setStyleSheet("color: #3F3F46; font-size: 12px; background: transparent;")
+        l.addWidget(lbl_ang)
+
+        self.slider_angle = QSlider(Qt.Horizontal, self)
+        self.slider_angle.setFocusPolicy(Qt.NoFocus)
+        self.slider_angle.setRange(-180, 180)
+        self.slider_angle.setSingleStep(1)
+        self.slider_angle.setPageStep(15)
+        self.slider_angle.setValue(0)
+        self.slider_angle.setFixedWidth(98)
+        self.slider_angle.setCursor(Qt.PointingHandCursor)
+        self.slider_angle.setToolTip("拖动自由旋转任意角度 (-180° ~ +180°)")
+        if theme == "frosted":
+            self.slider_angle.setStyleSheet("""
+                QSlider::groove:horizontal {
+                    height: 4px;
+                    background: rgba(142, 142, 147, 0.35);
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    background: #FFFFFF;
+                    border: 1.5px solid #B6863A;
+                    width: 12px;
+                    height: 12px;
+                    margin: -4px 0;
+                    border-radius: 7px;
+                }
+                QSlider::handle:horizontal:hover {
+                    background: #FAF1DE;
+                }
+            """)
+        l.addWidget(self.slider_angle)
+
+        self.spin_angle = QSpinBox(self)
+        self.spin_angle.setRange(-180, 180)
+        self.spin_angle.setValue(0)
+        self.spin_angle.setSuffix("°")
+        self.spin_angle.setFixedWidth(54)
+        self.spin_angle.setToolTip("精确输入旋转角度（正数顺时针，负数逆时针）")
+        if theme != "frosted":
+            self.spin_angle.setFixedHeight(26)
+            self.spin_angle.setStyleSheet(
+                "QSpinBox { background: #FFFFFF; color: #18181B; border: 1px solid #E4E4E7; "
+                "border-radius: 6px; padding: 1px 4px; font-size: 12px; }"
+                "QSpinBox:focus { border: 1.5px solid #0D0D0D; }"
+            )
+        l.addWidget(self.spin_angle)
+
+        self.btn_apply = _make_btn(None, "应用", "确认当前角度旋转", accent=True)
+        self.btn_reset = _make_btn(None, "重置", "取消未应用的自由角度预览")
+        if theme == "frosted":
+            self.btn_apply.setStyleSheet("""
+                QPushButton {
+                    background: #1f883d;
+                    color: #FFFFFF;
+                    border: none;
+                    border-radius: 5px;
+                    padding: 1px 8px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }
+                QPushButton:hover {
+                    background: #1a7f37;
+                }
+                QPushButton:disabled {
+                    background: rgba(203, 213, 225, 0.55);
+                    color: #9CA3AF;
+                }
+            """)
+        self.btn_apply.setEnabled(False)
+        self.btn_reset.setEnabled(False)
+        self.btn_apply.clicked.connect(self.apply_clicked.emit)
+        self.btn_reset.clicked.connect(self.reset_clicked.emit)
+        l.addWidget(self.btn_apply)
+        l.addWidget(self.btn_reset)
+
+        self.slider_angle.valueChanged.connect(self._on_slider_changed)
+        self.slider_angle.sliderReleased.connect(self.angle_drag_finished.emit)
+        self.spin_angle.valueChanged.connect(self._on_spin_changed)
+
+    def _sync_action_buttons(self, angle):
+        has_angle = int(angle) != 0
+        self.btn_apply.setEnabled(has_angle)
+        self.btn_reset.setEnabled(has_angle)
+
+    def _on_slider_changed(self, val):
+        prev = self.spin_angle.blockSignals(True)
+        try:
+            self.spin_angle.setValue(val)
+        finally:
+            self.spin_angle.blockSignals(prev)
+        self._sync_action_buttons(val)
+        self.angle_changed.emit(int(val))
+
+    def _on_spin_changed(self, val):
+        prev = self.slider_angle.blockSignals(True)
+        try:
+            self.slider_angle.setValue(val)
+        finally:
+            self.slider_angle.blockSignals(prev)
+        self._sync_action_buttons(val)
+        self.angle_changed.emit(int(val))
+
+    def current_angle(self):
+        return int(self.spin_angle.value())
+
+    def set_angle(self, angle, emit=False):
+        val = max(-180, min(180, int(angle)))
+        p1 = self.slider_angle.blockSignals(True)
+        p2 = self.spin_angle.blockSignals(True)
+        try:
+            self.slider_angle.setValue(val)
+            self.spin_angle.setValue(val)
+        finally:
+            self.slider_angle.blockSignals(p1)
+            self.spin_angle.blockSignals(p2)
+        self._sync_action_buttons(val)
+        if emit:
+            self.angle_changed.emit(val)
+
+    def is_dragging_angle(self):
+        return bool(self.slider_angle.isSliderDown())
 
 
 class ColorPaletteWidget(QWidget):
@@ -8164,7 +8717,13 @@ class SnipasteToolbar(FrostedBarWidget):
         self.btn_crop.clicked.connect(lambda: self.action_triggered.emit('CROP'))
         layout.addWidget(self.btn_crop)
 
-        # 11. 识图翻译
+        # 11. 旋转 / 翻转
+        self.btn_rotate = self._create_btn("rotate", "旋转 / 翻转", checkable=True)
+        self.btn_rotate.clicked.connect(lambda: self._on_tool_btn_clicked('ROTATE'))
+        layout.addWidget(self.btn_rotate)
+        self.tool_buttons['ROTATE'] = self.btn_rotate
+
+        # 12. 识图翻译
         self.btn_ocr = self._create_btn("ocr", "文字识别与多语言翻译 (F2)", checkable=False)
         self.btn_ocr.clicked.connect(lambda: self.action_triggered.emit('OCR'))
         layout.addWidget(self.btn_ocr)
@@ -8236,6 +8795,7 @@ class SnipasteToolbar(FrostedBarWidget):
         self.btn_text.setToolTip(_fmt("文本", "hotkey_tool_text"))
         self.btn_eraser.setToolTip(_fmt("橡皮擦 (拖拽整项擦除)", "hotkey_tool_eraser"))
         self.btn_crop.setToolTip(_fmt("裁剪选区", "hotkey_tool_crop"))
+        self.btn_rotate.setToolTip(_fmt("旋转 / 翻转", "hotkey_tool_rotate"))
         self.btn_ocr.setToolTip(_fmt("文字识别与多语言翻译", "hotkey_ocr", "F2"))
         self.btn_ocr_translate.setToolTip(_fmt("一键翻译当前截图 (结果显示方式可在设置中切换)", "hotkey_tool_translate"))
         hk_scroll = normalize_hotkey_str(s.get("hotkey_scroll", ""))
@@ -8341,6 +8901,7 @@ class ToolOptionsBar(FrostedBarWidget):
         self._init_mosaic_blur_panel()
         self._init_text_panel()
         self._init_eraser_panel()
+        self._init_rotate_panel()
 
         self.current_tool_name = None
 
@@ -8782,6 +9343,19 @@ class ToolOptionsBar(FrostedBarWidget):
 
         idx = self.stack.addWidget(panel)
         self.tool_indices['ERASER'] = idx
+
+    # 8. 旋转 / 翻转面板
+    def _init_rotate_panel(self):
+        panel = QWidget()
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(0)
+
+        self.rotate_controls = RotateControlsWidget(theme="frosted", parent=panel)
+        l.addWidget(self.rotate_controls)
+
+        idx = self.stack.addWidget(panel)
+        self.tool_indices['ROTATE'] = idx
 
     def set_tool(self, tool_name):
         self.current_tool_name = tool_name
@@ -10341,6 +10915,103 @@ class EditableImageLabel(QLabel):
         self.crop_drag_handle = None
         self.crop_drag_start_pos = None
         self.crop_drag_start_rect = None
+        self._rotation_preview_pixmap = None
+        self._rotation_preview_snapshot = None
+
+    def has_pending_rotation_preview(self):
+        return self._rotation_preview_snapshot is not None
+
+    def apply_orthogonal_transform(self, op):
+        """执行无损正交旋转或镜像翻转，保持矢量标注同步变换并写入撤销栈。"""
+        if getattr(self, 'inline_editor', None) and self.inline_editor.isVisible():
+            self.commit_text_edit()
+        if self.has_pending_rotation_preview():
+            self.commit_rotation_preview()
+        if self.base_pixmap is None or self.base_pixmap.isNull():
+            return
+        self.save_state()
+        old_size = self.base_pixmap.size()
+        new_pm = transform_pixmap_op(self.base_pixmap, op)
+        new_size = new_pm.size()
+        self.edits = transform_edits_op(
+            self.edits, QPoint(0, 0), old_size, old_size,
+            QPoint(0, 0), new_size, new_size, op
+        )
+        self.base_pixmap = new_pm
+        self.setPixmap(self.base_pixmap)
+        self.resize(self.base_pixmap.size())
+        if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+            self.toolbar_ref._sync_dim_badge()
+        self.update()
+
+    def preview_rotation_angle(self, angle_deg):
+        """实时预览任意角度旋转（无损从起点快照重算，不叠加插值模糊）。"""
+        angle = int(angle_deg)
+        if angle == 0:
+            self.cancel_rotation_preview()
+            return
+        if self._rotation_preview_snapshot is None:
+            if getattr(self, 'inline_editor', None) and self.inline_editor.isVisible():
+                self.commit_text_edit()
+            src_comp = composite_pixmap_with_edits(self.base_pixmap, self.edits, QPoint(0, 0))
+            self._rotation_preview_snapshot = {
+                'base_pixmap': QPixmap(self.base_pixmap),
+                'edits': clone_edits(self.edits),
+                'composite': src_comp,
+            }
+        src_comp = self._rotation_preview_snapshot['composite']
+        prev_pm = rotate_pixmap_angle(src_comp, angle)
+        self._rotation_preview_pixmap = prev_pm
+        self.setPixmap(prev_pm)
+        self.resize(prev_pm.size())
+        if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+            self.toolbar_ref._sync_dim_badge(prev_pm)
+        self.update()
+
+    def commit_rotation_preview(self):
+        """确认当前自由角度旋转预览并写入撤销栈。"""
+        if self._rotation_preview_snapshot is None:
+            return False
+        snap = self._rotation_preview_snapshot
+        prev_pm = self._rotation_preview_pixmap
+        self._rotation_preview_snapshot = None
+        self._rotation_preview_pixmap = None
+        if prev_pm is not None and not prev_pm.isNull():
+            self.undo_stack.append({
+                'edits': clone_edits(snap['edits']),
+                'base_pixmap': QPixmap(snap['base_pixmap']),
+            })
+            if len(self.undo_stack) > 50:
+                self.undo_stack.pop(0)
+            self.redo_stack.clear()
+            self.base_pixmap = QPixmap(prev_pm)
+            self.edits = []
+            self.setPixmap(self.base_pixmap)
+            self.resize(self.base_pixmap.size())
+            if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+                self.toolbar_ref._sync_dim_badge()
+        if hasattr(self.toolbar_ref, 'rotate_controls') and self.toolbar_ref.rotate_controls is not None:
+            self.toolbar_ref.rotate_controls.set_angle(0, emit=False)
+        self.update()
+        return True
+
+    def cancel_rotation_preview(self):
+        """取消未提交的自由角度旋转预览，恢复原图与标注。"""
+        if self._rotation_preview_snapshot is None:
+            return False
+        snap = self._rotation_preview_snapshot
+        self._rotation_preview_snapshot = None
+        self._rotation_preview_pixmap = None
+        self.base_pixmap = QPixmap(snap['base_pixmap'])
+        self.edits = clone_edits(snap['edits'])
+        self.setPixmap(self.base_pixmap)
+        self.resize(self.base_pixmap.size())
+        if hasattr(self.toolbar_ref, '_sync_dim_badge'):
+            self.toolbar_ref._sync_dim_badge()
+        if hasattr(self.toolbar_ref, 'rotate_controls') and self.toolbar_ref.rotate_controls is not None:
+            self.toolbar_ref.rotate_controls.set_angle(0, emit=False)
+        self.update()
+        return True
 
     def save_state(self):
         try:
@@ -10359,6 +11030,8 @@ class EditableImageLabel(QLabel):
         try:
             if getattr(self, 'inline_editor', None) and self.inline_editor.isVisible():
                 self.commit_text_edit()
+            if self.has_pending_rotation_preview():
+                return self.cancel_rotation_preview()
             if self.undo_stack:
                 if self.crop_mode and hasattr(self.toolbar_ref, 'cancel_crop'):
                     self.toolbar_ref.cancel_crop()
@@ -10383,6 +11056,8 @@ class EditableImageLabel(QLabel):
         try:
             if getattr(self, 'inline_editor', None) and self.inline_editor.isVisible():
                 self.commit_text_edit()
+            if self.has_pending_rotation_preview():
+                self.cancel_rotation_preview()
             if self.redo_stack:
                 if self.crop_mode and hasattr(self.toolbar_ref, 'cancel_crop'):
                     self.toolbar_ref.cancel_crop()
@@ -10415,7 +11090,8 @@ class EditableImageLabel(QLabel):
         try:
             super().paintEvent(event)
             painter = QPainter(self)
-            draw_all_edits(painter, self.edits, self.base_pixmap, QPoint(0, 0))
+            if self._rotation_preview_pixmap is None:
+                draw_all_edits(painter, self.edits, self.base_pixmap, QPoint(0, 0))
             
             if self.toolbar_ref.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None) and self.text_rect.width() > 3 and self.text_rect.height() > 3:
                 painter.save()
@@ -10523,7 +11199,9 @@ class EditableImageLabel(QLabel):
                 self.toolbar_ref.apply_crop()
                 return
             for i in range(len(self.edits) - 1, -1, -1):
-                if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                if (self.edits[i].get('type') == 'TEXT'
+                        and int(self.edits[i].get('rotation', 0)) % 360 == 0
+                        and is_annotation_hit(self.edits[i], pos)):
                     self.commit_text_edit()
                     if self.toolbar_ref.current_tool != 'TEXT':
                         self.toolbar_ref.set_tool('TEXT', getattr(self.toolbar_ref, 'btn_text', None))
@@ -10580,7 +11258,9 @@ class EditableImageLabel(QLabel):
             elif tool == 'TEXT':
                 clicked_idx = None
                 for i in range(len(self.edits) - 1, -1, -1):
-                    if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                    if (self.edits[i].get('type') == 'TEXT'
+                            and int(self.edits[i].get('rotation', 0)) % 360 == 0
+                            and is_annotation_hit(self.edits[i], pos)):
                         clicked_idx = i
                         break
 
@@ -10686,7 +11366,7 @@ class EditableImageLabel(QLabel):
                 self.setCursor(create_eraser_cursor())
             elif tool == 'TEXT':
                 hit_text = any(
-                    e.get('type') == 'TEXT' and is_annotation_hit(e, pos)
+                    e.get('type') == 'TEXT' and int(e.get('rotation', 0)) % 360 == 0 and is_annotation_hit(e, pos)
                     for e in self.edits
                 )
                 self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
@@ -10799,21 +11479,7 @@ class EditableImageLabel(QLabel):
         self.save_state()
         self.base_pixmap = self.base_pixmap.copy(valid_rect)
         offset = valid_rect.topLeft()
-        for edit in self.edits:
-            if 'rect' in edit and isinstance(edit['rect'], QRect):
-                edit['rect'].translate(-offset)
-            if 'pos' in edit and isinstance(edit['pos'], QPoint):
-                edit['pos'] -= offset
-            if 'start' in edit and isinstance(edit['start'], QPoint):
-                edit['start'] -= offset
-            if 'end' in edit and isinstance(edit['end'], QPoint):
-                edit['end'] -= offset
-            if 'p1' in edit and isinstance(edit['p1'], QPoint):
-                edit['p1'] -= offset
-            if 'p2' in edit and isinstance(edit['p2'], QPoint):
-                edit['p2'] -= offset
-            if 'points' in edit and isinstance(edit['points'], list):
-                edit['points'] = [p - offset for p in edit['points']]
+        translate_edits(self.edits, -offset)
         self.setPixmap(self.base_pixmap)
         self.resize(self.base_pixmap.size())
         if hasattr(self.toolbar_ref, '_sync_dim_badge'):
@@ -11088,6 +11754,20 @@ class ImageEditorDialog(QDialog):
                 background-color: #F7F7F8;
                 border-bottom: 1px solid #E4E4E7;
             }
+            QWidget#editorRotateBar {
+                background-color: #FAFAFB;
+                border-bottom: 1px solid #E4E4E7;
+            }
+            QWidget#editorRotateBar QPushButton#editorToolBtn {
+                padding: 3px 8px;
+                font-size: 12px;
+                min-height: 18px;
+            }
+            QWidget#editorRotateBar QPushButton#codexPrimaryBtn {
+                padding: 3px 10px;
+                font-size: 12px;
+                min-height: 18px;
+            }
             QWidget#editorStatusBar {
                 background-color: #F7F7F8;
                 border-top: 1px solid #E4E4E7;
@@ -11166,6 +11846,7 @@ class ImageEditorDialog(QDialog):
         layout.setSpacing(0)
 
         self.setup_toolbar(layout)
+        self.setup_rotate_bar(layout)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("editorCanvasArea")
@@ -11175,6 +11856,11 @@ class ImageEditorDialog(QDialog):
         self.img_label = EditableImageLabel(self.base_pixmap, self)
         self.scroll_area.setWidget(self.img_label)
         layout.addWidget(self.scroll_area, 1)
+
+        self.rotate_controls.op_triggered.connect(self.img_label.apply_orthogonal_transform)
+        self.rotate_controls.angle_changed.connect(self.img_label.preview_rotation_angle)
+        self.rotate_controls.apply_clicked.connect(self.img_label.commit_rotation_preview)
+        self.rotate_controls.reset_clicked.connect(self.img_label.cancel_rotation_preview)
 
         # 底部状态栏（快捷提示 + 实时分辨率）
         status_bar = QWidget()
@@ -11257,17 +11943,22 @@ class ImageEditorDialog(QDialog):
                 return
         self.copy_to_clipboard()
 
-    def _sync_dim_badge(self):
-        if hasattr(self, "dim_badge") and getattr(self.img_label, "base_pixmap", None) is not None:
-            pm = self.img_label.base_pixmap
+    def _sync_dim_badge(self, pm=None):
+        if pm is None:
+            pm = getattr(self.img_label, "base_pixmap", None)
+        if hasattr(self, "dim_badge") and pm is not None and not pm.isNull():
             self.dim_badge.setText(f"{pm.width()} × {pm.height()} px")
 
     def undo_edit(self):
         self.img_label.undo()
+        if hasattr(self, 'rotate_controls'):
+            self.rotate_controls.set_angle(0)
         self._sync_dim_badge()
 
     def redo_edit(self):
         self.img_label.redo()
+        if hasattr(self, 'rotate_controls'):
+            self.rotate_controls.set_angle(0)
         self._sync_dim_badge()
 
     def exec_nonmodal(self):
@@ -11323,6 +12014,7 @@ class ImageEditorDialog(QDialog):
         self.btn_erase = QPushButton()
         self.btn_color = QPushButton()
         self.btn_crop = QPushButton("裁剪")
+        self.btn_rotate = QPushButton("旋转")
         self.btn_ocr = QPushButton("识别")
         self.btn_history = QPushButton("历史")
         self.btn_settings = QPushButton("设置")
@@ -11377,6 +12069,7 @@ class ImageEditorDialog(QDialog):
 
         util_Specs = [
             (self.btn_crop, "crop", True, "裁剪区域", lambda: self.set_tool('CROP', self.btn_crop)),
+            (self.btn_rotate, "rotate", True, "旋转 / 翻转图像", lambda: self.set_tool('ROTATE', self.btn_rotate)),
             (self.btn_ocr, "ocr", True, "文字识别与翻译 (F2)", lambda: self.set_tool('OCR', self.btn_ocr)),
             (self.btn_history, "history", False, "截图历史记录", self.open_history),
             (self.btn_settings, None, False, "打开系统设置", self.open_settings),
@@ -11426,6 +12119,18 @@ class ImageEditorDialog(QDialog):
             layout.addWidget(btn)
 
         parent_layout.addWidget(self.toolbar)
+
+    def setup_rotate_bar(self, parent_layout):
+        self.rotate_bar = QWidget()
+        self.rotate_bar.setObjectName("editorRotateBar")
+        lay = QHBoxLayout(self.rotate_bar)
+        lay.setContentsMargins(12, 6, 12, 6)
+        lay.setSpacing(6)
+        self.rotate_controls = RotateControlsWidget(theme="codex", parent=self.rotate_bar)
+        lay.addWidget(self.rotate_controls)
+        lay.addStretch(1)
+        self.rotate_bar.hide()
+        parent_layout.addWidget(self.rotate_bar)
 
     def open_history(self):
         dlg = HistoryDialog(self, self.main_app_ref)
@@ -11492,6 +12197,12 @@ class ImageEditorDialog(QDialog):
         if getattr(self.img_label, 'inline_editor', None) and self.img_label.inline_editor.isVisible():
             self.img_label.commit_text_edit()
 
+        if getattr(self.img_label, 'has_pending_rotation_preview', None) and self.img_label.has_pending_rotation_preview() and (tool_name != 'ROTATE' or self.current_tool == 'ROTATE'):
+            self.img_label.commit_rotation_preview()
+            if hasattr(self, 'rotate_controls'):
+                self.rotate_controls.set_angle(0)
+            self._sync_dim_badge()
+
         # 退出裁剪模式（如果正在裁剪且不是切换到 CROP）
         if self.img_label.crop_mode and tool_name != 'CROP':
             self.cancel_crop()
@@ -11503,7 +12214,7 @@ class ImageEditorDialog(QDialog):
 
         tool_btns = [
             self.btn_rect, self.btn_ellipse, self.btn_line, self.btn_pen,
-            self.btn_highlighter, self.btn_step, self.btn_crop, self.btn_text,
+            self.btn_highlighter, self.btn_step, self.btn_rotate, self.btn_crop, self.btn_text,
             self.btn_blur, self.btn_erase, self.btn_ocr
         ]
 
@@ -11511,11 +12222,16 @@ class ImageEditorDialog(QDialog):
             self.current_tool = None
             for btn in tool_btns:
                 btn.setChecked(False)
+            if hasattr(self, 'rotate_bar'):
+                self.rotate_bar.hide()
             return
 
         self.current_tool = tool_name
         for btn in tool_btns:
             btn.setChecked(btn is active_btn)
+
+        if hasattr(self, 'rotate_bar'):
+            self.rotate_bar.setVisible(tool_name == 'ROTATE')
 
         # 进入裁剪模式
         if tool_name == 'CROP':
@@ -11533,6 +12249,12 @@ class ImageEditorDialog(QDialog):
             if getattr(self.img_label, 'inline_editor', None) and self.img_label.inline_editor.isVisible():
                 self.img_label.commit_text_edit()
                 return
+            if self.img_label.has_pending_rotation_preview():
+                self.img_label.cancel_rotation_preview()
+                if hasattr(self, 'rotate_controls'):
+                    self.rotate_controls.set_angle(0)
+                self._sync_dim_badge()
+                return
             if self.current_tool:
                 self.set_tool(None)
                 return
@@ -11541,6 +12263,17 @@ class ImageEditorDialog(QDialog):
                 return
         elif self.img_label.crop_mode and key in (Qt.Key_Return, Qt.Key_Enter):
             self.apply_crop()
+            return
+        elif (self.current_tool == 'ROTATE' or self.img_label.has_pending_rotation_preview()) and key in (Qt.Key_Return, Qt.Key_Enter):
+            fw = QApplication.focusWidget()
+            if fw is not None and hasattr(fw, 'interpretText'):
+                fw.interpretText()
+                fw.clearFocus()
+            if self.img_label.has_pending_rotation_preview():
+                self.img_label.commit_rotation_preview()
+            if hasattr(self, 'rotate_controls'):
+                self.rotate_controls.set_angle(0)
+            self._sync_dim_badge()
             return
         elif key == Qt.Key_F2 and not (mods & (Qt.ControlModifier | Qt.AltModifier)):
             self.set_tool('OCR', self.btn_ocr)
@@ -11588,19 +12321,20 @@ class ImageEditorDialog(QDialog):
         self.set_tool(None, self.btn_crop)
 
     def get_final_static_image(self):
+        if getattr(self.img_label, '_rotation_preview_pixmap', None) is not None and not self.img_label._rotation_preview_pixmap.isNull():
+            return QPixmap(self.img_label._rotation_preview_pixmap)
         if not self.img_label.edits:
             return self.img_label.base_pixmap
-        final_img = QPixmap(self.img_label.base_pixmap.size())
-        final_img.fill(Qt.transparent)
-        painter = QPainter(final_img)
-        painter.drawPixmap(0, 0, self.img_label.base_pixmap)
-        draw_all_edits(painter, self.img_label.edits, self.img_label.base_pixmap, QPoint(0,0))
-        painter.end()
-        return final_img
+        return composite_pixmap_with_edits(self.img_label.base_pixmap, self.img_label.edits, QPoint(0, 0))
 
     def copy_to_clipboard(self):
         try:
             self.img_label.commit_text_edit()
+            if self.img_label.has_pending_rotation_preview():
+                self.img_label.commit_rotation_preview()
+                if hasattr(self, 'rotate_controls'):
+                    self.rotate_controls.set_angle(0)
+                self._sync_dim_badge()
             final_img = self.get_final_static_image()
             if final_img and not final_img.isNull():
                 QApplication.clipboard().setPixmap(final_img)
@@ -11615,6 +12349,11 @@ class ImageEditorDialog(QDialog):
     def pin_to_screen(self):
         try:
             self.img_label.commit_text_edit()
+            if self.img_label.has_pending_rotation_preview():
+                self.img_label.commit_rotation_preview()
+                if hasattr(self, 'rotate_controls'):
+                    self.rotate_controls.set_angle(0)
+                self._sync_dim_badge()
             final_img = self.get_final_static_image()
             if self.main_app_ref and final_img and not final_img.isNull():
                 self.main_app_ref.create_pinned_window(final_img)
@@ -11628,6 +12367,11 @@ class ImageEditorDialog(QDialog):
     def save_image(self):
         try:
             self.img_label.commit_text_edit()
+            if self.img_label.has_pending_rotation_preview():
+                self.img_label.commit_rotation_preview()
+                if hasattr(self, 'rotate_controls'):
+                    self.rotate_controls.set_angle(0)
+                self._sync_dim_badge()
             final_img = self.get_final_static_image()
             if final_img and not final_img.isNull():
                 ok = save_image_dialog(self, final_img, default_prefix="edited")
@@ -15765,6 +16509,11 @@ class ScreenshotTool(QWidget):
         self.current_tool = None
         self._cached_selection_pixmap = None
         self._cached_selection_key = None
+        self._rotated_base_pixmap = None
+        self._rotated_display_cache = None
+        self._rotation_preview_pixmap = None
+        self._rotation_preview_snapshot = None
+        self._rotation_preview_display_cache = None
         self.crop_rect = None
         self.crop_mode = False
         self.crop_ratio = None
@@ -16043,52 +16792,260 @@ class ScreenshotTool(QWidget):
             except RuntimeError:
                 pass
 
-    def save_state(self):
-        state = {
+    def _snapshot_state(self):
+        return {
             'edits': clone_edits(self.edits),
-            'selection_rect': QRect(self.selection_rect)
+            'selection_rect': QRect(self.selection_rect),
+            'rotated_base_pixmap': getattr(self, '_rotated_base_pixmap', None)
         }
-        self.undo_stack.append(state)
+
+    def save_state(self):
+        self.undo_stack.append(self._snapshot_state())
         self.redo_stack.clear()
         self.update_undo_redo_states()
 
+    def _restore_state(self, state):
+        self.edits = state['edits']
+        new_rect = state['selection_rect']
+        new_rot = state.get('rotated_base_pixmap')
+        old_rot = getattr(self, '_rotated_base_pixmap', None)
+        content_changed = (new_rect != self.selection_rect) or (new_rot is not old_rot)
+        self.selection_rect = new_rect
+        self._rotated_base_pixmap = new_rot
+        self._rotated_display_cache = None
+        self.update_undo_redo_states()
+        self.update()
+        if content_changed:
+            self._invalidate_text_doc()
+            self.update_toolbar_positions()
+            if self.state == "EDITING":
+                self._schedule_auto_text_ocr()
+
     def undo(self):
+        if self.has_pending_rotation_preview():
+            self.cancel_rotation_preview()
+            return
         if self.undo_stack:
             self.commit_text_edit()
-            self.redo_stack.append({
-                'edits': clone_edits(self.edits),
-                'selection_rect': QRect(self.selection_rect)
-            })
-            state = self.undo_stack.pop()
-            self.edits = state['edits']
-            new_rect = state['selection_rect']
-            sel_changed = new_rect != self.selection_rect
-            self.selection_rect = new_rect
-            self.update_undo_redo_states()
-            self.update()
-            if sel_changed:
-                self._invalidate_text_doc()
-                if self.state == "EDITING":
-                    self._schedule_auto_text_ocr()
+            self.redo_stack.append(self._snapshot_state())
+            self._restore_state(self.undo_stack.pop())
 
     def redo(self):
+        if self.has_pending_rotation_preview():
+            self.cancel_rotation_preview()
         if self.redo_stack:
             self.commit_text_edit()
-            self.undo_stack.append({
-                'edits': clone_edits(self.edits),
-                'selection_rect': QRect(self.selection_rect)
-            })
-            state = self.redo_stack.pop()
-            self.edits = state['edits']
-            new_rect = state['selection_rect']
-            sel_changed = new_rect != self.selection_rect
-            self.selection_rect = new_rect
-            self.update_undo_redo_states()
-            self.update()
-            if sel_changed:
-                self._invalidate_text_doc()
-                if self.state == "EDITING":
-                    self._schedule_auto_text_ocr()
+            self.undo_stack.append(self._snapshot_state())
+            self._restore_state(self.redo_stack.pop())
+
+    # ---------- 旋转 / 翻转 ----------
+    def _reset_rotation_state(self):
+        self._rotated_base_pixmap = None
+        self._rotated_display_cache = None
+        self._rotation_preview_pixmap = None
+        self._rotation_preview_snapshot = None
+        self._rotation_preview_display_cache = None
+        rc = getattr(getattr(self, 'options_bar', None), 'rotate_controls', None)
+        if rc is not None:
+            rc.set_angle(0, emit=False)
+
+    def has_pending_rotation_preview(self):
+        return getattr(self, '_rotation_preview_pixmap', None) is not None
+
+    def _selection_rect_to_base(self, rect):
+        """把屏幕坐标中的矩形（位于选区内）换算为旋转底图的像素矩形"""
+        base = getattr(self, '_rotated_base_pixmap', None)
+        sel = self.selection_rect
+        rel = QRect(rect).intersected(sel).translated(-sel.topLeft())
+        if base is None or base.isNull() or rel.isEmpty():
+            return rel
+        sx = base.width() / float(max(1, sel.width()))
+        sy = base.height() / float(max(1, sel.height()))
+        x1 = int(round(rel.left() * sx))
+        y1 = int(round(rel.top() * sy))
+        x2 = int(round((rel.left() + rel.width()) * sx))
+        y2 = int(round((rel.top() + rel.height()) * sy))
+        return QRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1)).intersected(base.rect())
+
+    def _crop_selection_content(self, rect):
+        """截取选区内某个屏幕矩形对应的底图内容（兼容旋转后的选区）"""
+        base = getattr(self, '_rotated_base_pixmap', None)
+        if base is None or base.isNull():
+            return self.original_screen.copy(rect)
+        return base.copy(self._selection_rect_to_base(rect))
+
+    def _selection_base_pixmap(self):
+        """当前选区的底图（不含标注，真实分辨率）；旋转后返回旋转后的底图"""
+        rot = getattr(self, '_rotated_base_pixmap', None)
+        if rot is not None and not rot.isNull():
+            return QPixmap(rot)
+        if getattr(self, 'original_screen', None) is None or self.selection_rect.isNull():
+            return QPixmap()
+        return self.original_screen.copy(self.selection_rect)
+
+    def _scaled_for_selection(self, pm, cache_attr):
+        if pm is None or pm.isNull():
+            return None
+        size = self.selection_rect.size()
+        if pm.size() == size:
+            return pm
+        key = (pm.cacheKey(), size.width(), size.height())
+        cache = getattr(self, cache_attr, None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        scaled = pm.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        setattr(self, cache_attr, (key, scaled))
+        return scaled
+
+    def _get_rotated_display_pixmap(self):
+        """旋转后底图按选区显示尺寸缩放后的像素图（未旋转时返回 None）"""
+        return self._scaled_for_selection(getattr(self, '_rotated_base_pixmap', None), '_rotated_display_cache')
+
+    def _get_rotation_preview_display_pixmap(self):
+        return self._scaled_for_selection(getattr(self, '_rotation_preview_pixmap', None), '_rotation_preview_display_cache')
+
+    def _draw_edits_on_canvas(self, painter):
+        """在截图画布上绘制标注；任意角度预览时标注已合入预览图，不再重复绘制"""
+        if self.has_pending_rotation_preview():
+            return
+        rot_disp = self._get_rotated_display_pixmap()
+        if rot_disp is not None:
+            draw_all_edits(painter, self.edits, rot_disp, QPoint(0, 0), base_origin=self.selection_rect.topLeft())
+        else:
+            draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
+
+    def _compute_rotated_selection_rect(self, true_size, center_pt):
+        """按真实尺寸计算新选区：超出屏幕时等比缩小显示，并保持中心、限制在屏幕内"""
+        sw, sh = max(1, self.width()), max(1, self.height())
+        tw, th = max(1, true_size.width()), max(1, true_size.height())
+        scale = min(1.0, sw / tw, sh / th)
+        dw, dh = max(1, int(round(tw * scale))), max(1, int(round(th * scale)))
+        x = int(round(center_pt.x() - dw / 2.0))
+        y = int(round(center_pt.y() - dh / 2.0))
+        x = max(0, min(x, sw - dw))
+        y = max(0, min(y, sh - dh))
+        return QRect(x, y, dw, dh)
+
+    def _after_rotation_change(self):
+        self._rotated_display_cache = None
+        self._rotation_preview_display_cache = None
+        self._cached_selection_pixmap = None
+        self._cached_selection_key = None
+        self._reset_text_selection_state()
+        self._invalidate_text_doc()
+        self.update_toolbar_positions()
+        self.update()
+        if self.state == "EDITING":
+            self._schedule_auto_text_ocr()
+
+    def apply_orthogonal_transform(self, op):
+        if self.state != "EDITING" or self.selection_rect.isNull():
+            return
+        self.commit_text_edit()
+        if self.has_pending_rotation_preview():
+            self.commit_rotation_preview()
+        if self.crop_mode:
+            self.exit_crop_mode()
+        cur = self._selection_base_pixmap()
+        if cur.isNull():
+            return
+        new_pm = transform_pixmap_op(cur, op)
+        if new_pm is None or new_pm.isNull():
+            return
+        old_rect = QRect(self.selection_rect)
+        new_rect = self._compute_rotated_selection_rect(new_pm.size(), QRectF(old_rect).center())
+        self.save_state()
+        self.edits = transform_edits_op(
+            self.edits, old_rect.topLeft(), old_rect.size(), cur.size(),
+            new_rect.topLeft(), new_rect.size(), new_pm.size(), op
+        )
+        self._rotated_base_pixmap = new_pm
+        self.selection_rect = new_rect
+        self._after_rotation_change()
+
+    def preview_rotation_angle(self, angle_deg):
+        if self.state != "EDITING" or self.selection_rect.isNull():
+            return
+        angle = int(angle_deg) % 360
+        if angle > 180:
+            angle -= 360
+        if angle == 0:
+            if self.has_pending_rotation_preview():
+                self.cancel_rotation_preview(reset_controls=False)
+            return
+        self.commit_text_edit()
+        if self.crop_mode:
+            self.exit_crop_mode()
+        snap = getattr(self, '_rotation_preview_snapshot', None)
+        if snap is None:
+            source = self.get_final_static_image()
+            if source is None or source.isNull():
+                return
+            snap = {
+                'source': source,
+                'selection_rect': QRect(self.selection_rect),
+            }
+            self._rotation_preview_snapshot = snap
+        rotated = rotate_pixmap_angle(snap['source'], angle)
+        if rotated is None or rotated.isNull():
+            return
+        self._rotation_preview_pixmap = rotated
+        self._rotation_preview_display_cache = None
+        self.selection_rect = self._compute_rotated_selection_rect(rotated.size(), QRectF(snap['selection_rect']).center())
+        dragging = False
+        rc = getattr(getattr(self, 'options_bar', None), 'rotate_controls', None)
+        if rc is not None:
+            dragging = rc.is_dragging_angle()
+        self._reset_text_selection_state()
+        if not dragging:
+            self.update_toolbar_positions()
+        self.update()
+
+    def _on_rotate_drag_finished(self):
+        self.update_toolbar_positions()
+
+    def commit_rotation_preview(self):
+        if not self.has_pending_rotation_preview():
+            return
+        snap = self._rotation_preview_snapshot or {}
+        rotated = self._rotation_preview_pixmap
+        new_rect = QRect(self.selection_rect)
+        # 以预览前的状态入撤销栈
+        self.selection_rect = QRect(snap.get('selection_rect', new_rect))
+        self.save_state()
+        self.selection_rect = new_rect
+        self.edits = []
+        self._rotated_base_pixmap = rotated
+        self._rotation_preview_pixmap = None
+        self._rotation_preview_snapshot = None
+        rc = getattr(getattr(self, 'options_bar', None), 'rotate_controls', None)
+        if rc is not None:
+            rc.set_angle(0, emit=False)
+        self._after_rotation_change()
+
+    def cancel_rotation_preview(self, reset_controls=True):
+        if not self.has_pending_rotation_preview():
+            if reset_controls:
+                rc = getattr(getattr(self, 'options_bar', None), 'rotate_controls', None)
+                if rc is not None:
+                    rc.set_angle(0, emit=False)
+            return
+        snap = self._rotation_preview_snapshot or {}
+        if 'selection_rect' in snap:
+            self.selection_rect = QRect(snap['selection_rect'])
+        self._rotation_preview_pixmap = None
+        self._rotation_preview_snapshot = None
+        self._rotation_preview_display_cache = None
+        if reset_controls:
+            rc = getattr(getattr(self, 'options_bar', None), 'rotate_controls', None)
+            if rc is not None:
+                rc.set_angle(0, emit=False)
+        self.update_toolbar_positions()
+        self.update()
+
+    def _apply_rotate_controls_angle(self):
+        """“应用”按钮：提交当前角度预览"""
+        self.commit_rotation_preview()
 
     def erase_annotation_under_mouse(self, pos):
         for i in range(len(self.edits) - 1, -1, -1):
@@ -16111,6 +17068,13 @@ class ScreenshotTool(QWidget):
 
         self.options_bar = ToolOptionsBar(self)
         self.options_bar.options_changed.connect(self.on_tool_options_changed)
+        rc = getattr(self.options_bar, 'rotate_controls', None)
+        if rc is not None:
+            rc.op_triggered.connect(self.apply_orthogonal_transform)
+            rc.angle_changed.connect(self.preview_rotation_angle)
+            rc.angle_drag_finished.connect(self._on_rotate_drag_finished)
+            rc.apply_clicked.connect(self._apply_rotate_controls_angle)
+            rc.reset_clicked.connect(self.cancel_rotation_preview)
 
         # 映射工具栏按钮，使内部方法与异步逻辑完全打通
         self.btn_crop = self.toolbar.btn_crop
@@ -16332,6 +17296,7 @@ class ScreenshotTool(QWidget):
         self.edits = []
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self._reset_rotation_state()
         self.ocr_intent = ocr_intent
         self.recording_intent = recording_intent
         self.mode_banner_dismissed = False
@@ -16483,6 +17448,7 @@ class ScreenshotTool(QWidget):
                 self.selection_rect = QRect()
                 self._cached_selection_pixmap = None
                 self._cached_selection_key = None
+            self._reset_rotation_state()
             self.original_screen = None
             self.original_screen_image = None
             self.blurred_screen = None
@@ -16588,7 +17554,13 @@ class ScreenshotTool(QWidget):
         # 1. 若已有有效选区正在编辑，直接以该选区开启 OCR
         if self.state == "EDITING" and hasattr(self, 'selection_rect') and not self.selection_rect.isNull() and self.selection_rect.width() > 10:
             rect = QRect(self.selection_rect)
-            sub_pixmap = self.original_screen.copy(rect) if (hasattr(self, 'original_screen') and self.original_screen) else None
+            if self.has_pending_rotation_preview():
+                self.commit_rotation_preview()
+                rect = QRect(self.selection_rect)
+            if getattr(self, '_rotated_base_pixmap', None) is not None:
+                sub_pixmap = self._selection_base_pixmap()
+            else:
+                sub_pixmap = self.original_screen.copy(rect) if (hasattr(self, 'original_screen') and self.original_screen) else None
             self.hide_app(keep_history=False)
             self.start_quick_ocr_session(rect, sub_pixmap)
             return
@@ -16756,10 +17728,10 @@ class ScreenshotTool(QWidget):
 
     def _current_capture_image(self, include_annotations=True):
         self.commit_text_edit()
-        if not include_annotations and hasattr(self, 'original_screen') and self.original_screen and not self.selection_rect.isNull():
+        if not include_annotations and hasattr(self, 'original_screen') and self.original_screen and not self.selection_rect.isNull() and not self.has_pending_rotation_preview():
             has_content_edit = any(e.get('type') in ('TEXT', 'MOSAIC_BLUR', 'BLUR_STROKE') for e in (self.edits or []))
             if not has_content_edit:
-                pixmap = self.original_screen.copy(self.selection_rect)
+                pixmap = self._selection_base_pixmap()
                 return pixmap.toImage() if pixmap is not None and not pixmap.isNull() else QImage()
         pixmap = self.get_final_static_image()
         return pixmap.toImage() if pixmap is not None and not pixmap.isNull() else QImage()
@@ -17195,6 +18167,8 @@ class ScreenshotTool(QWidget):
 
     def translate_current_capture(self):
         """一键翻译：OCR 后生成覆盖译文的图片，按设置显示单图或左右对照。"""
+        if self.has_pending_rotation_preview():
+            self.commit_rotation_preview()
         if not self._valid_capture_selection():
             QMessageBox.information(None, "一键翻译", "请先框选需要翻译的截图区域。")
             return
@@ -17431,11 +18405,13 @@ class ScreenshotTool(QWidget):
 
         if self.current_tool in ['ERASER', 'ERASE']:
             self.setCursor(create_eraser_cursor())
+        elif self.current_tool == 'ROTATE':
+            self.setCursor(Qt.ArrowCursor)
         elif self.current_tool == 'TEXT':
             hit_text = (
                 pos is not None
                 and self.state == "EDITING"
-                and any(e.get('type') == 'TEXT' and is_annotation_hit(e, pos) for e in self.edits)
+                and any(e.get('type') == 'TEXT' and int(e.get('rotation', 0) or 0) % 360 == 0 and is_annotation_hit(e, pos) for e in self.edits)
             )
             self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
         elif self.current_tool in ['MOSAIC_BLUR', 'BLUR']:
@@ -17472,6 +18448,8 @@ class ScreenshotTool(QWidget):
 
     def set_tool(self, tool_name, active_btn=None):
         self.commit_text_edit()
+        if self.has_pending_rotation_preview() and (tool_name != 'ROTATE' or self.current_tool == 'ROTATE'):
+            self.commit_rotation_preview()
         if self.crop_mode and tool_name != 'CROP':
             self.cancel_crop()
 
@@ -17542,6 +18520,8 @@ class ScreenshotTool(QWidget):
         r = self.selection_rect
         if not r.isValid() or r.isNull():
             return None
+        if self._rotation_locked_edges():
+            return 'move' if (allow_move and r.contains(pos)) else None
         margin = min(10, max(3, min(r.width(), r.height()) // 3))
         x, y = pos.x(), pos.y()
         in_x = (r.left() - margin <= x <= r.right() + margin)
@@ -17561,6 +18541,10 @@ class ScreenshotTool(QWidget):
         if bottom: return 'bottom'
         if r.contains(pos): return 'move' if allow_move else None
         return None
+
+    def _rotation_locked_edges(self):
+        """旋转后的选区内容已脱离屏幕原图，只允许整体移动，不允许拉伸边缘"""
+        return getattr(self, '_rotated_base_pixmap', None) is not None or self.has_pending_rotation_preview()
 
     def commit_text_edit(self):
         if not hasattr(self, 'inline_editor') or not self.inline_editor.isVisible():
@@ -17783,11 +18767,16 @@ class ScreenshotTool(QWidget):
                         nx = max(0, min(max(0, self.width() - r.width()), r.x() + dx))
                         ny = max(0, min(max(0, self.height() - r.height()), r.y() + dy))
                         if nx != r.x() or ny != r.y():
+                            moved_by = QPoint(nx - r.x(), ny - r.y())
                             r.moveTo(nx, ny)
                             self.selection_rect = r
                             self._reset_text_selection_state()
-                            self._invalidate_text_doc()
-                            self._schedule_auto_text_ocr()
+                            if self._rotation_locked_edges():
+                                # 旋转后的内容随选区一起平移，标注同步跟随，无需重新识别
+                                translate_edits(self.edits, moved_by)
+                            else:
+                                self._invalidate_text_doc()
+                                self._schedule_auto_text_ocr()
                             self.update_toolbar_positions()
                             self.update()
                         return
@@ -17870,6 +18859,9 @@ class ScreenshotTool(QWidget):
                 self.copy_image()
                 return
         elif event.key() == Qt.Key_Escape: 
+            if self.has_pending_rotation_preview():
+                self.cancel_rotation_preview()
+                return
             if self.current_tool is not None:
                 self.set_tool(None)
                 self.show_toolbar()
@@ -18012,6 +19004,15 @@ class ScreenshotTool(QWidget):
                 for r in outer_region.rects():
                     painter.fillRect(r, mask_color)
 
+                # 旋转/翻转后的选区内容：以旋转后的底图覆盖原屏画面（透明角落以遮罩色填充）
+                if self.state == "EDITING":
+                    rot_disp = self._get_rotation_preview_display_pixmap()
+                    if rot_disp is None:
+                        rot_disp = self._get_rotated_display_pixmap()
+                    if rot_disp is not None:
+                        painter.fillRect(self.selection_rect, mask_color)
+                        painter.drawPixmap(self.selection_rect.topLeft(), rot_disp)
+
             # 3. 顶部/底部智能避让指引胶囊条（拖选时彻底隐藏，靠近时自动上下对调，点击可关闭）
             if (is_ocr or is_rec) and self.state == "SELECTING":
                 self._draw_mode_banner(painter, is_ocr, is_rec)
@@ -18052,7 +19053,7 @@ class ScreenshotTool(QWidget):
                 if self.state == "EDITING":
                     painter.setBrush(Qt.NoBrush)
                     painter.setClipRect(self.selection_rect)
-                    draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
+                    self._draw_edits_on_canvas(painter)
 
                     if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None) and self.text_rect.width() > 3 and self.text_rect.height() > 3:
                         painter.save()
@@ -18073,7 +19074,10 @@ class ScreenshotTool(QWidget):
                             painter.fillRect(r, QColor(0, 0, 0, 150))
 
                         painter.setClipRect(self.crop_rect)
-                        draw_all_edits(painter, self.edits, self.original_screen, QPoint(0, 0))
+                        rot_disp = self._get_rotated_display_pixmap() if not self.has_pending_rotation_preview() else None
+                        if rot_disp is not None:
+                            painter.drawPixmap(self.selection_rect.topLeft(), rot_disp)
+                        self._draw_edits_on_canvas(painter)
                         painter.setClipping(False)
 
                         # 三分线
@@ -18125,7 +19129,9 @@ class ScreenshotTool(QWidget):
         # 双击已添加的 TEXT 标注图元：自动切入文字工具并就地编辑
         if self.state == "EDITING" and not self.crop_mode:
             for i in range(len(self.edits) - 1, -1, -1):
-                if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                if (self.edits[i].get('type') == 'TEXT'
+                        and int(self.edits[i].get('rotation', 0)) % 360 == 0
+                        and is_annotation_hit(self.edits[i], pos)):
                     self.commit_text_edit()
                     if self.current_tool != 'TEXT':
                         self.set_tool('TEXT')
@@ -18263,7 +19269,9 @@ class ScreenshotTool(QWidget):
             elif self.current_tool == 'TEXT':
                 clicked_idx = None
                 for i in range(len(self.edits) - 1, -1, -1):
-                    if self.edits[i].get('type') == 'TEXT' and is_annotation_hit(self.edits[i], pos):
+                    if (self.edits[i].get('type') == 'TEXT'
+                            and int(self.edits[i].get('rotation', 0)) % 360 == 0
+                            and is_annotation_hit(self.edits[i], pos)):
                         clicked_idx = i
                         break
                 if clicked_idx is not None:
@@ -18432,6 +19440,7 @@ class ScreenshotTool(QWidget):
                     self.edits.clear()
                     self.undo_stack.clear()
                     self.redo_stack.clear()
+                    self._reset_rotation_state()
                     self._invalidate_text_doc()
                     self.update_undo_redo_states()
                     self.toolbar.hide()
@@ -18601,6 +19610,8 @@ class ScreenshotTool(QWidget):
                     max_x = max(0, self.width() - r.width())
                     max_y = max(0, self.height() - r.height())
                     r.moveTo(max(0, min(max_x, new_tl.x())), max(0, min(max_y, new_tl.y())))
+                    if self._rotation_locked_edges() and r.topLeft() != self.selection_rect.topLeft():
+                        translate_edits(self.edits, r.topLeft() - self.selection_rect.topLeft())
                     self.selection_rect = r
                 else:
                     px = max(0, min(self.width() - 1, pos.x()))
@@ -18736,7 +19747,7 @@ class ScreenshotTool(QWidget):
 
                     if self.current_tool == 'OCR' and getattr(self, 'ocr_rect', None):
                         if self.ocr_rect.width() > 10 and self.ocr_rect.height() > 10:
-                            sub_pixmap = self.original_screen.copy(self.ocr_rect)
+                            sub_pixmap = self._crop_selection_content(self.ocr_rect)
                             self.btn_ocr.setText("🔤 识别中...")
                             ocr_img = sub_pixmap.toImage()
                             self.ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
@@ -18760,8 +19771,12 @@ class ScreenshotTool(QWidget):
                         before = getattr(self, '_selection_before_drag', None)
                         if before is not None and self.selection_rect != before:
                             # 只有选区位置或尺寸真的变了才重新识别，避免点击触发无意义 OCR
-                            self._invalidate_text_doc()
-                            self._schedule_auto_text_ocr()
+                            if self._rotation_locked_edges():
+                                # 旋转后的内容随选区整体平移，识别结果按选区坐标自动换算，无需重新识别
+                                self._reset_text_selection_state()
+                            else:
+                                self._invalidate_text_doc()
+                                self._schedule_auto_text_ocr()
                     self._selection_before_drag = None
 
                     self.drag_mode = None
@@ -18799,6 +19814,8 @@ class ScreenshotTool(QWidget):
 
     def enter_crop_mode(self):
         """进入裁剪模式，在选区内显示默认裁剪框与控制栏"""
+        if self.has_pending_rotation_preview():
+            self.commit_rotation_preview()
         self.crop_mode = True
         margin_x = max(10, self.selection_rect.width() // 10)
         margin_y = max(10, self.selection_rect.height() // 10)
@@ -18831,6 +19848,12 @@ class ScreenshotTool(QWidget):
         if not self.crop_rect or self.crop_rect.width() < CROP_MIN_SIZE:
             return
         self.save_state()
+        if getattr(self, '_rotated_base_pixmap', None) is not None:
+            # 旋转后的选区：同步裁剪旋转底图（保持真实分辨率），标注坐标仍为屏幕坐标无需变换
+            new_base = self._rotated_base_pixmap.copy(self._selection_rect_to_base(self.crop_rect))
+            if new_base is not None and not new_base.isNull():
+                self._rotated_base_pixmap = new_base
+                self._rotated_display_cache = None
         self.selection_rect = QRect(self.crop_rect)
         self.crop_mode = False
         self.crop_rect = None
@@ -18982,6 +20005,29 @@ class ScreenshotTool(QWidget):
             self.crop_rect = new_rect
 
     def get_final_static_image(self):
+        preview = getattr(self, '_rotation_preview_pixmap', None)
+        if preview is not None and not preview.isNull():
+            return QPixmap(preview)
+        rot = getattr(self, '_rotated_base_pixmap', None)
+        if rot is not None and not rot.isNull():
+            base_image = QPixmap(rot)
+            if not self.edits:
+                return base_image
+            sel = self.selection_rect
+            if rot.size() != sel.size():
+                # 显示时被等比缩小：标注换算回真实分辨率后再合成
+                edits = scale_edits(self.edits, sel.topLeft(), sel.size(), QPoint(0, 0), rot.size())
+                offset = QPoint(0, 0)
+                base_origin = QPoint(0, 0)
+            else:
+                edits = self.edits
+                offset = sel.topLeft()
+                base_origin = sel.topLeft()
+            painter = QPainter(base_image)
+            painter.setRenderHint(QPainter.Antialiasing)
+            draw_all_edits(painter, edits, rot, offset, base_origin=base_origin)
+            painter.end()
+            return base_image
         base_image = self.original_screen.copy(self.selection_rect)
         painter = QPainter(base_image)
         draw_all_edits(painter, self.edits, self.original_screen, self.selection_rect.topLeft())
@@ -19085,6 +20131,8 @@ class ScreenshotTool(QWidget):
 
     def pin_image(self):
         self.commit_text_edit()
+        if getattr(self, '_rotation_preview_pixmap', None) is not None:
+            self.commit_rotation_preview()
         pixmap = self.get_final_static_image()
         pos = self.selection_rect.topLeft()
         self.create_pinned_window(pixmap, initial_pos=pos, zoom_factor=1.0)
@@ -19168,6 +20216,8 @@ class ScreenshotTool(QWidget):
 
     def copy_image(self):
         self.commit_text_edit()
+        if getattr(self, '_rotation_preview_pixmap', None) is not None:
+            self.commit_rotation_preview()
         pixmap = self.get_final_static_image()
         pos = self.selection_rect.topLeft()
         QApplication.clipboard().setPixmap(pixmap)
@@ -19182,6 +20232,8 @@ class ScreenshotTool(QWidget):
 
     def save_image(self):
         self.commit_text_edit()
+        if getattr(self, '_rotation_preview_pixmap', None) is not None:
+            self.commit_rotation_preview()
         pixmap = self.get_final_static_image()
         pos = self.selection_rect.topLeft()
         ok = save_image_dialog(self, pixmap, default_prefix="screenshot")
