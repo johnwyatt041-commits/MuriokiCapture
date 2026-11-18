@@ -11,6 +11,9 @@ a = Analysis(
     excludes=[
         'PyQt5', 'numpy', 'cv2', 'PIL', 'mss', 'keyboard', 'pytesseract',
         'psutil', 'onnxruntime', 'rapidocr_onnxruntime', 'torch',
+        'ssl', '_ssl', 'http', 'urllib', 'xml', 'html',
+        'unittest', 'doctest', 'pdb', 'pydoc', 'pydoc_data', '_pyrepl',
+        'asyncio', 'multiprocessing', 'concurrent',
     ],
     noarchive=False,
     optimize=1,
