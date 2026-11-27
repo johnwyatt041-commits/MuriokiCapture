@@ -199,7 +199,7 @@ from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.5.6"
+APP_VERSION = "1.5.7"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -2903,8 +2903,42 @@ def ai_translate_text(text, target_lang, source_lang='auto', is_cancelled_fn=Non
             detected_final = det
     return "\n".join(results), detected_final
 
-class TranslationWorker(QThread):
-    finished = pyqtSignal(str, str)
+_ACTIVE_MANAGED_QTHREADS = set()
+
+
+def _retire_managed_qthread(worker):
+    _ACTIVE_MANAGED_QTHREADS.discard(worker)
+    try:
+        worker.deleteLater()
+    except RuntimeError:
+        pass
+
+
+def _shutdown_managed_qthreads():
+    for worker in list(_ACTIVE_MANAGED_QTHREADS):
+        try:
+            if hasattr(worker, "cancel"):
+                worker.cancel()
+            elif hasattr(worker, "stop"):
+                worker.stop()
+            if worker.isRunning():
+                worker.wait(1500)
+        except RuntimeError:
+            pass
+
+
+class _ManagedQThread(QThread):
+    """在真正收到原生 QThread.finished 后再释放引用并 deleteLater，避免运行中销毁崩溃。"""
+
+    def start(self, priority=QThread.InheritPriority):
+        if self not in _ACTIVE_MANAGED_QTHREADS:
+            _ACTIVE_MANAGED_QTHREADS.add(self)
+            self.finished.connect(lambda _w=self: _retire_managed_qthread(_w), Qt.QueuedConnection)
+        super().start(priority)
+
+
+class TranslationWorker(_ManagedQThread):
+    translation_done = pyqtSignal(str, str)
     error = pyqtSignal(str)
 
     def __init__(self, text, target_lang, source_lang='auto', use_ai=False):
@@ -2930,7 +2964,7 @@ class TranslationWorker(QThread):
                 res, det = translate_text(self.text, self.target_lang, self.source_lang)
 
             if not self._is_cancelled:
-                self.finished.emit(res, det)
+                self.translation_done.emit(res, det)
         except Exception as e:
             if not self._is_cancelled:
                 self.error.emit(str(e))
@@ -2938,7 +2972,6 @@ class TranslationWorker(QThread):
 # ==========================================
 # OCR 结果展示与多语言智能翻译弹窗 (现代浅色双栏对照风格)
 # ==========================================
-_DETACHED_OCR_WORKERS = set()
 
 
 class OcrResultDialog(QDialog):
@@ -3376,15 +3409,7 @@ class OcrResultDialog(QDialog):
         self._set_status("AI 正在重新识别..." if use_ai_ocr else "正在重新识别...", "info")
 
         worker = OcrWorker(self.source_image, use_ai=use_ai_ocr)
-        _DETACHED_OCR_WORKERS.add(worker)
         self._reocr_worker = worker
-
-        def _cleanup_worker(*_args, _w=worker):
-            _DETACHED_OCR_WORKERS.discard(_w)
-            try:
-                _w.deleteLater()
-            except RuntimeError:
-                pass
 
         def _on_done(new_text, _w=worker):
             if self._dialog_closed or self._reocr_worker is not _w:
@@ -3412,8 +3437,7 @@ class OcrResultDialog(QDialog):
                 self.target_edit.clear()
                 self._set_status(warn or "未识别到文字", "warn")
 
-        worker.finished.connect(_on_done)
-        worker.finished.connect(_cleanup_worker)
+        worker.ocr_done.connect(_on_done)
         worker.start()
 
     def _cleanup_on_close(self):
@@ -3422,7 +3446,7 @@ class OcrResultDialog(QDialog):
         if self.current_worker and self.current_worker.isRunning():
             try:
                 self.current_worker.cancel()
-                self.current_worker.finished.disconnect()
+                self.current_worker.translation_done.disconnect()
                 self.current_worker.error.disconnect()
             except Exception:
                 pass
@@ -3452,13 +3476,13 @@ class OcrResultDialog(QDialog):
         if self.current_worker and self.current_worker.isRunning():
             try:
                 self.current_worker.cancel()
-                self.current_worker.finished.disconnect()
+                self.current_worker.translation_done.disconnect()
                 self.current_worker.error.disconnect()
             except Exception:
                 pass
 
         self.current_worker = TranslationWorker(text, target_lang, use_ai=use_ai)
-        self.current_worker.finished.connect(self._on_translation_finished)
+        self.current_worker.translation_done.connect(self._on_translation_finished)
         self.current_worker.error.connect(self._on_translation_error)
         self.current_worker.start()
 
@@ -4899,8 +4923,8 @@ def _fuse_rapid_and_tesseract(rapid_lines, tess_words, image_size):
 # ==========================================
 # OCR 后台工作线程 (智能双引擎融合: 懒加载 RapidOCR + 空间对齐 Tesseract / AI 视觉识别)
 # ==========================================
-class OcrWorker(QThread):
-    finished = pyqtSignal(str)
+class OcrWorker(_ManagedQThread):
+    ocr_done = pyqtSignal(str)
     doc_ready = pyqtSignal(object)
     codes_ready = pyqtSignal(list)
 
@@ -4932,7 +4956,7 @@ class OcrWorker(QThread):
             if self.use_ai:
                 try:
                     result = ai_ocr_recognize(self.image)
-                    self.finished.emit(result if result else "")
+                    self.ocr_done.emit(result if result else "")
                     return
                 except Exception as ex_ai:
                     logging.warning("AI OCR 失败，将尝试回退本地 OCR: %s", ex_ai)
@@ -4940,9 +4964,9 @@ class OcrWorker(QThread):
 
             if arr is None:
                 if self.ocr_warning:
-                    self.finished.emit(f"识别发生错误:\n{self.ocr_warning}")
+                    self.ocr_done.emit(f"识别发生错误:\n{self.ocr_warning}")
                 else:
-                    self.finished.emit("")
+                    self.ocr_done.emit("")
                 return
 
             # 1. 运行 RapidOCR（含 RGB→BGR、小字放大留白、大图滑窗切片与低置信度对比增强重识）
@@ -5008,20 +5032,20 @@ class OcrWorker(QThread):
                     if doc is not None and not doc.is_empty():
                         self.ocr_doc = doc
                         self.doc_ready.emit(doc)
-                        self.finished.emit(doc.text)
+                        self.ocr_done.emit(doc.text)
                         return
                 except Exception as ex_doc:
                     logging.warning(f"OCR 版面构建异常: {ex_doc}")
 
             if self.ocr_warning and not rapid_lines:
-                self.finished.emit(f"识别发生错误:\n{self.ocr_warning}")
+                self.ocr_done.emit(f"识别发生错误:\n{self.ocr_warning}")
                 return
             text_out = "\n".join(str(item[1]).strip() for item in rapid_lines if item and str(item[1]).strip())
-            self.finished.emit(text_out)
+            self.ocr_done.emit(text_out)
 
         except Exception as e:
             logging.error("OCR Worker Error: %s", e, exc_info=True)
-            self.finished.emit(f"识别发生错误:\n{e}")
+            self.ocr_done.emit(f"识别发生错误:\n{e}")
 
 # ==========================================
 # 共用划词右键菜单辅助
@@ -10658,8 +10682,7 @@ class PinnedWindow(QWidget):
                     self._show_hud("未识别到文字", ms=1400)
 
         worker.doc_ready.connect(_on_doc)
-        worker.finished.connect(_on_done)
-        worker.finished.connect(worker.deleteLater)
+        worker.ocr_done.connect(_on_done)
         worker.start()
 
     def toggle_text_select_mode(self, enable=None):
@@ -10823,7 +10846,7 @@ class PinnedWindow(QWidget):
                 else:
                     self._show_hud("未识别到文字或条码")
 
-            worker.finished.connect(_on_done)
+            worker.ocr_done.connect(_on_done)
             worker.start()
             self._silent_ocr_worker = worker
         except Exception as e:
@@ -11470,7 +11493,7 @@ class PinnedWindow(QWidget):
                 dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
                 self._temp_ocr_dialog = dlg
                 exec_dialog_nonmodal(dlg)
-            worker.finished.connect(_on_done)
+            worker.ocr_done.connect(_on_done)
             worker.start()
             self._temp_ocr_worker = worker
         except Exception as e:
@@ -13715,7 +13738,7 @@ class ImageEditorDialog(QDialog):
                 QMessageBox.information(self, "一键翻译", "未能识别到文字，请重试。")
 
         worker.doc_ready.connect(_on_doc)
-        worker.finished.connect(_on_finished)
+        worker.ocr_done.connect(_on_finished)
         worker.start()
 
     def process_ocr(self, pixmap):
@@ -13724,7 +13747,7 @@ class ImageEditorDialog(QDialog):
         self._set_ocr_busy(True)
         ocr_img = pixmap.toImage()
         self.ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
-        self.ocr_worker.finished.connect(self.show_ocr_result)
+        self.ocr_worker.ocr_done.connect(self.show_ocr_result)
         self.ocr_worker.start()
 
     def show_ocr_result(self, text):
@@ -16540,7 +16563,7 @@ class CaptureFrame(QWidget):
         painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
 
-class ScrollCaptureThread(QThread):
+class ScrollCaptureThread(_ManagedQThread):
     # 发射在内存中捕获的所有 BGR 图像帧列表（彻底杜绝磁盘 I/O 磨损与卡顿）
     capture_finished = pyqtSignal(list)
 
@@ -19188,7 +19211,7 @@ class ScreenshotTool(_CanvasEditingMixin, QWidget):
             QToolTip.showText(QCursor.pos(), "🔤 正在识别并翻译文字...", None, QRect(), 3000)
             ocr_img = sub_pixmap.toImage() if sub_pixmap else QImage()
             self._quick_ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
-            self._quick_ocr_worker.finished.connect(self._on_quick_ocr_finished)
+            self._quick_ocr_worker.ocr_done.connect(self._on_quick_ocr_finished)
             self._quick_ocr_worker.start()
         except Exception as e:
             logging.error("start_quick_ocr_session 异常: %s", e, exc_info=True)
@@ -19400,8 +19423,7 @@ class ScreenshotTool(_CanvasEditingMixin, QWidget):
                 self._drain_ocr_waiters(error=msg)
 
         worker.doc_ready.connect(_on_doc)
-        worker.finished.connect(_on_finished)
-        worker.finished.connect(worker.deleteLater)
+        worker.ocr_done.connect(_on_finished)
         worker.start()
 
     def _drain_ocr_waiters(self, doc=None, text=None, error=None):
@@ -21171,7 +21193,7 @@ class ScreenshotTool(_CanvasEditingMixin, QWidget):
                             self.btn_ocr.setText("🔤 识别中...")
                             ocr_img = sub_pixmap.toImage()
                             self.ocr_worker = OcrWorker(ocr_img, use_ai=load_settings().get("use_ai_ocr", False))
-                            self.ocr_worker.finished.connect(self.show_ocr_result)
+                            self.ocr_worker.ocr_done.connect(self.show_ocr_result)
                             self.ocr_worker.start()
 
                         self.ocr_rect = None
@@ -21914,7 +21936,6 @@ class ScreenshotTool(_CanvasEditingMixin, QWidget):
             self._scroll_hint.close()
             self._scroll_hint = None
         if self.scroll_thread:
-            self.scroll_thread.deleteLater()
             self.scroll_thread = None
         self.active_scroll_rect = None
         self.scroll_waiting = False
@@ -22270,6 +22291,7 @@ if __name__ == '__main__':
 
         ex = ScreenshotTool(hotkey_listener=hotkey_mgr)
         app.aboutToQuit.connect(ex._shutdown_update_workers)
+        app.aboutToQuit.connect(_shutdown_managed_qthreads)
         app.aboutToQuit.connect(WindowPinManager.get_instance().clear_all)
         if single_instance_event:
             single_instance_listener = SingleInstanceTriggerListener(single_instance_event)
