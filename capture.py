@@ -90,14 +90,14 @@ def get_rapid_ocr_engine():
                     det_path, rec_path, cls_path = _find_custom_ocr_models()
                     init_kwargs = {
                         "use_angle_cls": False,
-                        "text_score": 0.42,
-                        "min_height": 16,
+                        "text_score": 0.32,
+                        "min_height": 12,
                         "width_height_ratio": -1,
                         "det_model_path": det_path,
                         "det_limit_type": "max",
                         "det_limit_side_len": 1920,
-                        "det_box_thresh": 0.45,
-                        "det_unclip_ratio": 1.75,
+                        "det_box_thresh": 0.35,
+                        "det_unclip_ratio": 1.85,
                     }
                     if rec_path:
                         init_kwargs["rec_model_path"] = rec_path
@@ -171,7 +171,7 @@ from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -3806,7 +3806,8 @@ def build_ocr_doc(rapid_lines, image_size):
             if rect is None:
                 continue
             score = float(item[2]) if len(item) > 2 else 1.0
-            segments.append((rect, text, score))
+            word_spans = item[3] if len(item) > 3 and item[3] else None
+            segments.append((rect, text, score, word_spans))
         except Exception:
             continue
 
@@ -3870,7 +3871,7 @@ def build_ocr_doc(rapid_lines, image_size):
             char_rects = []
             prev_rect = None
             prev_text = ""
-            for rect, text, _score in cluster:
+            for rect, text, _score, word_spans in cluster:
                 if prev_rect is not None and prev_text and text:
                     gap = rect.left() - prev_rect.right()
                     min_h = max(4.0, float(min(rect.height(), prev_rect.height())))
@@ -3884,8 +3885,32 @@ def build_ocr_doc(rapid_lines, image_size):
                             space_rect = QRect(rect.left() - 2, rect.top(), 2, rect.height())
                         parts.append(" ")
                         char_rects.append(space_rect)
-                parts.extend(text)
-                char_rects.extend(_estimate_char_rects(rect, text))
+
+                used_spans = False
+                if word_spans:
+                    span_parts = []
+                    span_rects = []
+                    prev_w_rect = None
+                    for w_rect, w_txt in word_spans:
+                        wt = str(w_txt or "").strip()
+                        if not wt or w_rect is None:
+                            continue
+                        if span_parts and (span_parts[-1].isascii() or wt[0].isascii()):
+                            sp_left = (prev_w_rect.right() + 1) if prev_w_rect is not None else w_rect.left() - 2
+                            sp_w = max(2, w_rect.left() - sp_left)
+                            span_parts.append(" ")
+                            span_rects.append(QRect(sp_left, w_rect.top(), sp_w, w_rect.height()))
+                        span_parts.extend(wt)
+                        span_rects.extend(_estimate_char_rects(w_rect, wt))
+                        prev_w_rect = w_rect
+                    if "".join(span_parts).strip() == text and len(span_rects) == len(text):
+                        parts.extend(text)
+                        char_rects.extend(span_rects)
+                        used_spans = True
+
+                if not used_spans:
+                    parts.extend(text)
+                    char_rects.extend(_estimate_char_rects(rect, text))
                 prev_rect = rect
                 prev_text = text
 
@@ -3900,6 +3925,231 @@ def build_ocr_doc(rapid_lines, image_size):
     if not rows:
         return None
     return OcrDoc(rows, image_size)
+
+
+def ocr_doc_char_at(doc, lx, ly):
+    """在图像坐标系中定位光标所在字符索引 (row_idx, char_idx)。"""
+    if doc is None or doc.is_empty():
+        return None
+    pt = QPoint(int(lx), int(ly))
+    for ri, row in enumerate(doc.rows):
+        if ly < row.rect.top() - 3 or ly > row.rect.bottom() + 3:
+            continue
+        for ci, cr in enumerate(row.char_rects):
+            if cr.adjusted(-2, -2, 2, 2).contains(pt):
+                return (ri, ci)
+    return None
+
+
+def ocr_doc_column_rows(doc, col_rect, target_lx=None, target_ly=None):
+    """按列聚类范围锁定当前栏，兼顾多栏与窄标题接宽段落；拖过栏隙到相邻列文字时自动放开跨栏选取。"""
+    if doc is None or not doc.rows:
+        return []
+    rows = doc.rows
+    if col_rect is None or col_rect.isNull():
+        return list(range(len(rows)))
+
+    img_w = doc.image_size.width() or col_rect.right()
+    col_h = max(8, col_rect.height())
+    gutter = max(20, int(col_h * 1.4))
+
+    hard_left = 0
+    hard_right = img_w - 1
+    for r in rows:
+        if r.rect == col_rect:
+            continue
+        v_ov = min(r.rect.bottom(), col_rect.bottom()) - max(r.rect.top(), col_rect.top())
+        if v_ov >= min(r.rect.height(), col_h) * 0.35:
+            if r.rect.right() < col_rect.left() - gutter:
+                hard_left = max(hard_left, r.rect.right() + 2)
+            elif r.rect.left() > col_rect.right() + gutter:
+                hard_right = min(hard_right, r.rect.left() - 2)
+
+    col_left = max(hard_left, col_rect.left())
+    col_right = min(hard_right, col_rect.right())
+    changed = True
+    while changed:
+        changed = False
+        for r in rows:
+            if r.rect.left() < hard_left - gutter * 0.5 or r.rect.right() > hard_right + gutter * 0.5:
+                continue
+            ov = min(col_right, r.rect.right()) - max(col_left, r.rect.left())
+            min_w = max(1, min(col_right - col_left + 1, r.rect.width()))
+            if ov >= min_w * 0.45:
+                nl = max(hard_left, min(col_left, r.rect.left()))
+                nr = min(hard_right, max(col_right, r.rect.right()))
+                if nl < col_left or nr > col_right:
+                    col_left, col_right = nl, nr
+                    changed = True
+
+    if target_lx is not None and (target_lx < col_left - gutter or target_lx > col_right + gutter):
+        if target_ly is not None:
+            for r in rows:
+                if r.rect.top() - col_h <= target_ly <= r.rect.bottom() + col_h:
+                    if r.rect.left() - 8 <= target_lx <= r.rect.right() + 8:
+                        return list(range(len(rows)))
+
+    result = []
+    for ri, row in enumerate(rows):
+        left = max(col_left, row.rect.left())
+        right = min(col_right, row.rect.right())
+        overlap = max(0, right - left + 1)
+        min_w = min(max(1, col_right - col_left + 1), row.rect.width())
+        if min_w > 0 and overlap / min_w >= 0.35:
+            result.append(ri)
+    return result or list(range(len(rows)))
+
+
+def ocr_doc_flat(doc, row_indices=None):
+    if doc is None:
+        return []
+    rows = doc.rows
+    if row_indices is None:
+        row_indices = range(len(rows))
+    return [(ri, ci) for ri in row_indices for ci in range(len(rows[ri].text))]
+
+
+def ocr_doc_index_at(doc, lx, ly, row_indices=None):
+    """将图像坐标映射为阅读顺序中的字符索引。"""
+    if doc is None or doc.is_empty():
+        return None
+    rows = doc.rows
+    candidates = list(row_indices) if row_indices is not None else list(range(len(rows)))
+    if not candidates:
+        candidates = list(range(len(rows)))
+
+    def vdist(row):
+        if ly < row.rect.top():
+            return row.rect.top() - ly
+        if ly > row.rect.bottom():
+            return ly - row.rect.bottom()
+        return 0
+
+    def hdist(row):
+        if lx < row.rect.left():
+            return row.rect.left() - lx
+        if lx > row.rect.right():
+            return lx - row.rect.right()
+        return 0
+
+    ri = min(candidates, key=lambda i: (vdist(rows[i]), hdist(rows[i])))
+    row = rows[ri]
+    for ci, cr in enumerate(row.char_rects):
+        if cr.center().x() >= lx:
+            return (ri, ci)
+    return (ri, max(0, len(row.char_rects) - 1))
+
+
+def ocr_doc_selected_text(doc, selected_set):
+    """按视觉行聚合选中文本：同行多列词块用制表符/空格连接，跨视觉行用换行连接。"""
+    if not selected_set or doc is None:
+        return ""
+    picked = []
+    for ri, row in enumerate(doc.rows):
+        idxs = sorted(ci for (r, ci) in selected_set if r == ri and ci < len(row.text))
+        if not idxs:
+            continue
+        txt = "".join(row.text[ci] for ci in idxs).rstrip()
+        if not txt:
+            continue
+        if idxs[0] < len(row.char_rects) and idxs[-1] < len(row.char_rects):
+            seg_rect = row.char_rects[idxs[0]].united(row.char_rects[idxs[-1]])
+        else:
+            seg_rect = row.rect
+        picked.append((seg_rect, txt))
+    if not picked:
+        return ""
+
+    visual_lines = []
+    for rect, txt in picked:
+        cy = rect.center().y()
+        ch = max(1, rect.height())
+        if visual_lines:
+            last_line = visual_lines[-1]
+            anchor_y = last_line["cy"]
+            anchor_h = last_line["h"]
+            if abs(cy - anchor_y) <= max(6.0, max(ch, anchor_h) * 0.55):
+                last_line["items"].append((rect, txt))
+                n = len(last_line["items"])
+                last_line["cy"] = (anchor_y * (n - 1) + cy) / n
+                last_line["h"] = max(anchor_h, ch)
+                continue
+        visual_lines.append({"cy": float(cy), "h": float(ch), "items": [(rect, txt)]})
+
+    out_lines = []
+    for vline in visual_lines:
+        items = sorted(vline["items"], key=lambda it: it[0].left())
+        parts = [items[0][1]]
+        prev_r = items[0][0]
+        for r, t in items[1:]:
+            gap = r.left() - prev_r.right()
+            sep = "\t" if gap >= max(14.0, min(prev_r.height(), r.height()) * 1.4) else " "
+            parts.append(sep + t)
+            prev_r = r
+        out_lines.append("".join(parts).rstrip())
+    return "\n".join(out_lines).strip()
+
+
+def ocr_doc_selected_subdoc(doc, selected_set):
+    """构建仅包含选中文字的子 OcrDoc，供表格 TSV 提取或局部翻译使用。"""
+    if not selected_set or doc is None:
+        return None
+    sub_rows = []
+    for ri, row in enumerate(doc.rows):
+        idxs = sorted(ci for (r, ci) in selected_set
+                      if r == ri and ci < len(row.text) and ci < len(row.char_rects))
+        if not idxs:
+            continue
+        txt = "".join(row.text[ci] for ci in idxs).strip()
+        if not txt:
+            continue
+        c_rects = [QRect(row.char_rects[ci]) for ci in idxs]
+        rect = QRect(c_rects[0])
+        for cr in c_rects[1:]:
+            rect = rect.united(cr)
+        sub_rows.append(OcrRow(txt, rect, c_rects))
+    if not sub_rows:
+        return None
+    return OcrDoc(sub_rows, doc.image_size)
+
+
+def ocr_doc_draw_selection(painter, doc, selected_set, hover_idx, map_rect_fn):
+    """在画布/贴图上绘制连续字符选区高亮与悬停下划线。"""
+    if doc is None or doc.is_empty():
+        return
+    if selected_set:
+        fill = QColor(196, 146, 62, 78)
+        border = QColor(148, 102, 32, 95)
+        painter.setPen(QPen(border, 1))
+        for ri, row in enumerate(doc.rows):
+            idxs = sorted(ci for (r, ci) in selected_set
+                          if r == ri and ci < len(row.char_rects))
+            if not idxs:
+                continue
+            runs = []
+            start = prev = idxs[0]
+            for ci in idxs[1:]:
+                if ci == prev + 1:
+                    prev = ci
+                else:
+                    runs.append((start, prev))
+                    start = prev = ci
+            runs.append((start, prev))
+            for a, b in runs:
+                ra = map_rect_fn(row.char_rects[a])
+                rb = map_rect_fn(row.char_rects[b])
+                rect = QRect(ra.left(), min(ra.top(), rb.top()),
+                             max(1, rb.right() - ra.left() + 1), max(ra.height(), rb.height()))
+                painter.fillRect(rect, fill)
+                painter.drawRect(rect.adjusted(0, 0, -1, -1))
+    elif hover_idx is not None:
+        try:
+            ri, ci = hover_idx
+            rect = map_rect_fn(doc.rows[ri].char_rects[ci])
+            painter.fillRect(QRect(rect.left(), rect.bottom() - 2, rect.width(), 2),
+                             QColor(182, 134, 58, 200))
+        except (IndexError, KeyError):
+            pass
 
 
 def _border_ring_median(img_arr):
@@ -4203,8 +4453,15 @@ def _rapid_ocr_with_retry(rapid_engine, rgb_arr):
     bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
     primary = _rapid_ocr_tiled(rapid_engine, bgr)
     p_total, p_mean, p_chars, p_low = _ocr_quality_stats(primary)
+    bg = _border_ring_median(bgr)
+    is_dark_bg = (0.114 * bg[0] + 0.587 * bg[1] + 0.299 * bg[2]) < 110
 
-    need_retry = (not primary) or (p_mean < 0.78) or (len(primary) >= 2 and p_low >= 0.30)
+    need_retry = (
+        (not primary)
+        or (p_mean < 0.78)
+        or (len(primary) >= 2 and p_low >= 0.30)
+        or (is_dark_bg and p_mean < 0.86 and p_low >= 0.12)
+    )
     if not need_retry:
         return primary
 
@@ -4217,8 +4474,8 @@ def _rapid_ocr_with_retry(rapid_engine, rgb_arr):
     if not primary:
         return retry
     if r_total > p_total * 1.06 or (r_chars >= p_chars * 0.9 and r_mean > p_mean + 0.04):
-        return _merge_non_overlapping_ocr(retry, primary, min_score=0.75)
-    return _merge_non_overlapping_ocr(primary, retry, min_score=0.75)
+        return _merge_non_overlapping_ocr(retry, primary, min_score=0.45)
+    return _merge_non_overlapping_ocr(primary, retry, min_score=0.45)
 
 
 def _group_tess_words_into_lines(tess_words, image_size):
@@ -4266,8 +4523,12 @@ def _win_ocr_clusters_for_tile(bgr, langs=("zh-Hans-CN", "en-US")):
     if max(h, w) * scale > 3200:
         scale = max(1.0, 3200.0 / max(1, h, w))
     work = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1.05 else bgr
+    bg_bgr = _border_ring_median(work)
+    if (0.114 * bg_bgr[0] + 0.587 * bg_bgr[1] + 0.299 * bg_bgr[2]) < 115:
+        work = cv2.bitwise_not(work)
+        bg_bgr = _border_ring_median(work)
     pad = 16
-    padded = cv2.copyMakeBorder(work, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=_border_ring_median(work))
+    padded = cv2.copyMakeBorder(work, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=bg_bgr)
     ok_enc, enc_buf = cv2.imencode(".png", padded, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     if not ok_enc:
         return []
@@ -4326,6 +4587,7 @@ def _win_ocr_clusters_for_tile(bgr, langs=("zh-Hans-CN", "en-US")):
                         else:
                             break
                     parts = []
+                    word_spans = []
                     x0 = min(wd.bounding_rect.x for wd in grp)
                     y0 = min(wd.bounding_rect.y for wd in grp)
                     x1 = max(wd.bounding_rect.x + wd.bounding_rect.width for wd in grp)
@@ -4338,6 +4600,13 @@ def _win_ocr_clusters_for_tile(bgr, langs=("zh-Hans-CN", "en-US")):
                             parts.append(" " + wt)
                         else:
                             parts.append(wt)
+                        wx0 = max(0.0, min(float(w), (wd.bounding_rect.x - pad) / scale))
+                        wy0 = max(0.0, min(float(h), (wd.bounding_rect.y - pad) / scale))
+                        wx1 = max(wx0 + 1.0, min(float(w), (wd.bounding_rect.x + wd.bounding_rect.width - pad) / scale))
+                        wy1 = max(wy0 + 1.0, min(float(h), (wd.bounding_rect.y + wd.bounding_rect.height - pad) / scale))
+                        w_rect = QRect(int(math.floor(wx0)), int(math.floor(wy0)),
+                                       max(1, int(math.ceil(wx1 - wx0))), max(1, int(math.ceil(wy1 - wy0))))
+                        word_spans.append((w_rect, wt))
                     txt = "".join(parts).strip()
                     if not txt:
                         continue
@@ -4353,7 +4622,7 @@ def _win_ocr_clusters_for_tile(bgr, langs=("zh-Hans-CN", "en-US")):
                     )
                     base_conf = 0.80 if tag == "en-US" else 0.74
                     conf = 0.55 if (tag == "zh-Hans-CN" and has_spurious_cjk) else base_conf
-                    clusters.append([box, txt, conf])
+                    clusters.append([box, txt, conf, word_spans])
             per_lang[tag] = clusters
         return per_lang
 
@@ -4427,8 +4696,13 @@ def win_ocr_lines(image_rgb):
         for x0 in xs:
             x1 = min(w, x0 + tile_w)
             sub_res = _win_ocr_clusters_for_tile(bgr[y0:y1, x0:x1])
-            for pts, text, score in sub_res:
+            for item in sub_res:
+                pts, text, score = item[0], item[1], item[2]
                 shifted = [[pt[0] + x0, pt[1] + y0] for pt in pts]
+                shifted_spans = (
+                    [(r.translated(x0, y0), wt) for r, wt in item[3]]
+                    if len(item) > 3 and item[3] else None
+                )
                 pxs = [p[0] for p in shifted]
                 pys = [p[1] for p in shifted]
                 bx0, bx1 = min(pxs), max(pxs)
@@ -4439,7 +4713,8 @@ def win_ocr_lines(image_rgb):
                     or (y0 > 0 and by0 <= y0 + 4)
                     or (y1 < h and by1 >= y1 - 4)
                 )
-                candidates.append(([shifted, text, score], score, clipped, (bx0, by0, bx1, by1)))
+                entry = [shifted, text, score, shifted_spans] if shifted_spans else [shifted, text, score]
+                candidates.append((entry, score, clipped, (bx0, by0, bx1, by1)))
     return _dedup_tiled_boxes(candidates)
 
 
@@ -4563,9 +4838,14 @@ class OcrWorker(QThread):
                 except Exception as ex_r:
                     logging.warning(f"RapidOCR 执行异常: {ex_r}")
 
-            # 2. 若 RapidOCR 未安装或置信度偏低，启用 Windows 内置 OCR（高精 UI/中英双引擎互补）
+            # 2. 若 RapidOCR 未安装或置信度偏低，启用 Windows 内置 OCR（即使快扫模式低置信度时也轻量互补）
             _tot, mean_conf, _chars, low_ratio = _ocr_quality_stats(rapid_lines)
-            if (not rapid_lines) or (not self.fast and (mean_conf < 0.78 or low_ratio > 0.25)):
+            need_win_ocr = (
+                (not rapid_lines)
+                or (not self.fast and (mean_conf < 0.78 or low_ratio > 0.25))
+                or (self.fast and (mean_conf < 0.74 or low_ratio > 0.30))
+            )
+            if need_win_ocr:
                 try:
                     win_lines = win_ocr_lines(arr)
                     if win_lines:
@@ -4575,6 +4855,15 @@ class OcrWorker(QThread):
                             rapid_lines = _merge_non_overlapping_ocr(rapid_lines, win_lines, min_score=0.72)
                 except Exception as ex_win:
                     logging.warning(f"Windows OCR 融合异常: {ex_win}")
+
+            # 2.5 快扫模式下未检出文字时补扫二维码/条形码，避免纯码截图毫无反应
+            if self.fast and not rapid_lines and not self.detected_codes:
+                try:
+                    self.detected_codes = detect_codes_in_image(arr)
+                    if self.detected_codes:
+                        self.codes_ready.emit(self.detected_codes)
+                except Exception as ex_fc:
+                    logging.warning("快扫 QR/Barcode 兜底识别异常: %s", ex_fc)
 
             # 3. 按需运行 Tesseract（无 RapidOCR 时的非快扫高精度融合、小语种兜底或其余引擎空白/低置信度补全）
             settings = load_settings()
@@ -4619,220 +4908,70 @@ class OcrWorker(QThread):
             self.finished.emit(f"识别发生错误:\n{e}")
 
 # ==========================================
-# 图上取字层 (拖选 OCR 文字并复制)
+# 共用划词右键菜单辅助
 # ==========================================
-class TextSelectLayer(QWidget):
-    """覆盖在截图选区上的文字选择层：拖选高亮、Ctrl+C 复制、Esc 退出。"""
+CODEX_MENU_QSS = """
+    QMenu {
+        background-color: #FFFFFF;
+        border: 1px solid #E4E4E7;
+        border-radius: 10px;
+        padding: 5px;
+        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+        font-size: 12.5px;
+        color: #18181B;
+    }
+    QMenu::item {
+        padding: 6px 14px;
+        border-radius: 6px;
+    }
+    QMenu::item:selected {
+        background-color: #F4F4F5;
+        color: #09090B;
+    }
+    QMenu::separator {
+        height: 1px;
+        background: #ECECEF;
+        margin: 4px 8px;
+    }
+"""
 
-    copied = pyqtSignal(str)
-    closed = pyqtSignal()
 
-    def __init__(self, doc: OcrDoc, parent=None):
-        super().__init__(parent)
-        self.doc = doc
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setCursor(Qt.IBeamCursor)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
+def exec_text_selection_menu(parent, global_pos, text, on_copy, on_copy_table, on_translate,
+                             on_select_all, on_clear, on_copy_exit=None, extra_exit_action=None):
+    """在截图选区与贴图窗口间共用的划词快捷右键菜单。"""
+    if not text:
+        return None
+    menu = QMenu(parent)
+    menu.setStyleSheet(CODEX_MENU_QSS)
+    act_copy = menu.addAction("📋 复制选中文字 (Ctrl+C)")
+    act_copy_exit = menu.addAction("✅ 复制并退出") if on_copy_exit else None
+    act_table = menu.addAction("📊 复制为表格 (Excel)")
+    act_translate = menu.addAction("🌐 翻译选中文字")
+    url_match = re.search(r'https?://[^\s<>"\')\]}]+', text)
+    act_open_url = menu.addAction("🔗 打开链接") if url_match else None
+    menu.addSeparator()
+    act_all = menu.addAction("🔘 全选文字 (Ctrl+A)")
+    act_clear = menu.addAction("✖ 取消选中 (Esc)")
+    act_exit = menu.addAction(extra_exit_action[0]) if extra_exit_action else None
 
-        self._dragging = False
-        self._drag_start = QPoint()
-        self._sel_rect = QRect()
-        self._selected = set()
-        self._flash_text = ""
-        self._flash_timer = QTimer(self)
-        self._flash_timer.setSingleShot(True)
-        self._flash_timer.timeout.connect(self._clear_flash)
-        self._sx = 1.0
-        self._sy = 1.0
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._recalc_scale()
-        self.setFocus()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._recalc_scale()
-
-    def _recalc_scale(self):
-        iw = max(1, self.doc.image_size.width())
-        ih = max(1, self.doc.image_size.height())
-        self._sx = self.width() / iw if iw else 1.0
-        self._sy = self.height() / ih if ih else 1.0
-
-    def _scale_rect(self, rect):
-        return QRect(int(rect.left() * self._sx), int(rect.top() * self._sy),
-                     max(1, int(rect.width() * self._sx)), max(1, int(rect.height() * self._sy)))
-
-    def _clear_flash(self):
-        self._flash_text = ""
-        self.update()
-
-    def _update_selected(self):
-        self._selected.clear()
-        if self._sel_rect.isNull() or not self._sel_rect.isValid():
-            return
-        probe = self._sel_rect.adjusted(-1, -1, 1, 1)
-        for ri, row in enumerate(self.doc.rows):
-            for ci, cr in enumerate(row.char_rects):
-                if probe.contains(self._scale_rect(cr).center()):
-                    self._selected.add((ri, ci))
-
-    def _selected_text(self):
-        lines = []
-        for ri, row in enumerate(self.doc.rows):
-            chars = [row.text[ci] for ci in range(len(row.text)) if (ri, ci) in self._selected]
-            if chars:
-                lines.append("".join(chars).rstrip())
-        return "\n".join(lines).strip()
-
-    def _select_all(self):
-        self._selected = {(ri, ci) for ri, row in enumerate(self.doc.rows) for ci in range(len(row.text))}
-        self._sel_rect = QRect(0, 0, self.width(), self.height())
-        self.update()
-
-    def _select_row_at(self, pos):
-        for ri, row in enumerate(self.doc.rows):
-            if self._scale_rect(row.rect).adjusted(-2, -2, 2, 2).contains(pos):
-                self._selected = {(ri, ci) for ci in range(len(row.text))}
-                self._sel_rect = self._scale_rect(row.rect)
-                self.update()
-                return
-
-    def _copy_selection(self):
-        text = self._selected_text()
-        if not text:
-            return
-        QApplication.clipboard().setText(text)
-        self._flash_text = f"已复制 {len(text)} 字"
-        self._flash_timer.start(1800)
-        self.copied.emit(text)
-        self.update()
-
-    def _close_layer(self):
-        self.closed.emit()
-        self.hide()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        if self._selected:
-            fill = QColor(196, 146, 62, 78)
-            border = QColor(148, 102, 32, 95)
-            painter.setPen(QPen(border, 1))
-            for ri, row in enumerate(self.doc.rows):
-                idxs = sorted(ci for (r, ci) in self._selected if r == ri and ci < len(row.char_rects))
-                if not idxs:
-                    continue
-                # 合并连续字符为一段，避免逐字描边形成网格感
-                runs = []
-                start = prev = idxs[0]
-                for ci in idxs[1:]:
-                    if ci == prev + 1:
-                        prev = ci
-                    else:
-                        runs.append((start, prev))
-                        start = prev = ci
-                runs.append((start, prev))
-                for a, b in runs:
-                    ra = self._scale_rect(row.char_rects[a])
-                    rb = self._scale_rect(row.char_rects[b])
-                    rect = QRect(ra.left(), min(ra.top(), rb.top()),
-                                 max(1, rb.right() - ra.left() + 1), max(ra.height(), rb.height()))
-                    painter.fillRect(rect, fill)
-                    painter.drawRect(rect.adjusted(0, 0, -1, -1))
-
-        if self._dragging and not self._sel_rect.isNull():
-            painter.setPen(QPen(QColor(148, 102, 32, 185), 1, Qt.DashLine))
-            painter.setBrush(QColor(196, 146, 62, 24))
-            painter.drawRect(self._sel_rect.normalized())
-            painter.setBrush(Qt.NoBrush)
-
-        if self._flash_text:
-            self._draw_pill(painter, self._flash_text, center=True)
-        else:
-            self._draw_pill(painter, "拖选文字 · Ctrl+C 复制 · Esc 退出", center=False)
-        painter.end()
-
-    def _draw_pill(self, painter, text, center=False):
-        font = make_ui_font(pixel_size=12)
-        painter.setFont(font)
-        fm = QFontMetrics(font)
-        tw = fm.horizontalAdvance(text)
-        th = fm.height()
-        w = tw + 22
-        h = th + 10
-        if center:
-            x = max(6, int((self.width() - w) / 2))
-            y = 10
-        else:
-            x = max(6, self.width() - w - 8)
-            y = 8
-        rect = QRect(x, y, min(w, self.width() - 12), h)
-        painter.setPen(QPen(QColor(203, 213, 225), 1))
-        painter.setBrush(QColor(255, 255, 255, 236))
-        painter.drawRoundedRect(rect, 7, 7)
-        painter.setPen(QColor(51, 65, 85))
-        painter.drawText(rect.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            menu = QMenu(self)
-            act_copy = menu.addAction("复制选中文字")
-            act_copy.setEnabled(bool(self._selected))
-            act_all = menu.addAction("全选")
-            menu.addSeparator()
-            act_exit = menu.addAction("退出取字")
-            chosen = menu.exec_(event.globalPos())
-            if chosen == act_copy:
-                self._copy_selection()
-            elif chosen == act_all:
-                self._select_all()
-            elif chosen == act_exit:
-                self._close_layer()
-            return
-
-        if event.button() == Qt.LeftButton:
-            self._dragging = True
-            self._drag_start = event.pos()
-            self._sel_rect = QRect(self._drag_start, self._drag_start)
-            self._selected.clear()
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            self._sel_rect = QRect(self._drag_start, event.pos()).normalized()
-            self._update_selected()
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self._dragging:
-            self._dragging = False
-            moved = (event.pos() - self._drag_start).manhattanLength()
-            self._sel_rect = QRect(self._drag_start, event.pos()).normalized()
-            if moved < 3:
-                # 单击直接选中该行，方便快速复制单行
-                self._select_row_at(event.pos())
-            else:
-                self._update_selected()
-            self.update()
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._select_row_at(event.pos())
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self._close_layer()
-        elif event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier:
-            self._select_all()
-        elif event.key() in (Qt.Key_C, Qt.Key_Return, Qt.Key_Enter) and (
-                event.key() != Qt.Key_C or event.modifiers() & Qt.ControlModifier):
-            self._copy_selection()
-        else:
-            super().keyPressEvent(event)
+    chosen = menu.exec_(global_pos)
+    if chosen == act_copy:
+        on_copy()
+    elif act_copy_exit is not None and chosen == act_copy_exit:
+        on_copy_exit()
+    elif chosen == act_table:
+        on_copy_table()
+    elif chosen == act_translate:
+        on_translate()
+    elif act_open_url is not None and chosen == act_open_url and url_match:
+        webbrowser.open(url_match.group(0))
+    elif chosen == act_all:
+        on_select_all()
+    elif chosen == act_clear:
+        on_clear()
+    elif act_exit is not None and chosen == act_exit:
+        extra_exit_action[1]()
+    return chosen
 
 
 # ==========================================
@@ -8862,6 +9001,90 @@ class SnipasteToolbar(FrostedBarWidget):
         self.btn_redo.setEnabled(can_redo)
 
 
+class TextSelectionActionBar(FrostedBarWidget):
+    """划选文字后贴近选区悬浮的快捷操作条：复制、复制并退出、表格、翻译、打开链接。"""
+    action_triggered = pyqtSignal(str)  # 'COPY', 'COPY_EXIT', 'TABLE', 'TRANSLATE', 'OPEN_URL'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("textSelectionActionBar")
+        self.setStyleSheet("""
+            QWidget#textSelectionActionBar {
+                background: transparent;
+            }
+            QLabel#selCountBadge {
+                color: #7A5110;
+                background: rgba(251, 247, 238, 0.92);
+                border: 1px solid rgba(229, 210, 174, 0.95);
+                border-radius: 6px;
+                padding: 2px 7px;
+                font-size: 11.5px;
+                font-weight: 600;
+            }
+            QPushButton {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 4px 9px;
+                color: #18181B;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.85);
+                border: 1px solid rgba(182, 134, 58, 0.55);
+            }
+            QPushButton:pressed {
+                background: rgba(248, 238, 214, 0.95);
+                border: 1px solid rgba(182, 134, 58, 0.85);
+            }
+            QPushButton#primaryCopyBtn {
+                background: rgba(182, 134, 58, 0.14);
+                border: 1px solid rgba(182, 134, 58, 0.55);
+                color: #7A5110;
+                font-weight: 600;
+            }
+            QPushButton#primaryCopyBtn:hover {
+                background: rgba(182, 134, 58, 0.24);
+                border: 1px solid rgba(182, 134, 58, 0.85);
+            }
+        """)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(self.SHADOW_PAD + 6, self.SHADOW_PAD + 3, self.SHADOW_PAD + 6, self.SHADOW_PAD + 3)
+        layout.setSpacing(4)
+
+        self.lbl_count = QLabel("0 字")
+        self.lbl_count.setObjectName("selCountBadge")
+        layout.addWidget(self.lbl_count)
+
+        def _make_btn(text, tip, action, obj_name=None):
+            btn = QPushButton(text)
+            if obj_name:
+                btn.setObjectName(obj_name)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.setFont(make_ui_font(pixel_size=12))
+            btn.clicked.connect(lambda _=False, a=action: self.action_triggered.emit(a))
+            layout.addWidget(btn)
+            return btn
+
+        self.btn_copy = _make_btn("复制", "复制选中文字 (Ctrl+C)", "COPY", "primaryCopyBtn")
+        self.btn_copy_exit = _make_btn("复制并退出", "复制选中文字并退出截图", "COPY_EXIT")
+        self.btn_table = _make_btn("表格", "按行列结构复制为 Excel 表格 (TSV)", "TABLE")
+        self.btn_translate = _make_btn("翻译", "翻译当前选中文字", "TRANSLATE")
+        self.btn_open_url = _make_btn("打开链接", "在浏览器中打开选中链接", "OPEN_URL")
+
+        self.btn_table.hide()
+        self.btn_open_url.hide()
+
+    def configure(self, char_count, has_table=False, has_url=False):
+        self.lbl_count.setText(f"{char_count} 字")
+        self.btn_table.setVisible(bool(has_table))
+        self.btn_open_url.setVisible(bool(has_url))
+        self.adjustSize()
+
+
 class ToolOptionsBar(FrostedBarWidget):
     options_changed = pyqtSignal()
 
@@ -10083,13 +10306,23 @@ class _ClickThroughUnlockHandle(QWidget):
 
 
 class PinnedWindow(QWidget):
-    def __init__(self, pixmap, main_app_ref=None, initial_pos=None, zoom_factor=1.0):
+    def __init__(self, pixmap, main_app_ref=None, initial_pos=None, zoom_factor=1.0, ocr_doc=None):
         super().__init__()
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.pixmap = pixmap
         self.main_app_ref = main_app_ref
+        self._ocr_doc = ocr_doc
+        self._ocr_loading = False
+        self._pin_ocr_worker = None
+        self._text_select_mode = False
+        self._text_dragging = False
+        self._text_sel_start = QPoint()
+        self._text_sel_start_index = None
+        self._text_sel_column_rect = QRect()
+        self._text_selected = set()
+        self._text_hover = None
 
         # 屏幕可用区域
         screen = None
@@ -10165,6 +10398,151 @@ class PinnedWindow(QWidget):
             self._hud_timer.start(ms)
         else:
             self._hud_timer.stop()
+        self.update()
+
+    # ---------- 贴图内直接划词取字 ----------
+    def _text_doc_ready(self):
+        return (self._ocr_doc is not None and not self._ocr_doc.is_empty()
+                and not getattr(self, '_is_collapsed', False)
+                and not getattr(self, '_is_mini_for_drawer', False))
+
+    def _text_geometry(self):
+        doc = self._ocr_doc
+        iw = max(1, doc.image_size.width()) if doc else max(1, self.pixmap.width())
+        ih = max(1, doc.image_size.height()) if doc else max(1, self.pixmap.height())
+        return (self.width() / iw, self.height() / ih)
+
+    def _text_widget_rect(self, char_rect):
+        sx, sy = self._text_geometry()
+        return QRect(int(char_rect.left() * sx), int(char_rect.top() * sy),
+                     max(1, int(char_rect.width() * sx)), max(1, int(char_rect.height() * sy)))
+
+    def _text_char_at(self, pos):
+        if not self._text_doc_ready():
+            return None
+        sx, sy = self._text_geometry()
+        if sx <= 0 or sy <= 0:
+            return None
+        return ocr_doc_char_at(self._ocr_doc, pos.x() / sx, pos.y() / sy)
+
+    def _text_index_at(self, pos, row_indices=None):
+        if not self._text_doc_ready():
+            return None
+        sx, sy = self._text_geometry()
+        if sx <= 0 or sy <= 0:
+            return None
+        return ocr_doc_index_at(self._ocr_doc, pos.x() / sx, pos.y() / sy, row_indices)
+
+    def _selected_text(self):
+        return ocr_doc_selected_text(self._ocr_doc, self._text_selected)
+
+    def _clear_text_selection(self):
+        self._text_dragging = False
+        self._text_sel_start_index = None
+        self._text_sel_column_rect = QRect()
+        self._text_selected = set()
+        self._text_hover = None
+        self.update()
+
+    def _copy_selected_text(self):
+        text = self._selected_text()
+        if not text:
+            return False
+        QApplication.clipboard().setText(text)
+        self._clear_text_selection()
+        self._show_hud(f"✓ 已复制 {len(text)} 字", ms=1600)
+        return True
+
+    def _copy_selected_as_table(self):
+        text = self._selected_text()
+        if not text:
+            return False
+        sub_doc = ocr_doc_selected_subdoc(self._ocr_doc, self._text_selected)
+        tsv = extract_table_tsv(sub_doc, text)
+        if not tsv.strip():
+            return False
+        QApplication.clipboard().setText(tsv)
+        self._clear_text_selection()
+        row_cnt = len([ln for ln in tsv.splitlines() if ln.strip()])
+        self._show_hud(f"✓ 已复制表格 ({row_cnt} 行)", ms=1600)
+        return True
+
+    def _translate_selected_text(self):
+        text = self._selected_text()
+        if not text:
+            return
+        sub_doc = ocr_doc_selected_subdoc(self._ocr_doc, self._text_selected)
+        dlg = OcrResultDialog(text, None, ocr_doc=sub_doc)
+        dlg.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self._temp_ocr_dialog = dlg
+        exec_dialog_nonmodal(dlg)
+
+    def _select_all_text(self):
+        if not self._text_doc_ready():
+            return
+        self._text_selected = set(ocr_doc_flat(self._ocr_doc))
+        self.update()
+
+    def _ensure_ocr_doc(self, notify=False):
+        if self._ocr_doc is not None or self._ocr_loading:
+            return
+        if not self.pixmap or self.pixmap.isNull():
+            return
+        self._ocr_loading = True
+        if notify:
+            self._show_hud("正在识别文字…", ms=4000)
+        worker = OcrWorker(self.pixmap.toImage(), use_ai=False, fast=True)
+        self._pin_ocr_worker = worker
+
+        def _on_doc(doc):
+            self._ocr_loading = False
+            self._ocr_doc = doc
+            if self._pin_ocr_worker is worker:
+                self._pin_ocr_worker = None
+            if self._text_doc_ready():
+                pos = self.mapFromGlobal(QCursor.pos())
+                if self.rect().contains(pos) and (self._text_select_mode or (QApplication.keyboardModifiers() & Qt.ShiftModifier)):
+                    hover = self._text_char_at(pos)
+                    if hover is not None:
+                        self._text_hover = hover
+                        self.setCursor(Qt.IBeamCursor)
+            if self._text_select_mode:
+                self._show_hud("划词取字已开启 · 拖选复制", ms=1500)
+            elif notify:
+                self._clear_hud()
+            self.update()
+
+        def _on_done(_txt):
+            if self._ocr_loading:
+                self._ocr_loading = False
+                if self._pin_ocr_worker is worker:
+                    self._pin_ocr_worker = None
+                if self._ocr_doc is None and notify:
+                    self._show_hud("未识别到文字", ms=1400)
+
+        worker.doc_ready.connect(_on_doc)
+        worker.finished.connect(_on_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def toggle_text_select_mode(self, enable=None):
+        target = (not self._text_select_mode) if enable is None else bool(enable)
+        self._text_select_mode = target
+        if target:
+            if getattr(self, '_is_collapsed', False):
+                self.toggle_collapse()
+            if self._ocr_doc is not None and not self._ocr_doc.is_empty():
+                self._show_hud("划词取字已开启 · 拖选复制 (Esc退出)", ms=1800)
+                pos = self.mapFromGlobal(QCursor.pos())
+                if self.rect().contains(pos):
+                    self._text_hover = self._text_char_at(pos)
+                    self.setCursor(Qt.IBeamCursor if self._text_hover is not None else Qt.ArrowCursor)
+            else:
+                self._ensure_ocr_doc(notify=True)
+        else:
+            self._clear_text_selection()
+            self.setCursor(Qt.ArrowCursor)
+            self._show_hud("已退出划词取字", ms=1100)
         self.update()
 
     def _sync_click_through_handle(self):
@@ -10332,6 +10710,14 @@ class PinnedWindow(QWidget):
                 self.toggle_collapse()
                 event.accept()
                 return
+            if (self._text_select_mode or (event.modifiers() & Qt.ShiftModifier)) and self._text_doc_ready():
+                hit = self._text_char_at(event.pos())
+                if hit is not None:
+                    ri = hit[0]
+                    self._text_selected = {(ri, ci) for ci in range(len(self._ocr_doc.rows[ri].text))}
+                    self._copy_selected_text()
+                    event.accept()
+                    return
             if event.modifiers() & Qt.AltModifier:
                 self.toggle_collapse()
                 event.accept()
@@ -10465,6 +10851,8 @@ class PinnedWindow(QWidget):
             painter.drawText(exp_rect, Qt.AlignCenter, "展开")
         else:
             painter.drawPixmap(self.rect(), self.pixmap)
+            if self._text_doc_ready():
+                ocr_doc_draw_selection(painter, self._ocr_doc, self._text_selected, self._text_hover, self._text_widget_rect)
             border_enabled = (
                 bool(getattr(self.main_app_ref, "pin_border_enabled", False))
                 if self.main_app_ref is not None
@@ -10560,6 +10948,28 @@ class PinnedWindow(QWidget):
                 self.update()
                 event.accept()
                 return
+            if (not getattr(self, '_is_collapsed', False)
+                    and not (event.modifiers() & Qt.AltModifier)
+                    and (self._text_select_mode or (event.modifiers() & Qt.ShiftModifier))):
+                if not self._text_doc_ready():
+                    self._ensure_ocr_doc(notify=True)
+                    event.accept()
+                    return
+                sx, sy = self._text_geometry()
+                self._left_dragging = False
+                self._text_dragging = True
+                self._text_sel_start = event.pos()
+                self._text_sel_start_index = self._text_index_at(event.pos())
+                self._text_sel_column_rect = (
+                    QRect(self._ocr_doc.rows[self._text_sel_start_index[0]].rect)
+                    if self._text_sel_start_index is not None else QRect()
+                )
+                self._text_selected = set()
+                self._text_hover = None
+                self.setCursor(Qt.IBeamCursor)
+                self.update()
+                event.accept()
+                return
             self._expand_btn_pressed = False
             self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
             self._normal_size = self.size()
@@ -10578,6 +10988,9 @@ class PinnedWindow(QWidget):
             self._suppress_next_context_menu = False
 
     def leaveEvent(self, event):
+        if getattr(self, '_text_hover', None) is not None:
+            self._text_hover = None
+            self.update()
         if getattr(self, '_hover_expand_btn', False):
             self._hover_expand_btn = False
             self.setCursor(Qt.ArrowCursor)
@@ -10592,10 +11005,45 @@ class PinnedWindow(QWidget):
                     self._hover_expand_btn = hovered
                     self.setCursor(Qt.PointingHandCursor if hovered else Qt.ArrowCursor)
                     self.update()
+                return
             elif getattr(self, '_hover_expand_btn', False):
                 self._hover_expand_btn = False
                 self.setCursor(Qt.ArrowCursor)
                 self.update()
+            if self._text_select_mode or (event.modifiers() & Qt.ShiftModifier):
+                if self._ocr_doc is None and not self._ocr_loading:
+                    self._ensure_ocr_doc(notify=False)
+                if self._text_doc_ready():
+                    hover = self._text_char_at(event.pos())
+                    if hover != self._text_hover:
+                        self._text_hover = hover
+                        self.update()
+                    self.setCursor(Qt.IBeamCursor if (hover is not None or self._text_select_mode) else Qt.ArrowCursor)
+                    return
+            elif self._text_hover is not None:
+                self._text_hover = None
+                self.setCursor(Qt.ArrowCursor)
+                self.update()
+            return
+
+        if event.buttons() == Qt.LeftButton and self._text_dragging:
+            if self._text_doc_ready() and self._text_sel_start_index is not None:
+                sx, sy = self._text_geometry()
+                tlx = event.pos().x() / sx if sx > 0 else None
+                tly = event.pos().y() / sy if sy > 0 else None
+                row_indices = ocr_doc_column_rows(self._ocr_doc, self._text_sel_column_rect, tlx, tly)
+                end_idx = self._text_index_at(event.pos(), row_indices)
+                if end_idx is not None:
+                    flat = ocr_doc_flat(self._ocr_doc, row_indices)
+                    try:
+                        a = flat.index(self._text_sel_start_index)
+                        b = flat.index(end_idx)
+                        lo, hi = (a, b) if a <= b else (b, a)
+                        self._text_selected = set(flat[lo:hi + 1])
+                        self.update()
+                    except ValueError:
+                        pass
+            event.accept()
             return
 
         if event.buttons() == Qt.LeftButton:
@@ -10647,6 +11095,21 @@ class PinnedWindow(QWidget):
                     QTimer.singleShot(0, self._trigger_os_file_drag)
                 event.accept()
                 return
+
+        if event.button() == Qt.LeftButton and getattr(self, '_text_dragging', False):
+            self._text_dragging = False
+            moved = (event.pos() - self._text_sel_start).manhattanLength()
+            if moved < 3:
+                self._text_selected = set()
+                self._text_hover = self._text_char_at(event.pos())
+                self.update()
+            else:
+                txt = self._selected_text()
+                if txt:
+                    self._show_hud(f"已选 {len(txt)} 字 · Ctrl+C 复制", ms=1800)
+                self.update()
+            event.accept()
+            return
 
         if event.button() == Qt.LeftButton:
             if getattr(self, '_expand_btn_pressed', False):
@@ -10754,32 +11217,22 @@ class PinnedWindow(QWidget):
             self._suppress_next_context_menu = False
             event.accept()
             return
+        if self._text_selected:
+            exec_text_selection_menu(
+                self, self.mapToGlobal(event.pos()), self._selected_text(),
+                on_copy=self._copy_selected_text,
+                on_copy_table=self._copy_selected_as_table,
+                on_translate=self._translate_selected_text,
+                on_select_all=self._select_all_text,
+                on_clear=self._clear_text_selection,
+                extra_exit_action=("🔓 退出划词取字 (T)", lambda: self.toggle_text_select_mode(False))
+                if self._text_select_mode else None,
+            )
+            return
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #FFFFFF;
-                border: 1px solid #E4E4E7;
-                border-radius: 10px;
-                padding: 5px;
-                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
-                font-size: 12.5px;
-                color: #18181B;
-            }
-            QMenu::item {
-                padding: 6px 14px;
-                border-radius: 6px;
-            }
-            QMenu::item:selected {
-                background-color: #F4F4F5;
-                color: #09090B;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #ECECEF;
-                margin: 4px 8px;
-            }
-        """)
+        menu.setStyleSheet(CODEX_MENU_QSS)
         drawer_action = menu.addAction("🗄️ 存入抽屉 (Drawer)")
+        text_mode_action = menu.addAction("✅ 退出划词取字 (T)" if self._text_select_mode else "✏️ 贴图内划词取字 (T · Shift+拖选)")
         silent_ocr_action = menu.addAction("⚡ 静默识别文字并复制")
         ocr_action = menu.addAction("🔤 OCR 识别与翻译 (F2)")
         qr_action = menu.addAction("🔲 识别二维码 / 条码")
@@ -10814,6 +11267,8 @@ class PinnedWindow(QWidget):
         if action == drawer_action:
             if self.main_app_ref and hasattr(self.main_app_ref, "pin_drawer") and self.main_app_ref.pin_drawer:
                 self.main_app_ref.pin_drawer.add_pin_directly(self)
+        elif action == text_mode_action:
+            self.toggle_text_select_mode()
         elif action == silent_ocr_action:
             self.silent_ocr_copy()
         elif action == ocr_action:
@@ -10888,7 +11343,18 @@ class PinnedWindow(QWidget):
         mods = event.modifiers()
         key = event.key()
         if key == Qt.Key_Escape:
-            self.close()
+            if self._text_selected:
+                self._clear_text_selection()
+            elif self._text_select_mode:
+                self.toggle_text_select_mode(False)
+            else:
+                self.close()
+        elif key == Qt.Key_T and not mods:
+            self.toggle_text_select_mode()
+        elif key in (Qt.Key_Return, Qt.Key_Enter) and not mods and self._text_selected:
+            self._copy_selected_text()
+        elif (mods & Qt.ControlModifier) and key == Qt.Key_A and (self._text_select_mode or self._text_selected) and self._text_doc_ready():
+            self._select_all_text()
         elif key == Qt.Key_F2:
             self.trigger_ocr()
         elif key == Qt.Key_1 and not mods:
@@ -10900,6 +11366,9 @@ class PinnedWindow(QWidget):
         elif (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) and key == Qt.Key_T:
             self.set_click_through(True)
         elif (mods & Qt.ControlModifier) and key == Qt.Key_C:
+            if self._text_selected:
+                self._copy_selected_text()
+                return
             QApplication.clipboard().setPixmap(self.pixmap)
             self._show_hud("已复制图片")
             print("Pinned image copied!")
@@ -18398,7 +18867,9 @@ class ScreenshotTool(QWidget):
                 if not getattr(self, 'eraser_state_saved', False):
                     self.save_state()
                     self.eraser_state_saved = True
-                self.edits.pop(i)
+                removed = self.edits.pop(i)
+                if removed.get('type') in ('TEXT', 'MOSAIC_BLUR', 'BLUR_STROKE'):
+                    self._erased_content_edit = True
                 return True
         return False
 
@@ -18413,6 +18884,9 @@ class ScreenshotTool(QWidget):
 
         self.options_bar = ToolOptionsBar(self)
         self.options_bar.options_changed.connect(self.on_tool_options_changed)
+        self.text_action_bar = TextSelectionActionBar(self)
+        self.text_action_bar.action_triggered.connect(self._on_text_bar_action)
+        self.text_action_bar.hide()
         rc = getattr(self.options_bar, 'rotate_controls', None)
         if rc is not None:
             rc.op_triggered.connect(self.apply_orthogonal_transform)
@@ -18491,6 +18965,8 @@ class ScreenshotTool(QWidget):
             self.toolbar.hide()
             if hasattr(self, 'options_bar') and self.options_bar:
                 self.options_bar.hide()
+            if hasattr(self, 'text_action_bar') and self.text_action_bar:
+                self.text_action_bar.hide()
             return
 
         # 边界严格使用 ScreenshotTool 自身坐标系，杜绝多显示器全局坐标偏移
@@ -18568,11 +19044,15 @@ class ScreenshotTool(QWidget):
             self.options_bar.raise_()
             self.options_bar.update_frosted_bg()
 
+        self._update_text_action_bar()
+
     def _raise_floating_bars(self):
         if hasattr(self, 'toolbar') and self.toolbar and self.toolbar.isVisible():
             self.toolbar.raise_()
         if hasattr(self, 'options_bar') and self.options_bar and self.options_bar.isVisible():
             self.options_bar.raise_()
+        if hasattr(self, 'text_action_bar') and self.text_action_bar and self.text_action_bar.isVisible():
+            self.text_action_bar.raise_()
 
 
     def _show_layer_limit_toast(self):
@@ -18688,6 +19168,8 @@ class ScreenshotTool(QWidget):
         if hasattr(self, 'options_bar'):
             self.options_bar.hide()
             self.options_bar.set_tool(None)
+        if hasattr(self, 'text_action_bar') and self.text_action_bar:
+            self.text_action_bar.hide()
         self.update_undo_redo_states()
         self.inline_editor.hide()
         if hasattr(self, 'crop_toolbar'):
@@ -18803,6 +19285,8 @@ class ScreenshotTool(QWidget):
                 self.toolbar.hide()
             if hasattr(self, 'options_bar') and self.options_bar:
                 self.options_bar.hide()
+            if hasattr(self, 'text_action_bar') and self.text_action_bar:
+                self.text_action_bar.hide()
             self.hide()
 
             root = getattr(self, "root_tool", self)
@@ -19007,6 +19491,8 @@ class ScreenshotTool(QWidget):
             self.toolbar.hide()
         if hasattr(self, 'options_bar'):
             self.options_bar.hide()
+        if hasattr(self, 'text_action_bar') and self.text_action_bar:
+            self.text_action_bar.hide()
 
     def _leave_modal_layer(self):
         self.setCursor(Qt.CrossCursor)
@@ -19164,6 +19650,8 @@ class ScreenshotTool(QWidget):
             if not self.isVisible() or self.state != "EDITING":
                 self._drain_ocr_waiters(error="截图已关闭")
                 return
+            if silent and not clean and getattr(worker, "detected_codes", None):
+                self._last_auto_codes = list(worker.detected_codes)
             if clean and not clean.startswith("识别发生错误"):
                 if on_no_coords:
                     on_no_coords(clean)
@@ -19218,19 +19706,10 @@ class ScreenshotTool(QWidget):
     def _text_char_at(self, pos):
         if not self._text_doc_ready():
             return None
-        doc = self._ocr_doc
         sx, sy, ox, oy = self._text_geometry()
         if sx <= 0 or sy <= 0:
             return None
-        lx = int((pos.x() - ox) / sx)
-        ly = int((pos.y() - oy) / sy)
-        for ri, row in enumerate(doc.rows):
-            if ly < row.rect.top() - 3 or ly > row.rect.bottom() + 3:
-                continue
-            for ci, cr in enumerate(row.char_rects):
-                if cr.adjusted(-2, -2, 2, 2).contains(QPoint(lx, ly)):
-                    return (ri, ci)
-        return None
+        return ocr_doc_char_at(self._ocr_doc, (pos.x() - ox) / sx, (pos.y() - oy) / sy)
 
     def _schedule_auto_text_ocr(self):
         if self._valid_capture_selection():
@@ -19250,13 +19729,30 @@ class ScreenshotTool(QWidget):
         def _ok(doc):
             self._auto_ocr_pending = False
             self._text_ocr_hint = ""
+            if (self._text_doc_ready() and not self._text_dragging
+                    and not getattr(self, 'drag_mode', None)
+                    and not (QApplication.keyboardModifiers() & Qt.AltModifier)):
+                pos = self.mapFromGlobal(QCursor.pos())
+                if (self.selection_rect.contains(pos)
+                        and self.get_resize_edge(pos, allow_move=False) is None):
+                    hover = self._text_char_at(pos)
+                    if hover is not None:
+                        self._text_hover = hover
+                        self.color_picker_visible = False
+                        self.setCursor(Qt.IBeamCursor)
             self.update()
 
         def _fail(_msg=""):
             self._auto_ocr_pending = False
             self._text_ocr_hint = ""
+            codes = getattr(self, "_last_auto_codes", None)
+            if codes:
+                self._last_auto_codes = None
+                self._flash_text_status(f"🔲 检测到 {codes[0].get('type', '二维码')} · 按 F2 查看/复制", ms=3200)
+                return
             self.update()
 
+        self._last_auto_codes = None
         self._request_ocr_doc(_ok, on_no_coords=_fail, on_error=_fail, silent=True)
 
     def _reset_text_selection_state(self):
@@ -19267,6 +19763,9 @@ class ScreenshotTool(QWidget):
         self._text_sel_rect = QRect()
         self._text_selected = set()
         self._text_hover = None
+        bar = getattr(self, 'text_action_bar', None)
+        if bar is not None:
+            bar.hide()
 
     def _invalidate_text_doc(self):
         self._ocr_generation += 1
@@ -19288,91 +19787,35 @@ class ScreenshotTool(QWidget):
         self._text_flash = ""
         self.update()
 
-    def _text_column_rows(self):
-        """锁定起始文字所在列，复制时不会把侧边栏/另一栏的文字混进来。"""
+    def _text_column_rows(self, pos=None):
+        """锁定起始文字所在栏；若拖拽明显跨过栏隙到达相邻列，则放开跨栏选取。"""
         if self._ocr_doc is None:
             return []
-        rows = self._ocr_doc.rows
-        col = self._text_sel_column_rect
-        if col.isNull():
-            return list(range(len(rows)))
-        result = []
-        img_w = self._ocr_doc.image_size.width() or col.right()
-        if col.left() >= img_w * 0.25:
-            # 起始点在右半区：锁定右侧正文列，左侧侧边栏不参与
-            col_left = max(0, col.left() - int(img_w * 0.03))
-            col_right = img_w - 1
-        elif col.width() < img_w * 0.30:
-            # 起始点在左侧窄带：按侧边栏处理
-            col_left = 0
-            col_right = min(img_w - 1, col.right() + int(img_w * 0.08))
-        else:
-            col_left, col_right = 0, img_w - 1
-        for ri, row in enumerate(rows):
-            # 只按横向区间判断同一列，纵向要覆盖整张图，不能只看起始行的高度
-            left = max(col_left, row.rect.left())
-            right = min(col_right, row.rect.right())
-            overlap = max(0, right - left + 1)
-            min_w = min(col.width(), row.rect.width())
-            if min_w > 0 and overlap / min_w >= 0.30:
-                result.append(ri)
-        return result or list(range(len(rows)))
+        target_lx = target_ly = None
+        if pos is not None:
+            sx, sy, ox, oy = self._text_geometry()
+            if sx > 0 and sy > 0:
+                target_lx = (pos.x() - ox) / sx
+                target_ly = (pos.y() - oy) / sy
+        return ocr_doc_column_rows(self._ocr_doc, self._text_sel_column_rect, target_lx, target_ly)
 
     def _text_flat(self, row_indices=None):
-        if self._ocr_doc is None:
-            return []
-        rows = self._ocr_doc.rows
-        if row_indices is None:
-            row_indices = range(len(rows))
-        flat = []
-        for ri in row_indices:
-            row = rows[ri]
-            for ci in range(len(row.text)):
-                flat.append((ri, ci))
-        return flat
+        return ocr_doc_flat(self._ocr_doc, row_indices)
 
     def _text_index_at(self, pos, row_indices=None):
         """把鼠标位置映射成阅读顺序中的字符索引，用于像文本编辑器一样线性选取。"""
         if not self._text_doc_ready():
             return None
-        doc = self._ocr_doc
         sx, sy, ox, oy = self._text_geometry()
         if sx <= 0 or sy <= 0:
             return None
-        lx = (pos.x() - ox) / sx
-        ly = (pos.y() - oy) / sy
-        rows = doc.rows
-        if not rows:
-            return None
-        candidates = list(row_indices) if row_indices is not None else list(range(len(rows)))
-        if not candidates:
-            candidates = list(range(len(rows)))
-
-        def vdist(row):
-            if ly < row.rect.top():
-                return row.rect.top() - ly
-            if ly > row.rect.bottom():
-                return ly - row.rect.bottom()
-            return 0
-
-        def hdist(row):
-            if lx < row.rect.left():
-                return row.rect.left() - lx
-            if lx > row.rect.right():
-                return lx - row.rect.right()
-            return 0
-
-        # 先看纵向距离，再看横向距离，避免在左右两栏之间起选时选错列
-        ri = min(candidates, key=lambda i: (vdist(rows[i]), hdist(rows[i])))
-        row = rows[ri]
-        for ci, cr in enumerate(row.char_rects):
-            if cr.center().x() >= lx:
-                return (ri, ci)
-        return (ri, max(0, len(row.char_rects) - 1))
+        return ocr_doc_index_at(self._ocr_doc, (pos.x() - ox) / sx, (pos.y() - oy) / sy, row_indices)
 
     def _start_text_selection(self, pos):
         self.drag_mode = None
         self._text_dragging = True
+        self._text_flash = ""
+        self._text_flash_timer.stop()
         self._text_sel_start = pos
         self._text_sel_column_rect = QRect()
         self._text_sel_start_index = self._text_index_at(pos)
@@ -19390,7 +19833,7 @@ class ScreenshotTool(QWidget):
         self._text_sel_rect = QRect(self._text_sel_start, pos).normalized()
         if self._ocr_doc is None or self._text_sel_start_index is None:
             return
-        row_indices = self._text_column_rows()
+        row_indices = self._text_column_rows(pos)
         end_index = self._text_index_at(pos, row_indices)
         if end_index is None:
             return
@@ -19412,30 +19855,24 @@ class ScreenshotTool(QWidget):
             self._text_selected.clear()
             self._text_sel_rect = QRect()
             self._text_hover = self._text_char_at(pos)
+            self._update_text_action_bar()
             self.update()
             return
         self._update_text_selection(pos)
+        self._update_text_action_bar()
         self.update()
 
     def _selected_text(self):
-        if not self._text_selected or self._ocr_doc is None:
-            return ""
-        lines = []
-        for ri, row in enumerate(self._ocr_doc.rows):
-            chars = [row.text[ci] for ci in range(len(row.text)) if (ri, ci) in self._text_selected]
-            if chars:
-                lines.append("".join(chars).rstrip())
-        return "\n".join(lines).strip()
+        return ocr_doc_selected_text(self._ocr_doc, self._text_selected)
 
     def _copy_selected_text(self):
         text = self._selected_text()
         if not text:
             return False
         QApplication.clipboard().setText(text)
-        # 复制后立即清掉文字高亮和状态胶囊，避免白色块继续罩住原文
-        self._text_flash = ""
-        self._text_flash_timer.stop()
+        # 复制后立即清掉文字高亮（不遮挡原文），并在选区外侧显示确认胶囊
         self._reset_text_selection_state()
+        self._flash_text_status(f"✓ 已复制 {len(text)} 字 · Esc 退出", ms=2200)
         self.repaint()
         return True
 
@@ -19445,70 +19882,268 @@ class ScreenshotTool(QWidget):
         self._text_selected = {(ri, ci) for ri, row in enumerate(self._ocr_doc.rows)
                                for ci in range(len(row.text))}
         self._text_sel_rect = QRect(self.selection_rect)
+        self._text_flash = ""
+        self._text_flash_timer.stop()
+        self._update_text_action_bar()
         self.update()
 
     def _clear_text_selection(self):
         self._reset_text_selection_state()
         self._text_flash = ""
+        self._text_flash_timer.stop()
         self.update()
 
-    def _draw_text_status_pill(self, painter, text):
-        """状态提示固定在选区外侧（左下或左上），不跟随鼠标和文字选区。"""
+    def _place_text_status_pill(self, width, height):
+        """选择不与工具栏/选项栏及选区文字重叠的胶囊位置。"""
+        bounds = self.rect().adjusted(6, 6, -6, -6)
+        sel = self.selection_rect
+        x_left = max(bounds.left(), min(sel.left(), bounds.right() - width + 1))
+
+        blocked = []
+        for bar in (getattr(self, 'toolbar', None), getattr(self, 'options_bar', None), getattr(self, 'text_action_bar', None)):
+            try:
+                if bar is not None and bar.isVisible():
+                    blocked.append(bar.geometry().adjusted(-6, -4, 6, 4))
+            except RuntimeError:
+                pass
+
+        candidates = [
+            QRect(x_left, sel.bottom() + 8, width, height),
+            QRect(x_left, sel.top() - height - 8, width, height),
+        ]
+        tb = getattr(self, 'toolbar', None)
+        if tb is not None and tb.isVisible():
+            tb_g = tb.geometry()
+            candidates.append(QRect(tb_g.left() - width - 8, tb_g.top() + (tb_g.height() - height) // 2, width, height))
+            candidates.append(QRect(tb_g.right() + 9, tb_g.top() + (tb_g.height() - height) // 2, width, height))
+        candidates.extend([
+            QRect(sel.left() + 10, sel.top() + 10, width, height),
+            QRect(sel.left() + 10, max(bounds.top(), sel.bottom() - height - 10), width, height),
+        ])
+
+        for cand in candidates:
+            if bounds.contains(cand) and not any(cand.intersects(b) for b in blocked):
+                return cand
+        for cand in candidates:
+            if bounds.contains(cand):
+                return cand
+        cx = max(bounds.left(), min(x_left, max(bounds.left(), bounds.right() - width + 1)))
+        cy = max(bounds.top(), min(sel.top() + 10, max(bounds.top(), bounds.bottom() - height + 1)))
+        return QRect(cx, cy, width, height)
+
+    def _active_text_status_pill(self):
+        """返回当前应当显示的取字状态文案与色调: (text, tone)。"""
+        if self._text_flash:
+            return self._text_flash, "ok"
+        if self.current_tool is None and not self.crop_mode and not getattr(self, 'drag_mode', None):
+            if self._text_selected:
+                bar = getattr(self, 'text_action_bar', None)
+                if bar is not None and bar.isVisible():
+                    return "", "select"
+                sel_len = len(self._selected_text())
+                if sel_len > 0:
+                    hint = f"已选 {sel_len} 字" if self._text_dragging else f"已选 {sel_len} 字 · Ctrl+C / Enter 复制"
+                    return hint, "select"
+            if self._text_ocr_hint:
+                return self._text_ocr_hint, "info"
+        return "", "info"
+
+    def _draw_text_status_pill(self, painter, text, tone="info"):
+        """状态提示优先停靠在选区外侧并自动避让工具栏。"""
         if not text:
             return
         font = make_ui_font(pixel_size=12)
         painter.setFont(font)
         fm = QFontMetrics(font)
-        w = fm.horizontalAdvance(text) + 20
+        w = fm.horizontalAdvance(text) + 22
         h = 26
-        x = max(6, min(self.selection_rect.left(), self.width() - w - 6))
-        y = self.selection_rect.bottom() + 8
-        if y + h > self.height() - 6:
-            y = max(6, self.selection_rect.top() - h - 8)
-        rect = QRect(x, y, w, h)
-        painter.setPen(QPen(QColor(203, 213, 225), 1))
-        painter.setBrush(QColor(255, 255, 255, 242))
+        rect = self._place_text_status_pill(w, h)
+        palettes = {
+            "ok": (QColor(240, 253, 244, 246), QColor(134, 239, 172), QColor(21, 128, 61)),
+            "select": (QColor(251, 247, 238, 244), QColor(229, 210, 174), QColor(122, 81, 16)),
+            "info": (QColor(255, 255, 255, 242), QColor(203, 213, 225), QColor(51, 65, 85)),
+        }
+        bg, border, fg = palettes.get(tone, palettes["info"])
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(bg)
         painter.drawRoundedRect(rect, 7, 7)
-        painter.setPen(QColor(51, 65, 85))
+        painter.setPen(fg)
         painter.drawText(rect, Qt.AlignCenter, text)
+        painter.setBrush(Qt.NoBrush)
+
+    def _selected_ocr_doc(self):
+        """基于当前选中的文字构建子版面对象，供表格 TSV 还原或局部翻译使用。"""
+        return ocr_doc_selected_subdoc(self._ocr_doc, self._text_selected)
+
+    def _copy_selected_as_table(self):
+        text = self._selected_text()
+        if not text:
+            return False
+        tsv = extract_table_tsv(self._selected_ocr_doc(), text)
+        if not tsv.strip():
+            return False
+        QApplication.clipboard().setText(tsv)
+        self._reset_text_selection_state()
+        row_cnt = len([ln for ln in tsv.splitlines() if ln.strip()])
+        self._flash_text_status(f"✓ 已复制表格 ({row_cnt} 行) · Esc 退出", ms=2200)
+        self.repaint()
+        return True
+
+    def _translate_selected_text(self):
+        text = self._selected_text()
+        if not text:
+            return
+        sub_doc = self._selected_ocr_doc()
+        self._enter_modal_layer()
+        dlg = None
+        try:
+            dlg = OcrResultDialog(text, self, ocr_doc=sub_doc)
+            self._active_ocr_dialog = dlg
+            exec_dialog_nonmodal(dlg)
+        finally:
+            if dlg is not None and getattr(self, "_active_ocr_dialog", None) is dlg:
+                self._active_ocr_dialog = None
+            if self.isVisible():
+                self._leave_modal_layer()
+
+    def _show_text_context_menu(self, global_pos):
+        """选中文字或右键点击文字时弹出快捷菜单，避免误退出截图。"""
+        text = self._selected_text()
+        if not text:
+            return
+        chosen = exec_text_selection_menu(
+            self, global_pos, text,
+            on_copy=self._copy_selected_text,
+            on_copy_table=self._copy_selected_as_table,
+            on_translate=self._translate_selected_text,
+            on_select_all=self._select_all_text,
+            on_clear=self._clear_text_selection,
+            on_copy_exit=lambda: self.hide_app(keep_history=False) if self._copy_selected_text() else None,
+            extra_exit_action=("🚪 退出截图", lambda: self.hide_app(keep_history=False)),
+        )
+        if chosen is None and self.isVisible():
+            self._update_text_action_bar()
+            self.setFocus()
+
+    def _text_selection_bounds(self):
+        """返回当前选中文字在窗口坐标系中的外接矩形。"""
+        doc = self._ocr_doc
+        if doc is None or not self._text_selected:
+            return QRect()
+        bounds = QRect()
+        for ri, row in enumerate(doc.rows):
+            idxs = [ci for (r, ci) in self._text_selected if r == ri and ci < len(row.char_rects)]
+            if not idxs:
+                continue
+            ra = self._text_widget_rect(row.char_rects[min(idxs)])
+            rb = self._text_widget_rect(row.char_rects[max(idxs)])
+            row_r = QRect(
+                ra.left(), min(ra.top(), rb.top()),
+                max(1, rb.right() - ra.left() + 1), max(ra.height(), rb.height())
+            )
+            bounds = row_r if bounds.isNull() else bounds.united(row_r)
+        return bounds
+
+    def _update_text_action_bar(self):
+        bar = getattr(self, 'text_action_bar', None)
+        if bar is None:
+            return
+        should_show = (
+            self.isVisible()
+            and self.state == "EDITING"
+            and not self.crop_mode
+            and self.current_tool is None
+            and not self._text_dragging
+            and not getattr(self, 'drag_mode', None)
+            and self._text_select_layer is None
+            and self._translation_overlay is None
+            and bool(self._text_selected)
+        )
+        if not should_show:
+            bar.hide()
+            return
+        text = self._selected_text()
+        if not text:
+            bar.hide()
+            return
+
+        sub_doc = self._selected_ocr_doc()
+        has_table = bool(sub_doc is not None and len(sub_doc.rows) >= 2)
+        has_url = bool(re.search(r'https?://[^\s<>"\')\]}]+', text))
+        bar.configure(len(text), has_table=has_table, has_url=has_url)
+        hint = bar.sizeHint()
+        bw, bh = hint.width(), hint.height()
+        bar.resize(bw, bh)
+
+        sel_bounds = self._text_selection_bounds()
+        if sel_bounds.isNull():
+            sel_bounds = QRect(self.selection_rect)
+        screen_bounds = self.rect().adjusted(4, 4, -4, -4)
+        pad = getattr(bar, 'SHADOW_PAD', 8)
+
+        blocked = []
+        for other in (getattr(self, 'toolbar', None), getattr(self, 'options_bar', None)):
+            try:
+                if other is not None and other.isVisible():
+                    blocked.append(other.geometry().adjusted(-4, -4, 4, 4))
+            except RuntimeError:
+                pass
+
+        def _clamp_x(x_val):
+            return max(screen_bounds.left(), min(x_val, max(screen_bounds.left(), screen_bounds.right() - bw + 1)))
+
+        def _clamp_y(y_val):
+            return max(screen_bounds.top(), min(y_val, max(screen_bounds.top(), screen_bounds.bottom() - bh + 1)))
+
+        x_pref = _clamp_x(sel_bounds.left() - pad)
+        sel = self.selection_rect
+        candidates = [
+            QRect(x_pref, sel_bounds.bottom() + 4 - pad, bw, bh),
+            QRect(x_pref, sel_bounds.top() - bh - 4 + pad, bw, bh),
+            QRect(_clamp_x(sel.left() - pad), sel.bottom() + 6 - pad, bw, bh),
+            QRect(_clamp_x(sel.left() - pad), sel.top() - bh - 6 + pad, bw, bh),
+            QRect(x_pref, _clamp_y(sel_bounds.top() + 8), bw, bh),
+        ]
+
+        chosen = None
+        for cand in candidates:
+            if screen_bounds.contains(cand) and not any(cand.intersects(b) for b in blocked):
+                chosen = cand
+                break
+        if chosen is None:
+            for cand in candidates:
+                if screen_bounds.contains(cand):
+                    chosen = cand
+                    break
+        if chosen is None:
+            chosen = QRect(x_pref, _clamp_y(sel_bounds.bottom() + 4 - pad), bw, bh)
+
+        bar.move(chosen.topLeft())
+        bar.show()
+        bar.raise_()
+        bar.update_frosted_bg()
+
+    def _on_text_bar_action(self, action):
+        if action == 'COPY':
+            self._copy_selected_text()
+        elif action == 'COPY_EXIT':
+            if self._copy_selected_text():
+                self.hide_app(keep_history=False)
+        elif action == 'TABLE':
+            self._copy_selected_as_table()
+        elif action == 'TRANSLATE':
+            self._translate_selected_text()
+        elif action == 'OPEN_URL':
+            m = re.search(r'https?://[^\s<>"\')\]}]+', self._selected_text())
+            if m:
+                webbrowser.open(m.group(0))
 
     def _draw_text_layer(self, painter):
-        doc = self._ocr_doc
-        if doc is None or doc.is_empty():
-            return
-        if self._text_selected:
-            fill = QColor(196, 146, 62, 78)
-            border = QColor(148, 102, 32, 95)
-            painter.setPen(QPen(border, 1))
-            for ri, row in enumerate(doc.rows):
-                idxs = sorted(ci for (r, ci) in self._text_selected
-                              if r == ri and ci < len(row.char_rects))
-                if not idxs:
-                    continue
-                runs = []
-                start = prev = idxs[0]
-                for ci in idxs[1:]:
-                    if ci == prev + 1:
-                        prev = ci
-                    else:
-                        runs.append((start, prev))
-                        start = prev = ci
-                runs.append((start, prev))
-                for a, b in runs:
-                    ra = self._text_widget_rect(row.char_rects[a])
-                    rb = self._text_widget_rect(row.char_rects[b])
-                    rect = QRect(ra.left(), min(ra.top(), rb.top()),
-                                 max(1, rb.right() - ra.left() + 1), max(ra.height(), rb.height()))
-                    painter.fillRect(rect, fill)
-                    painter.drawRect(rect.adjusted(0, 0, -1, -1))
-        elif self._text_hover is not None:
-            try:
-                ri, ci = self._text_hover
-                rect = self._text_widget_rect(doc.rows[ri].char_rects[ci])
-                painter.fillRect(QRect(rect.left(), rect.bottom() - 2, rect.width(), 2),
-                                 QColor(182, 134, 58, 200))
-            except (IndexError, KeyError):
-                pass
+        ocr_doc_draw_selection(painter, self._ocr_doc, self._text_selected, self._text_hover, self._text_widget_rect)
+
+        pill_text, pill_tone = self._active_text_status_pill()
+        if pill_text:
+            self._draw_text_status_pill(painter, pill_text, tone=pill_tone)
 
     def translate_current_capture(self):
         """一键翻译：OCR 后生成覆盖译文的图片，按设置显示单图或左右对照。"""
@@ -19918,6 +20553,9 @@ class ScreenshotTool(QWidget):
                 'user_width': self.inline_editor.user_width,
                 'user_height': self.inline_editor.user_height,
             })
+            if self.isVisible() and self.state == "EDITING":
+                self._invalidate_text_doc()
+                self._schedule_auto_text_ocr()
         self.inline_editor.active_edit_ref = None
         self.inline_editor.hide()
         if self.isVisible():
@@ -20555,6 +21193,24 @@ class ScreenshotTool(QWidget):
             elif getattr(self, 'ocr_intent', False) or getattr(self, 'recording_intent', False):
                 self.hide_app(keep_history=False)
                 return
+            elif self.state == "EDITING" and not self.crop_mode:
+                pos = event.pos()
+                if self._text_selected:
+                    self._show_text_context_menu(event.globalPos())
+                    return
+                if (self._text_doc_ready() and self.selection_rect.contains(pos)):
+                    hit = self._text_char_at(pos)
+                    if hit is not None:
+                        ri = hit[0]
+                        self._text_selected = {(ri, ci) for ci in range(len(self._ocr_doc.rows[ri].text))}
+                        self._text_sel_rect = self._text_widget_rect(self._ocr_doc.rows[ri].rect)
+                        self._text_flash = ""
+                        self._text_flash_timer.stop()
+                        self.update()
+                        self._show_text_context_menu(event.globalPos())
+                        return
+                self.hide_app(keep_history=False)
+                return
             elif self.state in ["EDITING", "SELECTING"]:
                 self.hide_app(keep_history=False)
                 return
@@ -21033,6 +21689,10 @@ class ScreenshotTool(QWidget):
 
                 if self.current_tool in ['ERASER', 'ERASE']:
                     self.eraser_state_saved = False
+                    if getattr(self, '_erased_content_edit', False):
+                        self._erased_content_edit = False
+                        self._invalidate_text_doc()
+                        self._schedule_auto_text_ocr()
                     self.show_toolbar()
                     return
 
@@ -21076,6 +21736,9 @@ class ScreenshotTool(QWidget):
                                 self.update_undo_redo_states()
                         else:
                             item['temp'] = False
+                            if item.get('type') in ('MOSAIC_BLUR', 'BLUR_STROKE'):
+                                self._invalidate_text_doc()
+                                self._schedule_auto_text_ocr()
                     self.show_toolbar()
                     self.update()
                     return
@@ -21415,14 +22078,14 @@ class ScreenshotTool(QWidget):
             self.capture_history.pop(0)
         return item
 
-    def create_pinned_window(self, pixmap, initial_pos=None, zoom_factor=1.0):
+    def create_pinned_window(self, pixmap, initial_pos=None, zoom_factor=1.0, ocr_doc=None):
         """创建贴图窗口并注册到历史与活跃贴图列表"""
         if self.parent_tool is not None:
-            return self.root_tool.create_pinned_window(pixmap, initial_pos=initial_pos, zoom_factor=zoom_factor)
+            return self.root_tool.create_pinned_window(pixmap, initial_pos=initial_pos, zoom_factor=zoom_factor, ocr_doc=ocr_doc)
         if pixmap is None or pixmap.isNull():
             return None
         try:
-            new_pin = PinnedWindow(pixmap, main_app_ref=self, initial_pos=initial_pos, zoom_factor=zoom_factor)
+            new_pin = PinnedWindow(pixmap, main_app_ref=self, initial_pos=initial_pos, zoom_factor=zoom_factor, ocr_doc=ocr_doc)
             self.pinned_windows.append(new_pin)
             self.add_to_capture_history(pixmap, pos=new_pin.pos(), is_pinned=True, pin_window=new_pin, zoom_factor=new_pin.zoom_factor)
             return new_pin
@@ -21478,9 +22141,13 @@ class ScreenshotTool(QWidget):
         self.commit_text_edit()
         if getattr(self, '_rotation_preview_pixmap', None) is not None:
             self.commit_rotation_preview()
+        cached_doc = None
+        if (not self.edits and getattr(self, '_ocr_doc', None) is not None
+                and not self._ocr_doc.is_empty() and not getattr(self, '_rotated_base_pixmap', None)):
+            cached_doc = self._ocr_doc
         pixmap = self.get_final_static_image()
         pos = self.selection_rect.topLeft()
-        self.create_pinned_window(pixmap, initial_pos=pos, zoom_factor=1.0)
+        self.create_pinned_window(pixmap, initial_pos=pos, zoom_factor=1.0, ocr_doc=cached_doc)
         try:
             CaptureHistoryManager.get_instance().add_capture(pixmap, "pin")
             check_and_auto_save_capture(pixmap, prefix="pinned")
