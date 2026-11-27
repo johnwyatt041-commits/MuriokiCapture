@@ -25,7 +25,7 @@ for _dll_name in ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msv
     if os.path.exists(_sys_path):
         try:
             ctypes.CDLL(_sys_path)
-        except Exception:
+        except OSError:
             pass
 import re
 import json
@@ -143,6 +143,34 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def _is_dir_writable(path):
+    """检测目录是否具备真实写权限（兼容 Windows Program Files ACL / UAC 虚拟化）。"""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        with tempfile.TemporaryFile(dir=path):
+            pass
+        return True
+    except OSError:
+        return False
+
+def _resolve_data_dir(base_dir):
+    """优先使用便携目录（若可写），只读安装目录自动回落至 %LOCALAPPDATA%\\MuriokiCapture。"""
+    env_dir = os.environ.get("MURIOKI_DATA_DIR", "").strip()
+    if env_dir:
+        os.makedirs(env_dir, exist_ok=True)
+        return env_dir
+    if _is_dir_writable(base_dir):
+        data_dir = base_dir
+    else:
+        local_root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        data_dir = os.path.join(local_root, "MuriokiCapture")
+        os.makedirs(data_dir, exist_ok=True)
+    os.environ["MURIOKI_DATA_DIR"] = data_dir
+    return data_dir
+
+DATA_DIR = _resolve_data_dir(BASE_DIR)
+
 def get_resource_path(relative_path):
     """获取资源文件路径（兼容 PyInstaller 打包临时目录与源码运行目录）"""
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -151,13 +179,13 @@ def get_resource_path(relative_path):
             return bundle_path
     return os.path.join(BASE_DIR, relative_path)
 
-TEMP_FOLDER = os.path.join(BASE_DIR, "temp_scroll_frames")
-REC_TEMP_FOLDER = os.path.join(BASE_DIR, "temp_screen_recording")
+TEMP_FOLDER = os.path.join(DATA_DIR, "temp_scroll_frames")
+REC_TEMP_FOLDER = os.path.join(DATA_DIR, "temp_screen_recording")
 
 # ==========================================
 # AI 翻译与多模态识别配置 (智谱 GLM-OCR & 火山方舟豆包翻译)
 # ==========================================
-SETTINGS_FILE = os.path.join(BASE_DIR, "capture_settings.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "capture_settings.json")
 from pin_drawer import (
     PinDrawerWindow,
     DrawerHoverPreview,
@@ -171,7 +199,7 @@ from frosted_ui import FrostedBarWidget, FrostedTrayMenu, create_frosted_pixmap
 # ==========================================
 # 应用版本与在线更新
 # ==========================================
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
 GITHUB_REPO = "johnwyatt041-commits/MuriokiCapture"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -442,8 +470,82 @@ def sync_autostart_path_if_enabled():
         pass
 
 
+_SECRET_SETTINGS_KEYS = ("zhipu_api_key", "volc_api_key")
+_DPAPI_PREFIX = "dpapi:"
+
+
+class _DPAPIDataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+
+def _dpapi_transform(raw_bytes, protect=True):
+    """使用 Windows DPAPI 对字节串做当前用户级加解密。"""
+    if sys.platform != "win32" or not raw_bytes:
+        return None
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if protect:
+        fn.argtypes = [
+            ctypes.POINTER(_DPAPIDataBlob), wintypes.LPCWSTR,
+            ctypes.POINTER(_DPAPIDataBlob), ctypes.c_void_p,
+            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DPAPIDataBlob),
+        ]
+    else:
+        fn.argtypes = [
+            ctypes.POINTER(_DPAPIDataBlob), ctypes.c_void_p,
+            ctypes.POINTER(_DPAPIDataBlob), ctypes.c_void_p,
+            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DPAPIDataBlob),
+        ]
+    fn.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    buf = ctypes.create_string_buffer(raw_bytes, len(raw_bytes))
+    in_blob = _DPAPIDataBlob(len(raw_bytes), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = _DPAPIDataBlob()
+    CRYPTPROTECT_UI_FORBIDDEN = 0x1
+    args = (ctypes.byref(in_blob), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob))
+    if not fn(*args):
+        return None
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        if out_blob.pbData:
+            kernel32.LocalFree(ctypes.cast(out_blob.pbData, ctypes.c_void_p))
+
+
+def _protect_secret(value):
+    s = str(value or "").strip()
+    if not s or s.startswith(_DPAPI_PREFIX):
+        return s
+    try:
+        encrypted = _dpapi_transform(s.encode("utf-8"), protect=True)
+        if encrypted:
+            return _DPAPI_PREFIX + base64.b64encode(encrypted).decode("ascii")
+    except Exception as e:
+        logging.warning("DPAPI 加密配置密钥失败，回退明文保存: %s", e)
+    return s
+
+
+def _unprotect_secret(value):
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if not s.startswith(_DPAPI_PREFIX):
+        return s
+    try:
+        raw = base64.b64decode(s[len(_DPAPI_PREFIX):].encode("ascii"))
+        decrypted = _dpapi_transform(raw, protect=False)
+        if decrypted is not None:
+            return decrypted.decode("utf-8").strip()
+    except Exception as e:
+        logging.warning("DPAPI 解密配置密钥失败（可能更换了系统用户或机器）: %s", e)
+    return ""
+
+
 def load_settings():
-    """从本地 JSON 文件加载用户设置（自动兼容迁移历史配置文件）"""
+    """从本地 JSON 文件加载用户设置（自动兼容迁移历史配置文件与加密密钥）"""
     defaults = {
         "use_ai_translation": False,
         "use_ai_ocr": False,
@@ -483,23 +585,33 @@ def load_settings():
         defaults[_spec[0]] = ""
     try:
         cfg_file = SETTINGS_FILE
-        if not os.path.exists(cfg_file) and os.path.exists(BASE_DIR):
-            legacy_cands = [os.path.join(BASE_DIR, f) for f in os.listdir(BASE_DIR) if f.endswith("settings.json") and f != "capture_settings.json"]
-            if legacy_cands and os.path.exists(legacy_cands[0]):
-                cfg_file = legacy_cands[0]
+        if not os.path.exists(cfg_file):
+            # 只读安装目录下若预置了 capture_settings.json，则作为初始配置读取
+            install_cfg = os.path.join(BASE_DIR, "capture_settings.json")
+            if os.path.exists(install_cfg):
+                cfg_file = install_cfg
+            elif os.path.exists(DATA_DIR):
+                legacy_cands = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith("settings.json") and f != "capture_settings.json"]
+                if legacy_cands and os.path.exists(legacy_cands[0]):
+                    cfg_file = legacy_cands[0]
         if cfg_file and os.path.exists(cfg_file):
             with open(cfg_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             defaults.update(data)
     except Exception as e:
         logging.warning("加载设置文件失败: %s", e)
+    for _sk in _SECRET_SETTINGS_KEYS:
+        defaults[_sk] = _unprotect_secret(defaults.get(_sk, ""))
     return defaults
 
 def save_settings(settings_dict):
-    """将用户设置持久化到本地 JSON 文件"""
+    """将用户设置持久化到本地 JSON 文件（API Key 自动使用 Windows DPAPI 保护）"""
     try:
         existing = load_settings()
         existing.update(settings_dict)
+        for _sk in _SECRET_SETTINGS_KEYS:
+            existing[_sk] = _protect_secret(existing.get(_sk, ""))
+        os.makedirs(os.path.dirname(os.path.abspath(SETTINGS_FILE)), exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -616,7 +728,7 @@ def _pick_auto_ocr_langs():
 AUTO_OCR_LANGS = _pick_auto_ocr_langs()
 
 # 初始化日志配置（采用 RotatingFileHandler 限制最大 1MB，日常仅记录 INFO/ERROR，彻底避免无限膨胀）
-LOG_FILE = os.path.join(BASE_DIR, "capture_app.log")
+LOG_FILE = os.path.join(DATA_DIR, "capture_app.log")
 _log_handler = RotatingFileHandler(LOG_FILE, maxBytes=1*1024*1024, backupCount=1, encoding='utf-8')
 _log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 _root_logger = logging.getLogger()
@@ -791,10 +903,8 @@ def _register_nonmodal_dialog(dlg):
 
 
 def _unregister_nonmodal_dialog(dlg):
-    try:
+    if dlg in _NONMODAL_DIALOGS:
         _NONMODAL_DIALOGS.remove(dlg)
-    except ValueError:
-        pass
 
 
 def _get_visible_nonmodal_dialogs():
@@ -1022,8 +1132,8 @@ class WindowSnapper:
                         child_title = best_child['title'] or w['title']
                         return best_child['rect'], child_title
                     return w['rect'], w['title']
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("WindowSnapper.detect_at 异常: %s", e)
         return None, ""
 
     def detect_top_level_at(self, screen_x, screen_y):
@@ -1067,8 +1177,8 @@ class WindowSnapper:
 
         try:
             _user32.EnumWindows(_WNDENUMPROC(enum_cb), 0)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("WindowSnapper.detect_top_level_at EnumWindows 异常: %s", e)
 
         if found:
             return found
@@ -1886,8 +1996,8 @@ class WindowPinManager(QObject):
                 try:
                     badge.close()
                     badge.deleteLater()
-                except Exception:
-                    pass
+                except RuntimeError as e:
+                    logging.debug("关闭置顶角标时窗口已释放: %s", e)
         if not self._tracked and self._sync_timer.isActive():
             self._sync_timer.stop()
 
@@ -1933,8 +2043,8 @@ class WindowPinManager(QObject):
                     return True
                 cur = _user32.GetWindow(cur, GW_HWNDPREV)
                 steps += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("检查窗口 Z 序异常: %s", e)
         return False
 
     @staticmethod
@@ -2909,8 +3019,11 @@ class OcrResultDialog(QDialog):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
+        main_layout.addWidget(self._build_top_bar(initial_text))
+        main_layout.addWidget(self._build_editor_body(initial_text), 1)
+        main_layout.addWidget(self._build_bottom_bar())
 
-        # ── 顶部 Codex 工具头（标题徽章行 + 模式工具栏）──
+    def _build_top_bar(self, initial_text):
         top_bar = QWidget()
         top_bar.setObjectName("codexTopBar")
         top_lay = QVBoxLayout(top_bar)
@@ -3017,9 +3130,9 @@ class OcrResultDialog(QDialog):
         row2.addStretch()
         row2.addWidget(self.btn_translate)
         top_lay.addLayout(row2)
-        main_layout.addWidget(top_bar)
+        return top_bar
 
-        # ── 中央双栏编辑卡片区 ──
+    def _build_editor_body(self, initial_text):
         body_wrap = QWidget()
         body_wrap.setObjectName("codexBody")
         body_lay = QVBoxLayout(body_wrap)
@@ -3096,57 +3209,60 @@ class OcrResultDialog(QDialog):
         right_layout.addWidget(self.target_edit, 1)
 
         if self.detected_codes:
-            codes_card = QFrame()
-            codes_card.setObjectName("codesCard")
-            codes_card.setStyleSheet(
-                "QFrame#codesCard { background-color: #FFFFFF; border: 1px solid #E5D2AE; border-radius: 10px; }"
-            )
-            codes_lay = QVBoxLayout(codes_card)
-            codes_lay.setContentsMargins(14, 10, 14, 10)
-            codes_lay.setSpacing(6)
-            for idx_c, code_info in enumerate(self.detected_codes[:5]):
-                c_row = QHBoxLayout()
-                c_row.setSpacing(8)
-                badge = QLabel(code_info.get("type", "CODE"))
-                badge.setStyleSheet(
-                    "background-color: #FBF7EE; color: #7A5110; border: 1px solid #E5D2AE; "
-                    "border-radius: 5px; padding: 2px 7px; font-size: 11px; font-weight: 600;"
-                )
-                val_txt = code_info.get("text", "")
-                val_edit = QLineEdit(val_txt)
-                val_edit.setReadOnly(True)
-                val_edit.setStyleSheet(
-                    f"QLineEdit {{ font-family: {CODEX_MONO_FAMILY}; font-size: 12px; color: #0F172A; "
-                    "background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 3px 8px; }}"
-                )
-                btn_copy_code = QPushButton("复制")
-                btn_copy_code.setObjectName("codexGhostBtn")
-                btn_copy_code.setCursor(Qt.PointingHandCursor)
-
-                def _copy_this(_=False, t=val_txt, b=btn_copy_code):
-                    QApplication.clipboard().setText(t)
-                    b.setText("已复制")
-                    QTimer.singleShot(1400, lambda: b.setText("复制"))
-
-                btn_copy_code.clicked.connect(_copy_this)
-                c_row.addWidget(badge)
-                c_row.addWidget(val_edit, 1)
-                c_row.addWidget(btn_copy_code)
-                if code_info.get("is_url"):
-                    btn_open = QPushButton("打开链接")
-                    btn_open.setObjectName("codexGhostBtn")
-                    btn_open.setCursor(Qt.PointingHandCursor)
-                    btn_open.clicked.connect(lambda _=False, u=val_txt: webbrowser.open(u))
-                    c_row.addWidget(btn_open)
-                codes_lay.addLayout(c_row)
-            body_lay.addWidget(codes_card)
+            body_lay.addWidget(self._build_codes_card())
 
         cards_layout.addWidget(left_card, 1)
         cards_layout.addWidget(right_card, 1)
         body_lay.addLayout(cards_layout, 1)
-        main_layout.addWidget(body_wrap, 1)
+        return body_wrap
 
-        # ── 底部操作栏 ──
+    def _build_codes_card(self):
+        codes_card = QFrame()
+        codes_card.setObjectName("codesCard")
+        codes_card.setStyleSheet(
+            "QFrame#codesCard { background-color: #FFFFFF; border: 1px solid #E5D2AE; border-radius: 10px; }"
+        )
+        codes_lay = QVBoxLayout(codes_card)
+        codes_lay.setContentsMargins(14, 10, 14, 10)
+        codes_lay.setSpacing(6)
+        for code_info in self.detected_codes[:5]:
+            c_row = QHBoxLayout()
+            c_row.setSpacing(8)
+            badge = QLabel(code_info.get("type", "CODE"))
+            badge.setStyleSheet(
+                "background-color: #FBF7EE; color: #7A5110; border: 1px solid #E5D2AE; "
+                "border-radius: 5px; padding: 2px 7px; font-size: 11px; font-weight: 600;"
+            )
+            val_txt = code_info.get("text", "")
+            val_edit = QLineEdit(val_txt)
+            val_edit.setReadOnly(True)
+            val_edit.setStyleSheet(
+                f"QLineEdit {{ font-family: {CODEX_MONO_FAMILY}; font-size: 12px; color: #0F172A; "
+                "background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 3px 8px; }}"
+            )
+            btn_copy_code = QPushButton("复制")
+            btn_copy_code.setObjectName("codexGhostBtn")
+            btn_copy_code.setCursor(Qt.PointingHandCursor)
+
+            def _copy_this(_=False, t=val_txt, b=btn_copy_code):
+                QApplication.clipboard().setText(t)
+                b.setText("已复制")
+                QTimer.singleShot(1400, lambda: b.setText("复制"))
+
+            btn_copy_code.clicked.connect(_copy_this)
+            c_row.addWidget(badge)
+            c_row.addWidget(val_edit, 1)
+            c_row.addWidget(btn_copy_code)
+            if code_info.get("is_url"):
+                btn_open = QPushButton("打开链接")
+                btn_open.setObjectName("codexGhostBtn")
+                btn_open.setCursor(Qt.PointingHandCursor)
+                btn_open.clicked.connect(lambda _=False, u=val_txt: webbrowser.open(u))
+                c_row.addWidget(btn_open)
+            codes_lay.addLayout(c_row)
+        return codes_card
+
+    def _build_bottom_bar(self):
         bottom_bar_w = QWidget()
         bottom_bar_w.setObjectName("codexBottomBar")
         bottom_bar = QHBoxLayout(bottom_bar_w)
@@ -3172,7 +3288,7 @@ class OcrResultDialog(QDialog):
         bottom_bar.addStretch()
         bottom_bar.addWidget(self.btn_primary_copy)
         bottom_bar.addWidget(self.btn_close)
-        main_layout.addWidget(bottom_bar_w)
+        return bottom_bar_w
 
     def _apply_style(self):
         self.setStyleSheet(CODEX_DIALOG_BASE_QSS + """
@@ -3586,8 +3702,8 @@ def detect_codes_in_image(img_source):
                 txt, _p, _ = qd.detectAndDecode(mat)
                 if txt:
                     _add("QR 码", txt)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("QRCodeDetector 扫码异常: %s", e)
 
         if not results and hasattr(cv2, "QRCodeDetectorAruco"):
             try:
@@ -6736,7 +6852,7 @@ class TranslationResultWindow(QDialog):
             old.row_ready.disconnect(self._on_row_ready)
             old.progress.disconnect(self._on_progress)
             old.all_done.disconnect(self._on_all_done)
-        except Exception:
+        except (TypeError, RuntimeError):
             pass
 
     def _on_worker_finished(self):
@@ -7026,7 +7142,7 @@ class TranslationOverlay(QWidget):
             old.row_ready.disconnect(self._on_row_ready)
             old.progress.disconnect(self._on_progress)
             old.all_done.disconnect(self._on_all_done)
-        except Exception:
+        except (TypeError, RuntimeError):
             pass
 
     def _on_worker_finished(self):
@@ -7248,6 +7364,269 @@ def get_text_annotation_rect(edit, offset=QPoint(0, 0)):
     h = max(bounds.height(), float(uh)) if uh is not None else bounds.height()
     return QRectF(bounds.left(), bounds.top(), w, h)
 
+def _draw_edit_rect_ellipse(painter, edit, offset):
+    p1 = edit['p1'] - offset
+    p2 = edit['p2'] - offset
+    r = QRectF(p1, p2).normalized()
+    kind = edit.get('kind', 'rect')
+    fill_mode = edit.get('fillMode', 'none')
+    stroke_color = edit.get('strokeColor', QColor(255, 0, 0))
+    fill_color = edit.get('fillColor', stroke_color)
+    stroke_w = edit.get('strokeWidth', 3)
+    corner_radius = edit.get('cornerRadius', 0)
+
+    painter.save()
+    pen = QPen(stroke_color, stroke_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    if fill_mode == 'fill':
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(fill_color))
+    elif fill_mode == 'stroke_fill':
+        painter.setPen(pen)
+        painter.setBrush(QBrush(fill_color))
+    else:
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+    if kind == 'ellipse':
+        painter.drawEllipse(r)
+    elif corner_radius > 0:
+        painter.drawRoundedRect(r, corner_radius, corner_radius)
+    else:
+        painter.drawRect(r)
+    painter.restore()
+
+
+def _draw_edit_arrow(painter, edit, offset):
+    p1 = edit['start'] - offset
+    p2 = edit['end'] - offset
+    color = edit.get('color', QColor(255, 0, 0))
+    width = edit.get('width', 3)
+    mode = edit.get('arrowMode', 'end')
+
+    painter.save()
+    painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    painter.drawLine(p1, p2)
+
+    def _draw_arrowhead(p_from, p_to):
+        dx = p_to.x() - p_from.x()
+        dy = p_to.y() - p_from.y()
+        dist = math.hypot(dx, dy)
+        if dist < 2:
+            return
+        angle = math.atan2(p_from.y() - p_to.y(), p_from.x() - p_to.x())
+        arrow_len = min(dist * 0.45, 12.0 + width * 1.8)
+        arrow_angle = math.pi / 6.5
+        pa = QPointF(p_to.x() + arrow_len * math.cos(angle + arrow_angle),
+                     p_to.y() + arrow_len * math.sin(angle + arrow_angle))
+        pb = QPointF(p_to.x() + arrow_len * math.cos(angle - arrow_angle),
+                     p_to.y() + arrow_len * math.sin(angle - arrow_angle))
+        head_path = QPainterPath()
+        head_path.moveTo(QPointF(p_to))
+        head_path.lineTo(pa)
+        head_path.lineTo(pb)
+        head_path.closeSubpath()
+        painter.setBrush(QBrush(color))
+        painter.setPen(QPen(color, 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawPath(head_path)
+
+    if mode in ['end', 'both']:
+        _draw_arrowhead(p1, p2)
+    if mode in ['start', 'both']:
+        _draw_arrowhead(p2, p1)
+    painter.restore()
+
+
+def _draw_edit_polyline(painter, points, offset, color, width, cap=Qt.RoundCap):
+    if len(points) < 2:
+        return
+    painter.save()
+    painter.setPen(QPen(color, width, Qt.SolidLine, cap, Qt.RoundJoin))
+    painter.setBrush(Qt.NoBrush)
+    path = QPainterPath()
+    path.moveTo(points[0] - offset)
+    for pt in points[1:]:
+        path.lineTo(pt - offset)
+    painter.drawPath(path)
+    painter.restore()
+
+
+def _make_mosaic_tile_pixmap(sub_img, width, height, tile_size, smooth=False):
+    gw = max(1, width // max(2, tile_size))
+    gh = max(1, height // max(2, tile_size))
+    small = sub_img.scaled(gw, gh, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+    transform = Qt.SmoothTransformation if smooth else Qt.FastTransformation
+    return QPixmap.fromImage(small.scaled(width, height, Qt.IgnoreAspectRatio, transform))
+
+
+def _draw_clipped_mosaic_stroke(painter, points, radius, stroke_w, proc_pix, bbox, offset, base_origin):
+    painter.save()
+    stroker = QPainterPathStroker()
+    stroker.setWidth(stroke_w)
+    stroker.setCapStyle(Qt.RoundCap)
+    stroker.setJoinStyle(Qt.RoundJoin)
+
+    line_path = QPainterPath()
+    line_path.moveTo(points[0] - offset)
+    if len(points) == 1:
+        line_path.lineTo(points[0] - offset + QPoint(1, 1))
+    else:
+        for pt in points[1:]:
+            line_path.lineTo(pt - offset)
+    painter.setClipPath(stroker.createStroke(line_path))
+    painter.drawPixmap(bbox.translated(base_origin - offset).topLeft(), proc_pix)
+    painter.restore()
+
+
+def _draw_edit_mosaic_blur(painter, edit, base_pixmap, offset, base_origin):
+    points = edit.get('points', [])
+    if base_pixmap is None or not points:
+        return
+    mode = edit.get('mode', 'mosaic')
+    block_size = edit.get('blockSize', 10)
+    smooth = edit.get('smooth', False)
+    brush_w = edit.get('brushWidth', 22)
+
+    radius = brush_w // 2 + 2
+    world_bbox = QRect(
+        QPoint(min(p.x() for p in points) - radius, min(p.y() for p in points) - radius),
+        QPoint(max(p.x() for p in points) + radius, max(p.y() for p in points) + radius),
+    )
+    bbox = world_bbox.translated(-base_origin).intersected(base_pixmap.rect())
+    if bbox.isEmpty() or bbox.width() <= 0 or bbox.height() <= 0:
+        return
+
+    sub_img = base_pixmap.copy(bbox).toImage()
+    if mode == 'blur':
+        try:
+            ptr = sub_img.bits()
+            ptr.setsize(sub_img.byteCount())
+            arr = np.frombuffer(ptr, np.uint8).reshape((sub_img.height(), sub_img.width(), 4))
+            ksize = max(3, int(block_size * 2) | 1)
+            blurred_rgb = cv2.GaussianBlur(arr[:, :, :3], (ksize, ksize), 0)
+            out_arr = arr.copy()
+            out_arr[:, :, :3] = blurred_rgb
+            qimg_blur = QImage(out_arr.data, bbox.width(), bbox.height(), sub_img.bytesPerLine(), QImage.Format_ARGB32_Premultiplied)
+            proc_pix = QPixmap.fromImage(qimg_blur)
+        except Exception as e:
+            logging.debug("高斯模糊回退缩放模糊: %s", e)
+            tile_size = max(2, block_size)
+            small = sub_img.scaled(max(1, bbox.width() // tile_size), max(1, bbox.height() // tile_size), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            proc_pix = QPixmap.fromImage(small.scaled(bbox.width(), bbox.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+    else:
+        proc_pix = _make_mosaic_tile_pixmap(sub_img, bbox.width(), bbox.height(), block_size, smooth=smooth)
+
+    _draw_clipped_mosaic_stroke(painter, points, radius, brush_w, proc_pix, bbox, offset, base_origin)
+
+
+def _draw_edit_text(painter, edit, offset):
+    text = edit.get('text', '')
+    if not text:
+        return
+    painter.save()
+    font = _extract_edit_font(edit)
+    box_rect = get_text_annotation_rect(edit, offset)
+    rot = int(edit.get('rotation', 0)) % 360
+    if rot:
+        center = box_rect.center()
+        painter.translate(center)
+        painter.rotate(rot)
+        painter.translate(-center)
+
+    if edit.get('bgEnabled', False) and edit.get('bgColor'):
+        painter.setBrush(QBrush(edit['bgColor']))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(box_rect, 4.0, 4.0)
+
+    inner_rect = box_rect.adjusted(
+        TEXT_BOX_CONTENT_PAD, TEXT_BOX_CONTENT_PAD,
+        -TEXT_BOX_CONTENT_PAD, -TEXT_BOX_CONTENT_PAD
+    )
+    doc = _build_text_document(text, font, content_width=max(12.0, inner_rect.width()))
+    ctx = QAbstractTextDocumentLayout.PaintContext()
+    ctx.palette.setColor(QPalette.Text, edit.get('color', QColor(255, 0, 0)))
+    painter.setClipRect(box_rect)
+    painter.translate(inner_rect.topLeft())
+    doc.documentLayout().draw(painter, ctx)
+    painter.restore()
+
+
+def _draw_edit_legacy(painter, edit, t, thickness, base_pixmap, offset, base_origin):
+    if t == 'RECTANGLE':
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(edit['color'], thickness))
+        painter.drawRect(edit['rect'].translated(-offset))
+    elif t == 'LINE':
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        line_style = Qt.DashLine if edit.get('lineStyle') == 'dashed' else Qt.SolidLine
+        painter.setPen(QPen(edit['color'], thickness, line_style, Qt.RoundCap, Qt.RoundJoin))
+        p1 = edit['start'] - offset
+        p2 = edit['end'] - offset
+        painter.drawLine(p1, p2)
+        if edit.get('arrow'):
+            angle = math.atan2(p1.y() - p2.y(), p1.x() - p2.x())
+            arrow_size = 10 + thickness * 1.5
+            p3 = QPoint(int(p2.x() + arrow_size * math.cos(angle + math.pi / 6)),
+                        int(p2.y() + arrow_size * math.sin(angle + math.pi / 6)))
+            p4 = QPoint(int(p2.x() + arrow_size * math.cos(angle - math.pi / 6)),
+                        int(p2.y() + arrow_size * math.sin(angle - math.pi / 6)))
+            painter.setBrush(QBrush(edit['color']))
+            painter.setPen(QPen(edit['color'], 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolygon(p2, p3, p4)
+        painter.restore()
+    elif t == 'BLUR':
+        source_rect = edit['rect'].translated(-base_origin)
+        if base_pixmap is not None:
+            source_rect = source_rect.intersected(base_pixmap.rect())
+        if base_pixmap is not None and not source_rect.isEmpty():
+            draw_rect = source_rect.translated(base_origin - offset)
+            mosaic = _make_mosaic_tile_pixmap(
+                base_pixmap.copy(source_rect).toImage(),
+                source_rect.width(), source_rect.height(),
+                max(6, thickness * 3), smooth=False
+            )
+            painter.drawPixmap(draw_rect.topLeft(), mosaic)
+    elif t == 'BLUR_STROKE':
+        points = edit.get('points', [])
+        if base_pixmap is not None and points:
+            radius = max(8, thickness * 4)
+            world_bbox = QRect(
+                QPoint(min(p.x() for p in points) - radius, min(p.y() for p in points) - radius),
+                QPoint(max(p.x() for p in points) + radius, max(p.y() for p in points) + radius),
+            )
+            bbox = world_bbox.translated(-base_origin).intersected(base_pixmap.rect())
+            if not bbox.isEmpty():
+                mosaic = _make_mosaic_tile_pixmap(
+                    base_pixmap.copy(bbox).toImage(),
+                    bbox.width(), bbox.height(),
+                    max(6, thickness * 3), smooth=False
+                )
+                _draw_clipped_mosaic_stroke(painter, points, radius, radius * 2, mosaic, bbox, offset, base_origin)
+    elif t == 'ELLIPSE':
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(edit['color'], thickness))
+        painter.drawEllipse(edit['rect'].translated(-offset))
+    elif t == 'HIGHLIGHTER':
+        hl_color = QColor(edit['color'])
+        hl_color.setAlpha(115)
+        _draw_edit_polyline(painter, edit.get('points', []), offset, hl_color, max(12, thickness * 4))
+    elif t == 'STEP':
+        step_pos = edit.get('pos') or edit.get('center')
+        if step_pos is not None:
+            pos = step_pos - offset
+            radius = edit.get('radius') or max(11, 8 + thickness * 2)
+            num_val = edit.get('num') if edit.get('num') is not None else edit.get('number', 1)
+            painter.save()
+            painter.setBrush(QBrush(edit['color']))
+            painter.setPen(QPen(Qt.white, 1.5))
+            painter.drawEllipse(pos, radius, radius)
+            text_color = Qt.white if edit['color'].lightness() < 165 else Qt.black
+            painter.setPen(QPen(text_color))
+            painter.setFont(make_ui_font(max(8, int(radius * 0.95)), QFont.DemiBold))
+            painter.drawText(QRect(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2), Qt.AlignCenter, str(num_val))
+            painter.restore()
+
+
 def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0), base_origin=QPoint(0, 0)):
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
@@ -7256,325 +7635,30 @@ def draw_all_edits(painter, edits, base_pixmap, offset=QPoint(0, 0), base_origin
     for edit in edits:
         t = edit.get('type')
         thickness = edit.get('thickness', edit.get('strokeWidth', edit.get('width', 3)))
-
-        # 1. 新版矩形 / 椭圆合并图元 (RectEllipsePaintItem)
         if t == 'RECT_ELLIPSE':
-            p1 = edit['p1'] - offset
-            p2 = edit['p2'] - offset
-            r = QRectF(p1, p2).normalized()
-            kind = edit.get('kind', 'rect')
-            fill_mode = edit.get('fillMode', 'none')
-            stroke_color = edit.get('strokeColor', QColor(255, 0, 0))
-            fill_color = edit.get('fillColor', stroke_color)
-            stroke_w = edit.get('strokeWidth', 3)
-            corner_radius = edit.get('cornerRadius', 0)
-
-            painter.save()
-            pen = QPen(stroke_color, stroke_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-
-            if fill_mode == 'fill':
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(fill_color))
-            elif fill_mode == 'stroke_fill':
-                painter.setPen(pen)
-                painter.setBrush(QBrush(fill_color))
-            else:
-                painter.setPen(pen)
-                painter.setBrush(Qt.NoBrush)
-
-            if kind == 'ellipse':
-                painter.drawEllipse(r)
-            else:
-                if corner_radius > 0:
-                    painter.drawRoundedRect(r, corner_radius, corner_radius)
-                else:
-                    painter.drawRect(r)
-            painter.restore()
-
-        # 2. 箭头图元 (ArrowPaintItem)
+            _draw_edit_rect_ellipse(painter, edit, offset)
         elif t == 'ARROW':
-            p1 = edit['start'] - offset
-            p2 = edit['end'] - offset
-            color = edit.get('color', QColor(255, 0, 0))
-            width = edit.get('width', 3)
-            mode = edit.get('arrowMode', 'end')
-
-            painter.save()
-            painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawLine(p1, p2)
-
-            def _draw_arrowhead(p_from, p_to):
-                dx = p_to.x() - p_from.x()
-                dy = p_to.y() - p_from.y()
-                dist = math.hypot(dx, dy)
-                if dist < 2: return
-                angle = math.atan2(p_from.y() - p_to.y(), p_from.x() - p_to.x())
-                arrow_len = min(dist * 0.45, 12.0 + width * 1.8)
-                arrow_angle = math.pi / 6.5
-                pa = QPointF(p_to.x() + arrow_len * math.cos(angle + arrow_angle),
-                             p_to.y() + arrow_len * math.sin(angle + arrow_angle))
-                pb = QPointF(p_to.x() + arrow_len * math.cos(angle - arrow_angle),
-                             p_to.y() + arrow_len * math.sin(angle - arrow_angle))
-                head_path = QPainterPath()
-                head_path.moveTo(QPointF(p_to))
-                head_path.lineTo(pa)
-                head_path.lineTo(pb)
-                head_path.closeSubpath()
-                painter.setBrush(QBrush(color))
-                painter.setPen(QPen(color, 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.drawPath(head_path)
-
-            if mode in ['end', 'both']:
-                _draw_arrowhead(p1, p2)
-            if mode in ['start', 'both']:
-                _draw_arrowhead(p2, p1)
-            painter.restore()
-
-        # 3. 记号笔 / 荧光笔图元 (MarkerPaintItem)
+            _draw_edit_arrow(painter, edit, offset)
         elif t == 'MARKER':
-            points = edit.get('points', [])
-            if len(points) >= 2:
-                painter.save()
-                color = QColor(edit.get('color', QColor(255, 230, 0)))
-                width = edit.get('width', 16)
-                opacity_pct = edit.get('opacity', 45)
-                color.setAlpha(int(255 * (opacity_pct / 100.0)))
-                tip_style = edit.get('tipStyle', 'round')
-                cap = Qt.RoundCap if tip_style == 'round' else Qt.SquareCap
-                painter.setPen(QPen(color, width, Qt.SolidLine, cap, Qt.RoundJoin))
-                painter.setBrush(Qt.NoBrush)
-                path = QPainterPath()
-                path.moveTo(points[0] - offset)
-                for pt in points[1:]:
-                    path.lineTo(pt - offset)
-                painter.drawPath(path)
-                painter.restore()
-
-        # 4. 马赛克 / 高斯模糊图元 (MosaicPaintItem)
+            color = QColor(edit.get('color', QColor(255, 230, 0)))
+            color.setAlpha(int(255 * (edit.get('opacity', 45) / 100.0)))
+            cap = Qt.RoundCap if edit.get('tipStyle', 'round') == 'round' else Qt.SquareCap
+            _draw_edit_polyline(painter, edit.get('points', []), offset, color, edit.get('width', 16), cap=cap)
         elif t == 'MOSAIC_BLUR':
-            points = edit.get('points', [])
-            mode = edit.get('mode', 'mosaic')
-            block_size = edit.get('blockSize', 10)
-            smooth = edit.get('smooth', False)
-            brush_w = edit.get('brushWidth', 22)
-
-            if base_pixmap is not None and len(points) > 0:
-                radius = brush_w // 2 + 2
-                min_x = min(p.x() for p in points) - radius
-                max_x = max(p.x() for p in points) + radius
-                min_y = min(p.y() for p in points) - radius
-                max_y = max(p.y() for p in points) + radius
-                world_bbox = QRect(QPoint(min_x, min_y), QPoint(max_x, max_y))
-                bbox = world_bbox.translated(-base_origin).intersected(base_pixmap.rect())
-
-                if not bbox.isEmpty() and bbox.width() > 0 and bbox.height() > 0:
-                    sub_pix = base_pixmap.copy(bbox)
-                    sub_img = sub_pix.toImage()
-
-                    if mode == 'blur':
-                        try:
-                            ptr = sub_img.bits()
-                            ptr.setsize(sub_img.byteCount())
-                            arr = np.frombuffer(ptr, np.uint8).reshape((sub_img.height(), sub_img.width(), 4))
-                            ksize = max(3, int(block_size * 2) | 1)
-                            blurred_rgb = cv2.GaussianBlur(arr[:, :, :3], (ksize, ksize), 0)
-                            out_arr = arr.copy()
-                            out_arr[:, :, :3] = blurred_rgb
-                            qimg_blur = QImage(out_arr.data, bbox.width(), bbox.height(), sub_img.bytesPerLine(), QImage.Format_ARGB32_Premultiplied)
-                            proc_pix = QPixmap.fromImage(qimg_blur)
-                        except Exception:
-                            tile_size = max(2, block_size)
-                            small = sub_img.scaled(max(1, bbox.width() // tile_size), max(1, bbox.height() // tile_size), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                            proc_pix = QPixmap.fromImage(small.scaled(bbox.width(), bbox.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
-                    else:
-                        tile_size = max(2, block_size)
-                        bw, bh = bbox.width(), bbox.height()
-                        gw = max(1, bw // tile_size)
-                        gh = max(1, bh // tile_size)
-                        small = sub_img.scaled(gw, gh, Qt.IgnoreAspectRatio, Qt.FastTransformation)
-                        transform = Qt.SmoothTransformation if smooth else Qt.FastTransformation
-                        proc_pix = QPixmap.fromImage(small.scaled(bw, bh, Qt.IgnoreAspectRatio, transform))
-
-                    painter.save()
-                    stroker = QPainterPathStroker()
-                    stroker.setWidth(brush_w)
-                    stroker.setCapStyle(Qt.RoundCap)
-                    stroker.setJoinStyle(Qt.RoundJoin)
-
-                    line_path = QPainterPath()
-                    line_path.moveTo(points[0] - offset)
-                    if len(points) == 1:
-                        line_path.lineTo(points[0] - offset + QPoint(1, 1))
-                    else:
-                        for pt in points[1:]:
-                            line_path.lineTo(pt - offset)
-                    clip_path = stroker.createStroke(line_path)
-
-                    painter.setClipPath(clip_path)
-                    painter.drawPixmap(bbox.translated(base_origin - offset).topLeft(), proc_pix)
-                    painter.restore()
-
-        # 5. 画笔图元 (PenPaintItem)
+            _draw_edit_mosaic_blur(painter, edit, base_pixmap, offset, base_origin)
         elif t == 'PEN':
             points = edit.get('points', [])
-            color = edit.get('color', QColor(255, 0, 0))
-            width = edit.get('width', edit.get('thickness', 3))
-            style = edit.get('penStyle', 'polyline')
-
             if len(points) >= 2:
-                painter.save()
-                painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.setBrush(Qt.NoBrush)
-                if style == 'line':
-                    painter.drawLine(points[0] - offset, points[-1] - offset)
+                color = edit.get('color', QColor(255, 0, 0))
+                width = edit.get('width', edit.get('thickness', 3))
+                if edit.get('penStyle', 'polyline') == 'line':
+                    _draw_edit_polyline(painter, [points[0], points[-1]], offset, color, width)
                 else:
-                    path = QPainterPath()
-                    path.moveTo(points[0] - offset)
-                    for pt in points[1:]:
-                        path.lineTo(pt - offset)
-                    painter.drawPath(path)
-                painter.restore()
-
-        # 6. 文本图元 (TextPaintItem)
+                    _draw_edit_polyline(painter, points, offset, color, width)
         elif t == 'TEXT':
-            text = edit.get('text', '')
-            if text:
-                painter.save()
-                font = _extract_edit_font(edit)
-                box_rect = get_text_annotation_rect(edit, offset)
-                rot = int(edit.get('rotation', 0)) % 360
-                if rot:
-                    center = box_rect.center()
-                    painter.translate(center)
-                    painter.rotate(rot)
-                    painter.translate(-center)
-
-                bg_enabled = edit.get('bgEnabled', False)
-                bg_color = edit.get('bgColor')
-                if bg_enabled and bg_color:
-                    painter.setBrush(QBrush(bg_color))
-                    painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(box_rect, 4.0, 4.0)
-
-                inner_rect = box_rect.adjusted(
-                    TEXT_BOX_CONTENT_PAD, TEXT_BOX_CONTENT_PAD,
-                    -TEXT_BOX_CONTENT_PAD, -TEXT_BOX_CONTENT_PAD
-                )
-                doc = _build_text_document(text, font, content_width=max(12.0, inner_rect.width()))
-                ctx = QAbstractTextDocumentLayout.PaintContext()
-                ctx.palette.setColor(QPalette.Text, edit.get('color', QColor(255, 0, 0)))
-                painter.setClipRect(box_rect)
-                painter.translate(inner_rect.topLeft())
-                doc.documentLayout().draw(painter, ctx)
-
-                painter.restore()
-
-        # 7. 历史兼容模式 (旧版矩形、直线、模糊、旧笔触等)
-        elif t == 'RECTANGLE':
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(edit['color'], thickness))
-            painter.drawRect(edit['rect'].translated(-offset))
-        elif t == 'LINE':
-            painter.save()
-            painter.setBrush(Qt.NoBrush)
-            line_style = Qt.DashLine if edit.get('lineStyle') == 'dashed' else Qt.SolidLine
-            painter.setPen(QPen(edit['color'], thickness, line_style, Qt.RoundCap, Qt.RoundJoin))
-            p1 = edit['start'] - offset
-            p2 = edit['end'] - offset
-            painter.drawLine(p1, p2)
-            if edit.get('arrow'):
-                angle = math.atan2(p1.y() - p2.y(), p1.x() - p2.x())
-                arrow_size = 10 + thickness * 1.5
-                p3 = QPoint(int(p2.x() + arrow_size * math.cos(angle + math.pi / 6)),
-                            int(p2.y() + arrow_size * math.sin(angle + math.pi / 6)))
-                p4 = QPoint(int(p2.x() + arrow_size * math.cos(angle - math.pi / 6)),
-                            int(p2.y() + arrow_size * math.sin(angle - math.pi / 6)))
-                painter.setBrush(QBrush(edit['color']))
-                painter.setPen(QPen(edit['color'], 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.drawPolygon(p2, p3, p4)
-            painter.restore()
-        elif t == 'BLUR':
-            source_rect = edit['rect'].translated(-base_origin)
-            if base_pixmap is not None:
-                source_rect = source_rect.intersected(base_pixmap.rect())
-            if base_pixmap is not None and not source_rect.isEmpty():
-                draw_rect = source_rect.translated(base_origin - offset)
-                tile_size = max(6, thickness * 3)
-                sw, sh = source_rect.width(), source_rect.height()
-                gw = max(1, sw // tile_size)
-                gh = max(1, sh // tile_size)
-                sub_img = base_pixmap.copy(source_rect).toImage()
-                small = sub_img.scaled(gw, gh, Qt.IgnoreAspectRatio, Qt.FastTransformation)
-                mosaic = QPixmap.fromImage(small.scaled(sw, sh, Qt.IgnoreAspectRatio, Qt.FastTransformation))
-                painter.drawPixmap(draw_rect.topLeft(), mosaic)
-        elif t == 'BLUR_STROKE':
-            points = edit.get('points', [])
-            if base_pixmap is not None and points:
-                radius = max(8, thickness * 4)
-                min_x = min(p.x() for p in points) - radius
-                max_x = max(p.x() for p in points) + radius
-                min_y = min(p.y() for p in points) - radius
-                max_y = max(p.y() for p in points) + radius
-                world_bbox = QRect(QPoint(min_x, min_y), QPoint(max_x, max_y))
-                bbox = world_bbox.translated(-base_origin).intersected(base_pixmap.rect())
-                if not bbox.isEmpty():
-                    tile_size = max(6, thickness * 3)
-                    bw, bh = bbox.width(), bbox.height()
-                    gw = max(1, bw // tile_size)
-                    gh = max(1, bh // tile_size)
-                    sub_img = base_pixmap.copy(bbox).toImage()
-                    small = sub_img.scaled(gw, gh, Qt.IgnoreAspectRatio, Qt.FastTransformation)
-                    mosaic = QPixmap.fromImage(small.scaled(bw, bh, Qt.IgnoreAspectRatio, Qt.FastTransformation))
-                    painter.save()
-                    stroker = QPainterPathStroker()
-                    stroker.setWidth(radius * 2)
-                    stroker.setCapStyle(Qt.RoundCap)
-                    stroker.setJoinStyle(Qt.RoundJoin)
-                    line_path = QPainterPath()
-                    line_path.moveTo(points[0] - offset)
-                    for pt in points[1:]:
-                        line_path.lineTo(pt - offset)
-                    clip_path = stroker.createStroke(line_path)
-                    painter.setClipPath(clip_path)
-                    painter.drawPixmap(bbox.translated(base_origin - offset).topLeft(), mosaic)
-                    painter.restore()
-        elif t == 'ELLIPSE':
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(edit['color'], thickness))
-            painter.drawEllipse(edit['rect'].translated(-offset))
-        elif t == 'HIGHLIGHTER':
-            points = edit.get('points', [])
-            if len(points) >= 2:
-                painter.save()
-                hl_color = QColor(edit['color'])
-                hl_color.setAlpha(115)
-                hl_pen = QPen(hl_color, max(12, thickness * 4), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(hl_pen)
-                path = QPainterPath()
-                path.moveTo(points[0] - offset)
-                for pt in points[1:]:
-                    path.lineTo(pt - offset)
-                painter.drawPath(path)
-                painter.restore()
-        elif t == 'STEP':
-            step_pos = edit.get('pos') or edit.get('center')
-            if step_pos is not None:
-                pos = step_pos - offset
-                radius = edit.get('radius') or max(11, 8 + thickness * 2)
-                num_val = edit.get('num') if edit.get('num') is not None else edit.get('number', 1)
-                num_str = str(num_val)
-                painter.save()
-                painter.setBrush(QBrush(edit['color']))
-                painter.setPen(QPen(Qt.white, 1.5))
-                painter.drawEllipse(pos, radius, radius)
-                text_color = Qt.white if edit['color'].lightness() < 165 else Qt.black
-                painter.setPen(QPen(text_color))
-                f = make_ui_font(max(8, int(radius * 0.95)), QFont.DemiBold)
-                painter.setFont(f)
-                text_rect = QRect(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
-                painter.drawText(text_rect, Qt.AlignCenter, num_str)
-                painter.restore()
+            _draw_edit_text(painter, edit, offset)
+        else:
+            _draw_edit_legacy(painter, edit, t, thickness, base_pixmap, offset, base_origin)
 
     painter.setBrush(Qt.NoBrush)
 
@@ -7699,8 +7783,8 @@ def is_annotation_hit(edit, pos):
                 radius = edit.get('radius') or (max(11, 8 + thick * 2) + 6)
                 return math.hypot(pos.x() - step_pos.x(), pos.y() - step_pos.y()) <= radius
             return False
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("is_annotation_hit 异常: %s", e)
     return False
 
 
@@ -8104,17 +8188,7 @@ class VectorIconFactory:
     """纯矢量 QPainter 绘制 Apple SF Symbols 质感 27x27 线框图标，保证任意高分屏 DPI 下极致细腻锐利"""
 
     @staticmethod
-    def create_pixmap(name, color=QColor("#1D1D1F"), size=44, stroke=2.15):
-        pm = QPixmap(size, size)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        if size != 27:
-            p.scale(size / 27.0, size / 27.0)
-        pen = QPen(color, stroke, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-
+    def _draw_shape_and_draw_icon(p, name, color):
         if name == 'rect_ellipse':
             p.drawRoundedRect(QRectF(3.5, 4.0, 12.2, 12.2), 2.8, 2.8)
             p.drawEllipse(QRectF(11.2, 11.2, 12.2, 12.2))
@@ -8183,7 +8257,13 @@ class VectorIconFactory:
             p.drawRoundedRect(QRectF(8.2, 5.0, 10.6, 16.8), 2.8, 2.8)
             p.drawLine(QPointF(8.2, 13.8), QPointF(18.8, 13.8))
             p.restore()
-        elif name == 'undo':
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def _draw_action_icon(p, name, color):
+        if name == 'undo':
             path = QPainterPath()
             path.arcMoveTo(QRectF(6.2, 6.2, 14.8, 14.8), 215)
             path.arcTo(QRectF(6.2, 6.2, 14.8, 14.8), 215, -210)
@@ -8231,7 +8311,6 @@ class VectorIconFactory:
             p.drawRoundedRect(QRectF(8.2, 4.5, 7.6, 5.8), 1.0, 1.0)
             p.drawRoundedRect(QRectF(7.5, 14.5, 12.0, 8.0), 1.6, 1.6)
         elif name == 'copy':
-            # SF Symbols doc.on.doc 风格：无实心白块遮挡，通透玻璃上完美融合
             back = QPainterPath()
             back.moveTo(9.0, 9.0)
             back.lineTo(9.0, 6.8)
@@ -8249,7 +8328,6 @@ class VectorIconFactory:
             p.drawLine(QPointF(8.8, 5.0), QPointF(8.8, 18.2))
             p.drawLine(QPointF(8.8, 18.2), QPointF(22.0, 18.2))
         elif name == 'ocr':
-            # Viewfinder 圆角取景角标 + 'A' 识图符
             tl = QPainterPath()
             tl.moveTo(4.5, 9.2); tl.lineTo(4.5, 6.8); tl.quadTo(4.5, 4.5, 6.8, 4.5); tl.lineTo(9.2, 4.5)
             p.drawPath(tl)
@@ -8324,8 +8402,13 @@ class VectorIconFactory:
             arr.lineTo(13.5, 11.8)
             arr.lineTo(16.8, 15.2)
             p.drawPath(arr)
-        elif name == 'rotate':
-            # SF Symbols rotate.right 风格：画布框 + 顺时针绕角旋转箭头
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def _draw_transform_icon(p, name, color, stroke):
+        if name == 'rotate':
             p.drawRoundedRect(QRectF(4.4, 11.2, 11.2, 11.2), 2.2, 2.2)
             arc = QPainterPath()
             arc.arcMoveTo(QRectF(7.6, 4.4, 14.0, 14.0), 112)
@@ -8375,48 +8458,49 @@ class VectorIconFactory:
             h2.lineTo(5.6, 16.6)
             h2.lineTo(8.4, 18.8)
             p.drawPath(h2)
-        elif name == 'flip_h':
+        elif name in ('flip_h', 'flip_v'):
             dash_pen = QPen(color, max(1.6, stroke * 0.85), Qt.DashLine, Qt.RoundCap)
             p.save()
             p.setPen(dash_pen)
-            p.drawLine(QPointF(13.5, 4.5), QPointF(13.5, 22.5))
+            if name == 'flip_h':
+                p.drawLine(QPointF(13.5, 4.5), QPointF(13.5, 22.5))
+            else:
+                p.drawLine(QPointF(4.5, 13.5), QPointF(22.5, 13.5))
             p.restore()
-            left_tri = QPainterPath()
-            left_tri.moveTo(10.5, 7.2)
-            left_tri.lineTo(4.6, 13.5)
-            left_tri.lineTo(10.5, 19.8)
-            left_tri.closeSubpath()
-            p.drawPath(left_tri)
-            right_tri = QPainterPath()
-            right_tri.moveTo(16.5, 7.2)
-            right_tri.lineTo(22.4, 13.5)
-            right_tri.lineTo(16.5, 19.8)
-            right_tri.closeSubpath()
-            p.save()
-            p.setBrush(QBrush(color))
-            p.drawPath(right_tri)
-            p.restore()
-        elif name == 'flip_v':
-            dash_pen = QPen(color, max(1.6, stroke * 0.85), Qt.DashLine, Qt.RoundCap)
-            p.save()
-            p.setPen(dash_pen)
-            p.drawLine(QPointF(4.5, 13.5), QPointF(22.5, 13.5))
-            p.restore()
-            top_tri = QPainterPath()
-            top_tri.moveTo(7.2, 10.5)
-            top_tri.lineTo(13.5, 4.6)
-            top_tri.lineTo(19.8, 10.5)
-            top_tri.closeSubpath()
-            p.drawPath(top_tri)
-            bot_tri = QPainterPath()
-            bot_tri.moveTo(7.2, 16.5)
-            bot_tri.lineTo(13.5, 22.4)
-            bot_tri.lineTo(19.8, 16.5)
-            bot_tri.closeSubpath()
-            p.save()
-            p.setBrush(QBrush(color))
-            p.drawPath(bot_tri)
-            p.restore()
+            if name == 'flip_h':
+                t1_pts = [(10.5, 7.2), (4.6, 13.5), (10.5, 19.8)]
+                t2_pts = [(16.5, 7.2), (22.4, 13.5), (16.5, 19.8)]
+            else:
+                t1_pts = [(7.2, 10.5), (13.5, 4.6), (19.8, 10.5)]
+                t2_pts = [(7.2, 16.5), (13.5, 22.4), (19.8, 16.5)]
+            for pts, filled in ((t1_pts, False), (t2_pts, True)):
+                tri = QPainterPath()
+                tri.moveTo(*pts[0])
+                tri.lineTo(*pts[1])
+                tri.lineTo(*pts[2])
+                tri.closeSubpath()
+                if filled:
+                    p.save()
+                    p.setBrush(QBrush(color))
+                    p.drawPath(tri)
+                    p.restore()
+                else:
+                    p.drawPath(tri)
+
+    @staticmethod
+    def create_pixmap(name, color=QColor("#1D1D1F"), size=44, stroke=2.15):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if size != 27:
+            p.scale(size / 27.0, size / 27.0)
+        p.setPen(QPen(color, stroke, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+
+        if not VectorIconFactory._draw_shape_and_draw_icon(p, name, color):
+            if not VectorIconFactory._draw_action_icon(p, name, color):
+                VectorIconFactory._draw_transform_icon(p, name, color, stroke)
 
         p.end()
         return pm
@@ -9085,7 +9169,494 @@ class TextSelectionActionBar(FrostedBarWidget):
         self.adjustSize()
 
 
-class ToolOptionsBar(FrostedBarWidget):
+class _ToolOptionsPanelsMixin:
+    """共享的二级工具选项栏面板构建与状态读取混入（供悬浮毛玻璃栏与独立编辑器栏复用）。"""
+    _opt_theme = "frosted"
+    _opt_panel_stretch = False
+    _opt_divider_qss = "background: rgba(148, 163, 184, 0.35); border: none; margin: 0 2px;"
+    _opt_hint_qss = "color: #6E7781; font-size: 10px; margin-left: 4px;"
+    _opt_rotate_theme = "frosted"
+    _opt_text_bold_w = 26
+
+    def _add_divider(self, layout):
+        sep = QFrame(self)
+        sep.setFixedSize(1, 16)
+        sep.setStyleSheet(self._opt_divider_qss)
+        layout.addWidget(sep)
+
+    def _make_opt_btn(self, text, checked=False, checkable=True, tip="", fixed_w=None):
+        if self._opt_theme == "codex":
+            btn = QPushButton(text, self)
+            btn.setObjectName("subSegBtn")
+            btn.setCheckable(checkable)
+            btn.setChecked(checked if checkable else False)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setFixedHeight(24)
+            btn.setCursor(Qt.PointingHandCursor)
+        else:
+            btn = SegmentedButton(text, self)
+            if not checkable:
+                btn.setCheckable(False)
+            elif checked:
+                btn.setChecked(True)
+        if fixed_w is not None:
+            btn.setFixedWidth(fixed_w)
+        if tip:
+            btn.setToolTip(tip)
+        return btn
+
+    def _make_opt_spin(self, min_v, max_v, val, width=44, suffix=""):
+        sb = QSpinBox(self)
+        sb.setRange(min_v, max_v)
+        sb.setValue(val)
+        sb.setFixedWidth(width)
+        if suffix:
+            sb.setSuffix(suffix)
+        sb.valueChanged.connect(self.options_changed.emit)
+        return sb
+
+    def _make_opt_palette(self, default_color="#FF3B30", presets=None):
+        if self._opt_theme == "codex":
+            pal = ColorPaletteWidget(
+                self, default_color=default_color, presets=presets,
+                swatch_size=15, spacing=3, theme="codex"
+            )
+        else:
+            pal = ColorPaletteWidget(default_color=default_color, presets=presets)
+        pal.color_changed.connect(lambda _: self.options_changed.emit())
+        return pal
+
+    def _make_opt_combo(self):
+        combo = CodexComboBox(self) if self._opt_theme == "codex" else QComboBox()
+        combo.setFocusPolicy(Qt.NoFocus)
+        return combo
+
+    def _make_opt_hint(self, text):
+        lbl = QLabel(text, self)
+        if self._opt_theme == "codex":
+            lbl.setObjectName("subHintLabel")
+        else:
+            lbl.setStyleSheet(self._opt_hint_qss)
+        return lbl
+
+    def _register_panel(self, tool_name, panel, layout=None):
+        if layout is not None and self._opt_panel_stretch:
+            layout.addStretch(1)
+        idx = self.stack.addWidget(panel)
+        self.tool_indices[tool_name] = idx
+
+    def _build_shape_panel(self, tool_name, with_kind_toggle=False, with_radius=True, hint_text=""):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        btn_rect = btn_ellipse = None
+        if with_kind_toggle:
+            btn_rect = self._make_opt_btn("矩形 ▢", checked=True)
+            btn_ellipse = self._make_opt_btn("椭圆 ◯")
+            l.addWidget(btn_rect)
+            l.addWidget(btn_ellipse)
+            self._add_divider(l)
+
+        btn_none = self._make_opt_btn("无填充", checked=True)
+        btn_stroke = self._make_opt_btn("带框填充" if self._opt_theme == "codex" else "带边框填充")
+        btn_solid = self._make_opt_btn("实心填充")
+        l.addWidget(btn_none)
+        l.addWidget(btn_stroke)
+        l.addWidget(btn_solid)
+
+        self._add_divider(l)
+
+        lbl_w = QLabel("宽度:", panel)
+        l.addWidget(lbl_w)
+        spin_w = self._make_opt_spin(1, 24, 3, width=44 if self._opt_theme == "codex" else 42)
+        l.addWidget(spin_w)
+
+        lbl_r = spin_r = None
+        if with_radius:
+            lbl_r = QLabel("圆角:", panel)
+            l.addWidget(lbl_r)
+            spin_r = self._make_opt_spin(0, 30, 0, width=44 if self._opt_theme == "codex" else 42)
+            l.addWidget(spin_r)
+
+        self._add_divider(l)
+
+        lbl_stroke = QLabel("描边:", panel)
+        stroke_pal = self._make_opt_palette(default_color="#FF3B30")
+        l.addWidget(lbl_stroke)
+        l.addWidget(stroke_pal)
+
+        lbl_fill = QLabel("填充:", panel)
+        fill_pal = self._make_opt_palette(default_color="#FF3B30")
+        l.addWidget(lbl_fill)
+        l.addWidget(fill_pal)
+        lbl_fill.hide()
+        fill_pal.hide()
+
+        if hint_text:
+            l.addWidget(self._make_opt_hint(hint_text))
+
+        def _set_kind(kind):
+            if btn_rect is not None and btn_ellipse is not None:
+                btn_rect.setChecked(kind == 'rect')
+                btn_ellipse.setChecked(kind == 'ellipse')
+            if lbl_r is not None and spin_r is not None:
+                lbl_r.setEnabled(kind == 'rect')
+                spin_r.setEnabled(kind == 'rect')
+            self.options_changed.emit()
+
+        def _set_fill(mode):
+            btn_none.setChecked(mode == 'none')
+            btn_stroke.setChecked(mode == 'stroke_fill')
+            btn_solid.setChecked(mode == 'fill')
+            has_fill = (mode != 'none')
+            if self._opt_theme == "codex":
+                has_stroke = (mode != 'fill')
+                lbl_stroke.setVisible(has_stroke)
+                stroke_pal.setVisible(has_stroke)
+                lbl_w.setEnabled(has_stroke)
+                spin_w.setEnabled(has_stroke)
+            lbl_fill.setVisible(has_fill)
+            fill_pal.setVisible(has_fill)
+            self.options_changed.emit()
+
+        if btn_rect is not None and btn_ellipse is not None:
+            btn_rect.clicked.connect(lambda: _set_kind('rect'))
+            btn_ellipse.clicked.connect(lambda: _set_kind('ellipse'))
+        btn_none.clicked.connect(lambda: _set_fill('none'))
+        btn_stroke.clicked.connect(lambda: _set_fill('stroke_fill'))
+        btn_solid.clicked.connect(lambda: _set_fill('fill'))
+
+        self._register_panel(tool_name, panel, l)
+        return {
+            'btn_rect': btn_rect, 'btn_ellipse': btn_ellipse,
+            'btn_none': btn_none, 'btn_stroke': btn_stroke, 'btn_solid': btn_solid,
+            'lbl_r': lbl_r, 'spin_w': spin_w, 'spin_r': spin_r,
+            'stroke_pal': stroke_pal, 'fill_pal': fill_pal,
+            'set_kind': _set_kind, 'set_fill': _set_fill,
+        }
+
+    @staticmethod
+    def _read_shape_options(refs, default_kind='rect'):
+        kind = default_kind
+        if refs.get('btn_ellipse') is not None:
+            kind = 'ellipse' if refs['btn_ellipse'].isChecked() else 'rect'
+        if refs['btn_solid'].isChecked():
+            fill_mode = 'fill'
+        elif refs['btn_stroke'].isChecked():
+            fill_mode = 'stroke_fill'
+        else:
+            fill_mode = 'none'
+        spin_r = refs.get('spin_r')
+        return {
+            'kind': kind,
+            'fillMode': fill_mode,
+            'strokeWidth': refs['spin_w'].value(),
+            'cornerRadius': spin_r.value() if (spin_r is not None and kind == 'rect') else 0,
+            'strokeColor': refs['stroke_pal'].current_color,
+            'fillColor': refs['fill_pal'].current_color,
+        }
+
+    def _init_arrow_panel(self, tool_name='ARROW', none_label="关 ━", show_hint=False):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        self.btn_arr_end = self._make_opt_btn("结尾 ➔", checked=True)
+        self.btn_arr_start = self._make_opt_btn("开始 ⬅")
+        self.btn_arr_both = self._make_opt_btn("双向 ⬌")
+        self.btn_arr_none = self._make_opt_btn(none_label)
+        self.btn_arr_end.clicked.connect(lambda: self._set_arr_mode('end'))
+        self.btn_arr_start.clicked.connect(lambda: self._set_arr_mode('start'))
+        self.btn_arr_both.clicked.connect(lambda: self._set_arr_mode('both'))
+        self.btn_arr_none.clicked.connect(lambda: self._set_arr_mode('none'))
+        l.addWidget(self.btn_arr_end)
+        l.addWidget(self.btn_arr_start)
+        l.addWidget(self.btn_arr_both)
+        l.addWidget(self.btn_arr_none)
+
+        self._add_divider(l)
+
+        l.addWidget(QLabel("宽度:", panel))
+        self.spin_arr_width = self._make_opt_spin(1, 24, 3, width=44 if self._opt_theme == "codex" else 42)
+        self.spin_arrow_width = self.spin_arr_width
+        l.addWidget(self.spin_arr_width)
+
+        self._add_divider(l)
+
+        l.addWidget(QLabel("颜色:", panel))
+        self.arr_palette = self._make_opt_palette(default_color="#FF3B30")
+        self.arrow_palette = self.arr_palette
+        l.addWidget(self.arr_palette)
+
+        if show_hint:
+            l.addWidget(self._make_opt_hint("💡 Shift 对齐 45°"))
+
+        self._register_panel(tool_name, panel, l)
+
+    def _set_arr_mode(self, mode):
+        self.btn_arr_end.setChecked(mode == 'end')
+        self.btn_arr_start.setChecked(mode == 'start')
+        self.btn_arr_both.setChecked(mode == 'both')
+        self.btn_arr_none.setChecked(mode == 'none')
+        self.options_changed.emit()
+
+    def get_arrow_options(self):
+        mode = 'end'
+        if self.btn_arr_start.isChecked():
+            mode = 'start'
+        elif self.btn_arr_both.isChecked():
+            mode = 'both'
+        elif self.btn_arr_none.isChecked():
+            mode = 'none'
+        return {
+            'arrowMode': mode,
+            'width': self.spin_arr_width.value(),
+            'color': self.arr_palette.current_color,
+        }
+
+    def _init_pen_panel(self, tool_name='PEN', poly_label="折线 〰", hint_text="💡 拖拽画单条直线，点按画折线"):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        self.btn_pen_poly = self._make_opt_btn(poly_label, checked=True)
+        self.btn_pen_line = self._make_opt_btn("直线 ╱")
+        self.btn_pen_poly.clicked.connect(lambda: self._set_pen_style('polyline'))
+        self.btn_pen_line.clicked.connect(lambda: self._set_pen_style('line'))
+        l.addWidget(self.btn_pen_poly)
+        l.addWidget(self.btn_pen_line)
+
+        self._add_divider(l)
+
+        l.addWidget(QLabel("宽度:", panel))
+        self.spin_pen_width = self._make_opt_spin(1, 24, 3, width=44 if self._opt_theme == "codex" else 42)
+        l.addWidget(self.spin_pen_width)
+
+        self._add_divider(l)
+
+        l.addWidget(QLabel("颜色:", panel))
+        self.pen_palette = self._make_opt_palette(default_color="#FF3B30")
+        l.addWidget(self.pen_palette)
+
+        if hint_text:
+            l.addWidget(self._make_opt_hint(hint_text))
+
+        self._register_panel(tool_name, panel, l)
+
+    def _set_pen_style(self, style):
+        self.btn_pen_poly.setChecked(style == 'polyline')
+        self.btn_pen_line.setChecked(style == 'line')
+        self.options_changed.emit()
+
+    def get_pen_options(self):
+        return {
+            'penStyle': 'line' if self.btn_pen_line.isChecked() else 'polyline',
+            'width': self.spin_pen_width.value(),
+            'color': self.pen_palette.current_color,
+        }
+
+    def _init_marker_panel(self, tool_name='MARKER'):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        l.addWidget(QLabel("颜色:", panel))
+        marker_presets = ["#FFE600", "#39FF14", "#FF1493", "#00E5FF", "#FF8C00", "#A855F7", "#FF3B30", "#000000"]
+        self.marker_palette = self._make_opt_palette(default_color="#FFE600", presets=marker_presets)
+        l.addWidget(self.marker_palette)
+
+        self._add_divider(l)
+
+        l.addWidget(QLabel("宽度:", panel))
+        self.spin_marker_width = self._make_opt_spin(6, 50, 16, width=46 if self._opt_theme == "codex" else 44)
+        l.addWidget(self.spin_marker_width)
+
+        l.addWidget(QLabel("不透明度:", panel))
+        self.spin_marker_opacity = self._make_opt_spin(15, 90, 45, width=54 if self._opt_theme == "codex" else 52, suffix="%")
+        l.addWidget(self.spin_marker_opacity)
+
+        self._add_divider(l)
+
+        self.btn_tip_round = self._make_opt_btn("圆头 ◐", checked=True)
+        self.btn_tip_flat = self._make_opt_btn("平头 ◼")
+        self.btn_tip_round.clicked.connect(lambda: self._set_tip_style('round'))
+        self.btn_tip_flat.clicked.connect(lambda: self._set_tip_style('flat'))
+        l.addWidget(self.btn_tip_round)
+        l.addWidget(self.btn_tip_flat)
+
+        self._register_panel(tool_name, panel, l)
+
+    def _set_tip_style(self, style):
+        self.btn_tip_round.setChecked(style == 'round')
+        self.btn_tip_flat.setChecked(style == 'flat')
+        self.options_changed.emit()
+
+    def get_marker_options(self):
+        return {
+            'color': self.marker_palette.current_color,
+            'width': self.spin_marker_width.value(),
+            'opacity': self.spin_marker_opacity.value(),
+            'tipStyle': 'flat' if self.btn_tip_flat.isChecked() else 'round',
+        }
+
+    def _init_mosaic_blur_panel(self, tool_name='MOSAIC_BLUR'):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        self.btn_mb_mosaic = self._make_opt_btn("马赛克 ▨", checked=True, tip="切换马赛克 / 高斯模糊")
+        self.btn_mb_blur = self._make_opt_btn("高斯模糊 💧", tip="切换马赛克 / 高斯模糊")
+        self.btn_mb_mosaic.clicked.connect(lambda: self._set_mb_mode('mosaic'))
+        self.btn_mb_blur.clicked.connect(lambda: self._set_mb_mode('blur'))
+        l.addWidget(self.btn_mb_mosaic)
+        l.addWidget(self.btn_mb_blur)
+
+        self._add_divider(l)
+
+        self.btn_mb_smooth = self._make_opt_btn("像素平滑 ≋", tip="开启柔化像素边缘，关闭为硬边方块")
+        self.btn_mb_smooth.clicked.connect(self.options_changed.emit)
+        l.addWidget(self.btn_mb_smooth)
+
+        self._add_divider(l)
+
+        spin_w = 46 if self._opt_theme == "codex" else 44
+        l.addWidget(QLabel("粒度:", panel))
+        self.spin_mb_block = self._make_opt_spin(4, 32, 10, width=spin_w)
+        l.addWidget(self.spin_mb_block)
+
+        l.addWidget(QLabel("笔尖:", panel))
+        self.spin_mb_brush = self._make_opt_spin(8, 60, 22, width=spin_w)
+        l.addWidget(self.spin_mb_brush)
+
+        self._register_panel(tool_name, panel, l)
+
+    def _set_mb_mode(self, mode):
+        self.btn_mb_mosaic.setChecked(mode == 'mosaic')
+        self.btn_mb_blur.setChecked(mode == 'blur')
+        self.btn_mb_smooth.setEnabled(mode == 'mosaic')
+        self.options_changed.emit()
+
+    def get_mosaic_options(self):
+        return {
+            'mode': 'blur' if self.btn_mb_blur.isChecked() else 'mosaic',
+            'smooth': self.btn_mb_smooth.isChecked(),
+            'blockSize': self.spin_mb_block.value(),
+            'brushWidth': self.spin_mb_brush.value(),
+        }
+
+    def _init_text_panel(self, tool_name='TEXT'):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(5)
+
+        self.combo_text_font = self._make_opt_combo()
+        self.combo_text_font.addItems(["Microsoft YaHei", "Segoe UI", "Arial", "SimHei", "Consolas"])
+        self.combo_text_font.currentTextChanged.connect(self.options_changed.emit)
+        l.addWidget(self.combo_text_font)
+
+        l.addWidget(QLabel("字号:", panel))
+        self.spin_text_size = self._make_opt_spin(8, 72, 14, width=46 if self._opt_theme == "codex" else 44)
+        l.addWidget(self.spin_text_size)
+
+        self._add_divider(l)
+
+        self.btn_text_bold = self._make_opt_btn("B", fixed_w=self._opt_text_bold_w, tip="粗体")
+        self.btn_text_bold.setStyleSheet(self.btn_text_bold.styleSheet() + "font-weight: bold;")
+        self.btn_text_bold.clicked.connect(self.options_changed.emit)
+        l.addWidget(self.btn_text_bold)
+
+        self.btn_text_italic = self._make_opt_btn("I", fixed_w=self._opt_text_bold_w, tip="斜体")
+        self.btn_text_italic.setStyleSheet(self.btn_text_italic.styleSheet() + "font-style: italic;")
+        self.btn_text_italic.clicked.connect(self.options_changed.emit)
+        l.addWidget(self.btn_text_italic)
+
+        self._add_divider(l)
+
+        l.addWidget(QLabel("颜色:", panel))
+        self.text_palette = self._make_opt_palette(default_color="#FF3B30")
+        l.addWidget(self.text_palette)
+
+        self._add_divider(l)
+
+        self.btn_text_bg = self._make_opt_btn("背景框", tip="开启/关闭文字圆角背景框")
+        self.btn_text_bg.clicked.connect(self.options_changed.emit)
+        l.addWidget(self.btn_text_bg)
+
+        self._register_panel(tool_name, panel, l)
+
+    def get_text_options(self):
+        return {
+            'fontFamily': self.combo_text_font.currentText(),
+            'fontSize': self.spin_text_size.value(),
+            'bold': self.btn_text_bold.isChecked(),
+            'italic': self.btn_text_italic.isChecked(),
+            'color': self.text_palette.current_color,
+            'bgEnabled': self.btn_text_bg.isChecked(),
+            'bgColor': QColor(255, 255, 255, 230),
+        }
+
+    def sync_text_options_from_edit(self, edit):
+        """选中已有文本图元时，将其字体/字号/样式/颜色/背景框状态反向同步到工具选项栏。"""
+        if not edit:
+            return
+        font = _extract_edit_font(edit)
+        family = edit.get('fontFamily') or font.family()
+        size = int(edit.get('fontSize') or (font.pointSize() if font.pointSize() > 0 else 14))
+        bold = bool(edit.get('bold', font.bold()))
+        italic = bool(edit.get('italic', font.italic()))
+        color = edit.get('color', self.text_palette.current_color)
+        bg_enabled = bool(edit.get('bgEnabled', False))
+
+        widgets = [
+            self.combo_text_font, self.spin_text_size,
+            self.btn_text_bold, self.btn_text_italic, self.btn_text_bg,
+        ]
+        prev_states = [w.blockSignals(True) for w in widgets]
+        try:
+            idx = self.combo_text_font.findText(family, Qt.MatchFixedString)
+            if idx >= 0:
+                self.combo_text_font.setCurrentIndex(idx)
+            self.spin_text_size.setValue(max(self.spin_text_size.minimum(), min(self.spin_text_size.maximum(), size)))
+            self.btn_text_bold.setChecked(bold)
+            self.btn_text_italic.setChecked(italic)
+            self.btn_text_bg.setChecked(bg_enabled)
+            if isinstance(color, QColor) and color.isValid():
+                self.text_palette.set_color(color, emit=False)
+        finally:
+            for w, prev in zip(widgets, prev_states):
+                w.blockSignals(prev)
+
+    def _init_rotate_panel(self):
+        panel = QWidget(self)
+        l = QHBoxLayout(panel)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(0)
+        self.rotate_controls = RotateControlsWidget(theme=self._opt_rotate_theme, parent=panel)
+        l.addWidget(self.rotate_controls)
+        self._register_panel('ROTATE', panel, l)
+
+    def set_tool(self, tool_name):
+        self.current_tool_name = tool_name
+        if tool_name in self.tool_indices:
+            self.stack.setCurrentIndex(self.tool_indices[tool_name])
+            self.show()
+        else:
+            self.hide()
+
+    def has_active_tool(self):
+        return self.current_tool_name in self.tool_indices
+
+
+class ToolOptionsBar(_ToolOptionsPanelsMixin, FrostedBarWidget):
     options_changed = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -9139,478 +9710,44 @@ class ToolOptionsBar(FrostedBarWidget):
 
         self.tool_indices = {}
         self._init_rect_ellipse_panel()
-        self._init_arrow_panel()
-        self._init_pen_panel()
-        self._init_marker_panel()
-        self._init_mosaic_blur_panel()
-        self._init_text_panel()
+        self._init_arrow_panel(tool_name='ARROW', none_label="关 ━", show_hint=False)
+        self._init_pen_panel(tool_name='PEN', poly_label="折线 〰", hint_text="💡 拖拽画单条直线，点按画折线")
+        self._init_marker_panel(tool_name='MARKER')
+        self._init_mosaic_blur_panel(tool_name='MOSAIC_BLUR')
+        self._init_text_panel(tool_name='TEXT')
         self._init_eraser_panel()
         self._init_rotate_panel()
 
         self.current_tool_name = None
 
-    def _add_divider(self, layout):
-        sep = QFrame()
-        sep.setFixedSize(1, 16)
-        sep.setStyleSheet("background: rgba(148, 163, 184, 0.35); border: none; margin: 0 2px;")
-        layout.addWidget(sep)
-
-    # 1. 矩形 / 椭圆面板
     def _init_rect_ellipse_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_re_rect = SegmentedButton("矩形 ▢")
-        self.btn_re_ellipse = SegmentedButton("椭圆 ◯")
-        self.btn_re_rect.setChecked(True)
-        self.btn_re_rect.clicked.connect(lambda: self._set_re_kind('rect'))
-        self.btn_re_ellipse.clicked.connect(lambda: self._set_re_kind('ellipse'))
-        l.addWidget(self.btn_re_rect)
-        l.addWidget(self.btn_re_ellipse)
-
-        self._add_divider(l)
-
-        self.btn_re_fill_none = SegmentedButton("无填充")
-        self.btn_re_fill_stroke = SegmentedButton("带边框填充")
-        self.btn_re_fill_solid = SegmentedButton("实心填充")
-        self.btn_re_fill_none.setChecked(True)
-        self.btn_re_fill_none.clicked.connect(lambda: self._set_re_fill('none'))
-        self.btn_re_fill_stroke.clicked.connect(lambda: self._set_re_fill('stroke_fill'))
-        self.btn_re_fill_solid.clicked.connect(lambda: self._set_re_fill('fill'))
-        l.addWidget(self.btn_re_fill_none)
-        l.addWidget(self.btn_re_fill_stroke)
-        l.addWidget(self.btn_re_fill_solid)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:"))
-        self.spin_re_width = QSpinBox()
-        self.spin_re_width.setRange(1, 24)
-        self.spin_re_width.setValue(3)
-        self.spin_re_width.setFixedWidth(42)
-        self.spin_re_width.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_re_width)
-
-        self.lbl_re_radius = QLabel("圆角:")
-        l.addWidget(self.lbl_re_radius)
-        self.spin_re_radius = QSpinBox()
-        self.spin_re_radius.setRange(0, 30)
-        self.spin_re_radius.setValue(0)
-        self.spin_re_radius.setFixedWidth(42)
-        self.spin_re_radius.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_re_radius)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("描边:"))
-        self.re_stroke_palette = ColorPaletteWidget(default_color="#FF3B30")
-        self.re_stroke_palette.color_changed.connect(lambda _: self.options_changed.emit())
-        l.addWidget(self.re_stroke_palette)
-
-        self.lbl_re_fill_color = QLabel("填充:")
-        self.re_fill_palette = ColorPaletteWidget(default_color="#FF3B30")
-        self.re_fill_palette.color_changed.connect(lambda _: self.options_changed.emit())
-        l.addWidget(self.lbl_re_fill_color)
-        l.addWidget(self.re_fill_palette)
-        self.lbl_re_fill_color.hide()
-        self.re_fill_palette.hide()
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['RECT_ELLIPSE'] = idx
-
-    def _set_re_kind(self, kind):
-        self.btn_re_rect.setChecked(kind == 'rect')
-        self.btn_re_ellipse.setChecked(kind == 'ellipse')
-        self.lbl_re_radius.setEnabled(kind == 'rect')
-        self.spin_re_radius.setEnabled(kind == 'rect')
-        self.options_changed.emit()
-
-    def _set_re_fill(self, fill_mode):
-        self.btn_re_fill_none.setChecked(fill_mode == 'none')
-        self.btn_re_fill_stroke.setChecked(fill_mode == 'stroke_fill')
-        self.btn_re_fill_solid.setChecked(fill_mode == 'fill')
-        has_fill = (fill_mode != 'none')
-        self.lbl_re_fill_color.setVisible(has_fill)
-        self.re_fill_palette.setVisible(has_fill)
-        self.options_changed.emit()
+        refs = self._build_shape_panel('RECT_ELLIPSE', with_kind_toggle=True, with_radius=True)
+        self._re_refs = refs
+        self.btn_re_rect = refs['btn_rect']
+        self.btn_re_ellipse = refs['btn_ellipse']
+        self.btn_re_fill_none = refs['btn_none']
+        self.btn_re_fill_stroke = refs['btn_stroke']
+        self.btn_re_fill_solid = refs['btn_solid']
+        self.spin_re_width = refs['spin_w']
+        self.lbl_re_radius = refs['lbl_r']
+        self.spin_re_radius = refs['spin_r']
+        self.re_stroke_palette = refs['stroke_pal']
+        self.re_fill_palette = refs['fill_pal']
+        self._set_re_kind = refs['set_kind']
+        self._set_re_fill = refs['set_fill']
 
     def get_rect_ellipse_options(self):
-        kind = 'ellipse' if self.btn_re_ellipse.isChecked() else 'rect'
-        if self.btn_re_fill_solid.isChecked():
-            fill_mode = 'fill'
-        elif self.btn_re_fill_stroke.isChecked():
-            fill_mode = 'stroke_fill'
-        else:
-            fill_mode = 'none'
-        return {
-            'kind': kind,
-            'fillMode': fill_mode,
-            'strokeWidth': self.spin_re_width.value(),
-            'cornerRadius': self.spin_re_radius.value() if kind == 'rect' else 0,
-            'strokeColor': self.re_stroke_palette.current_color,
-            'fillColor': self.re_fill_palette.current_color
-        }
+        return self._read_shape_options(self._re_refs, default_kind='rect')
 
-    # 2. 箭头面板
-    def _init_arrow_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_arr_end = SegmentedButton("结尾 ➔")
-        self.btn_arr_start = SegmentedButton("开始 ⬅")
-        self.btn_arr_both = SegmentedButton("双向 ⬌")
-        self.btn_arr_none = SegmentedButton("关 ━")
-        self.btn_arr_end.setChecked(True)
-        self.btn_arr_end.clicked.connect(lambda: self._set_arr_mode('end'))
-        self.btn_arr_start.clicked.connect(lambda: self._set_arr_mode('start'))
-        self.btn_arr_both.clicked.connect(lambda: self._set_arr_mode('both'))
-        self.btn_arr_none.clicked.connect(lambda: self._set_arr_mode('none'))
-        l.addWidget(self.btn_arr_end)
-        l.addWidget(self.btn_arr_start)
-        l.addWidget(self.btn_arr_both)
-        l.addWidget(self.btn_arr_none)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:"))
-        self.spin_arr_width = QSpinBox()
-        self.spin_arr_width.setRange(1, 24)
-        self.spin_arr_width.setValue(3)
-        self.spin_arr_width.setFixedWidth(42)
-        self.spin_arr_width.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_arr_width)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("颜色:"))
-        self.arr_palette = ColorPaletteWidget(default_color="#FF3B30")
-        self.arr_palette.color_changed.connect(lambda _: self.options_changed.emit())
-        l.addWidget(self.arr_palette)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['ARROW'] = idx
-
-    def _set_arr_mode(self, mode):
-        self.btn_arr_end.setChecked(mode == 'end')
-        self.btn_arr_start.setChecked(mode == 'start')
-        self.btn_arr_both.setChecked(mode == 'both')
-        self.btn_arr_none.setChecked(mode == 'none')
-        self.options_changed.emit()
-
-    def get_arrow_options(self):
-        mode = 'end'
-        if self.btn_arr_start.isChecked(): mode = 'start'
-        elif self.btn_arr_both.isChecked(): mode = 'both'
-        elif self.btn_arr_none.isChecked(): mode = 'none'
-        return {
-            'arrowMode': mode,
-            'width': self.spin_arr_width.value(),
-            'color': self.arr_palette.current_color
-        }
-
-    # 3. 画笔面板
-    def _init_pen_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_pen_poly = SegmentedButton("折线 〰")
-        self.btn_pen_line = SegmentedButton("直线 ╱")
-        self.btn_pen_poly.setChecked(True)
-        self.btn_pen_poly.clicked.connect(lambda: self._set_pen_style('polyline'))
-        self.btn_pen_line.clicked.connect(lambda: self._set_pen_style('line'))
-        l.addWidget(self.btn_pen_poly)
-        l.addWidget(self.btn_pen_line)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:"))
-        self.spin_pen_width = QSpinBox()
-        self.spin_pen_width.setRange(1, 24)
-        self.spin_pen_width.setValue(3)
-        self.spin_pen_width.setFixedWidth(42)
-        self.spin_pen_width.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_pen_width)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("颜色:"))
-        self.pen_palette = ColorPaletteWidget(default_color="#FF3B30")
-        self.pen_palette.color_changed.connect(lambda _: self.options_changed.emit())
-        l.addWidget(self.pen_palette)
-
-        lbl_hint = QLabel("💡 拖拽画单条直线，点按画折线")
-        lbl_hint.setStyleSheet("color: #6E7781; font-size: 10px; margin-left: 4px;")
-        l.addWidget(lbl_hint)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['PEN'] = idx
-
-    def _set_pen_style(self, style):
-        self.btn_pen_poly.setChecked(style == 'polyline')
-        self.btn_pen_line.setChecked(style == 'line')
-        self.options_changed.emit()
-
-    def get_pen_options(self):
-        return {
-            'penStyle': 'line' if self.btn_pen_line.isChecked() else 'polyline',
-            'width': self.spin_pen_width.value(),
-            'color': self.pen_palette.current_color
-        }
-
-    # 4. 记号笔面板
-    def _init_marker_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        l.addWidget(QLabel("颜色:"))
-        marker_presets = ["#FFE600", "#39FF14", "#FF1493", "#00E5FF", "#FF8C00", "#A855F7", "#FF3B30", "#000000"]
-        self.marker_palette = ColorPaletteWidget(default_color="#FFE600", presets=marker_presets)
-        self.marker_palette.color_changed.connect(lambda _: self.options_changed.emit())
-        l.addWidget(self.marker_palette)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:"))
-        self.spin_marker_width = QSpinBox()
-        self.spin_marker_width.setRange(6, 50)
-        self.spin_marker_width.setValue(16)
-        self.spin_marker_width.setFixedWidth(44)
-        self.spin_marker_width.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_marker_width)
-
-        l.addWidget(QLabel("不透明度:"))
-        self.spin_marker_opacity = QSpinBox()
-        self.spin_marker_opacity.setRange(15, 90)
-        self.spin_marker_opacity.setValue(45)
-        self.spin_marker_opacity.setSuffix("%")
-        self.spin_marker_opacity.setFixedWidth(52)
-        self.spin_marker_opacity.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_marker_opacity)
-
-        self._add_divider(l)
-
-        self.btn_tip_round = SegmentedButton("圆头 ◐")
-        self.btn_tip_flat = SegmentedButton("平头 ◼")
-        self.btn_tip_round.setChecked(True)
-        self.btn_tip_round.clicked.connect(lambda: self._set_tip_style('round'))
-        self.btn_tip_flat.clicked.connect(lambda: self._set_tip_style('flat'))
-        l.addWidget(self.btn_tip_round)
-        l.addWidget(self.btn_tip_flat)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['MARKER'] = idx
-
-    def _set_tip_style(self, style):
-        self.btn_tip_round.setChecked(style == 'round')
-        self.btn_tip_flat.setChecked(style == 'flat')
-        self.options_changed.emit()
-
-    def get_marker_options(self):
-        return {
-            'color': self.marker_palette.current_color,
-            'width': self.spin_marker_width.value(),
-            'opacity': self.spin_marker_opacity.value(),
-            'tipStyle': 'flat' if self.btn_tip_flat.isChecked() else 'round'
-        }
-
-    # 5. 马赛克 / 模糊面板
-    def _init_mosaic_blur_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_mb_mosaic = SegmentedButton("马赛克 ▨")
-        self.btn_mb_blur = SegmentedButton("高斯模糊 💧")
-        self.btn_mb_mosaic.setChecked(True)
-        self.btn_mb_mosaic.setToolTip("点击该按钮可以切换马赛克/高斯模糊")
-        self.btn_mb_blur.setToolTip("点击该按钮可以切换马赛克/高斯模糊")
-        self.btn_mb_mosaic.clicked.connect(lambda: self._set_mb_mode('mosaic'))
-        self.btn_mb_blur.clicked.connect(lambda: self._set_mb_mode('blur'))
-        l.addWidget(self.btn_mb_mosaic)
-        l.addWidget(self.btn_mb_blur)
-
-        self._add_divider(l)
-
-        self.btn_mb_smooth = SegmentedButton("像素平滑 ≋")
-        self.btn_mb_smooth.setToolTip("切换像素平滑 (开启柔化边缘，关闭为硬边方块)")
-        self.btn_mb_smooth.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_mb_smooth)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("粒度:"))
-        self.spin_mb_block = QSpinBox()
-        self.spin_mb_block.setRange(4, 32)
-        self.spin_mb_block.setValue(10)
-        self.spin_mb_block.setFixedWidth(44)
-        self.spin_mb_block.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_mb_block)
-
-        l.addWidget(QLabel("笔尖:"))
-        self.spin_mb_brush = QSpinBox()
-        self.spin_mb_brush.setRange(8, 60)
-        self.spin_mb_brush.setValue(22)
-        self.spin_mb_brush.setFixedWidth(44)
-        self.spin_mb_brush.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_mb_brush)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['MOSAIC_BLUR'] = idx
-
-    def _set_mb_mode(self, mode):
-        self.btn_mb_mosaic.setChecked(mode == 'mosaic')
-        self.btn_mb_blur.setChecked(mode == 'blur')
-        self.btn_mb_smooth.setEnabled(mode == 'mosaic')
-        self.options_changed.emit()
-
-    def get_mosaic_options(self):
-        return {
-            'mode': 'blur' if self.btn_mb_blur.isChecked() else 'mosaic',
-            'smooth': self.btn_mb_smooth.isChecked(),
-            'blockSize': self.spin_mb_block.value(),
-            'brushWidth': self.spin_mb_brush.value()
-        }
-
-    # 6. 文本面板
-    def _init_text_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.combo_text_font = QComboBox()
-        self.combo_text_font.setFocusPolicy(Qt.NoFocus)
-        self.combo_text_font.addItems(["Microsoft YaHei", "Segoe UI", "Arial", "SimHei", "Consolas"])
-        self.combo_text_font.currentTextChanged.connect(self.options_changed.emit)
-        l.addWidget(self.combo_text_font)
-
-        l.addWidget(QLabel("字号:"))
-        self.spin_text_size = QSpinBox()
-        self.spin_text_size.setRange(8, 72)
-        self.spin_text_size.setValue(14)
-        self.spin_text_size.setFixedWidth(44)
-        self.spin_text_size.valueChanged.connect(self.options_changed.emit)
-        l.addWidget(self.spin_text_size)
-
-        self._add_divider(l)
-
-        self.btn_text_bold = SegmentedButton("B")
-        self.btn_text_bold.setFixedWidth(26)
-        self.btn_text_bold.setStyleSheet(self.btn_text_bold.styleSheet() + "font-weight: bold;")
-        self.btn_text_bold.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_text_bold)
-
-        self.btn_text_italic = SegmentedButton("I")
-        self.btn_text_italic.setFixedWidth(26)
-        self.btn_text_italic.setStyleSheet(self.btn_text_italic.styleSheet() + "font-style: italic;")
-        self.btn_text_italic.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_text_italic)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("颜色:"))
-        self.text_palette = ColorPaletteWidget(default_color="#FF3B30")
-        self.text_palette.color_changed.connect(lambda _: self.options_changed.emit())
-        l.addWidget(self.text_palette)
-
-        self._add_divider(l)
-
-        self.btn_text_bg = SegmentedButton("背景框")
-        self.btn_text_bg.setToolTip("开启/关闭文字圆角背景框")
-        self.btn_text_bg.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_text_bg)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['TEXT'] = idx
-
-    def get_text_options(self):
-        return {
-            'fontFamily': self.combo_text_font.currentText(),
-            'fontSize': self.spin_text_size.value(),
-            'bold': self.btn_text_bold.isChecked(),
-            'italic': self.btn_text_italic.isChecked(),
-            'color': self.text_palette.current_color,
-            'bgEnabled': self.btn_text_bg.isChecked(),
-            'bgColor': QColor(255, 255, 255, 230)
-        }
-
-    def sync_text_options_from_edit(self, edit):
-        """选中已有文本图元时，将其字体/字号/样式/颜色/背景框状态反向同步到工具选项栏。"""
-        if not edit:
-            return
-        font = _extract_edit_font(edit)
-        family = edit.get('fontFamily') or font.family()
-        size = int(edit.get('fontSize') or (font.pointSize() if font.pointSize() > 0 else 14))
-        bold = bool(edit.get('bold', font.bold()))
-        italic = bool(edit.get('italic', font.italic()))
-        color = edit.get('color', self.text_palette.current_color)
-        bg_enabled = bool(edit.get('bgEnabled', False))
-
-        widgets = [
-            self.combo_text_font, self.spin_text_size,
-            self.btn_text_bold, self.btn_text_italic, self.btn_text_bg
-        ]
-        prev_states = [w.blockSignals(True) for w in widgets]
-        try:
-            idx = self.combo_text_font.findText(family, Qt.MatchFixedString)
-            if idx >= 0:
-                self.combo_text_font.setCurrentIndex(idx)
-            self.spin_text_size.setValue(max(self.spin_text_size.minimum(), min(self.spin_text_size.maximum(), size)))
-            self.btn_text_bold.setChecked(bold)
-            self.btn_text_italic.setChecked(italic)
-            self.btn_text_bg.setChecked(bg_enabled)
-            if isinstance(color, QColor) and color.isValid():
-                self.text_palette.set_color(color, emit=False)
-        finally:
-            for w, prev in zip(widgets, prev_states):
-                w.blockSignals(prev)
-
-    # 7. 橡皮擦面板
     def _init_eraser_panel(self):
-        panel = QWidget()
+        panel = QWidget(self)
         l = QHBoxLayout(panel)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(5)
-
-        lbl = QLabel("🧹 拖动鼠标经过已有标注即可整项擦除 (一次拖动记录为单步撤销)")
+        lbl = QLabel("🧹 拖动鼠标经过已有标注即可整项擦除 (一次拖动记录为单步撤销)", panel)
         lbl.setStyleSheet("color: #57606A; font-size: 11px;")
         l.addWidget(lbl)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['ERASER'] = idx
-
-    # 8. 旋转 / 翻转面板
-    def _init_rotate_panel(self):
-        panel = QWidget()
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(0)
-
-        self.rotate_controls = RotateControlsWidget(theme="frosted", parent=panel)
-        l.addWidget(self.rotate_controls)
-
-        idx = self.stack.addWidget(panel)
-        self.tool_indices['ROTATE'] = idx
-
-    def set_tool(self, tool_name):
-        self.current_tool_name = tool_name
-        if tool_name in self.tool_indices:
-            self.stack.setCurrentIndex(self.tool_indices[tool_name])
-            self.show()
-        else:
-            self.hide()
-
-    def has_active_tool(self):
-        return self.current_tool_name in self.tool_indices
+        self._register_panel('ERASER', panel, l)
 
 
 class QuickTextEdit(QTextEdit):
@@ -10556,7 +10693,7 @@ class PinnedWindow(QWidget):
             if handle is not None:
                 try:
                     handle.hide()
-                except Exception:
+                except RuntimeError:
                     pass
             return
         if handle is None:
@@ -10613,7 +10750,7 @@ class PinnedWindow(QWidget):
             if getattr(self, "_ct_handle", None) is not None:
                 try:
                     self._ct_handle.close()
-                except Exception:
+                except RuntimeError:
                     pass
                 self._ct_handle = None
             self._show_hud("已恢复鼠标交互")
@@ -11180,7 +11317,7 @@ class PinnedWindow(QWidget):
             if getattr(self, '_ct_handle', None) is not None:
                 try:
                     self._ct_handle.hide()
-                except Exception:
+                except RuntimeError:
                     pass
             QApplication.processEvents()
 
@@ -11375,7 +11512,505 @@ class PinnedWindow(QWidget):
         elif (mods & Qt.ControlModifier) and key == Qt.Key_S:
             self.save_as()
 
-class EditableImageLabel(QLabel):
+class _CanvasEditingMixin:
+    """截图画布与独立图片编辑器共享的矢量标注、行内文本、橡皮擦与裁剪交互混入。"""
+
+    @staticmethod
+    def _constrain_square_point(p1, p2):
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        side = max(abs(dx), abs(dy))
+        sx = 1 if dx >= 0 else -1
+        sy = 1 if dy >= 0 else -1
+        return QPoint(p1.x() + sx * side, p1.y() + sy * side)
+
+    @staticmethod
+    def _snap_angle_45(p1, p2):
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        angle = math.degrees(math.atan2(dy, dx))
+        snapped = round(angle / 45.0) * 45.0
+        rad = math.radians(snapped)
+        dist = math.hypot(dx, dy)
+        return QPoint(int(round(p1.x() + dist * math.cos(rad))), int(round(p1.y() + dist * math.sin(rad))))
+
+    @staticmethod
+    def _draw_text_draw_preview(painter, text_rect):
+        if text_rect is None or text_rect.width() <= 3 or text_rect.height() <= 3:
+            return
+        painter.save()
+        painter.fillRect(text_rect, QColor(255, 255, 255, 35))
+        painter.setPen(QPen(QColor(255, 255, 255, 210), 2, Qt.DashLine))
+        painter.drawRect(text_rect)
+        painter.setPen(QPen(QColor(200, 144, 48), 1.4, Qt.DashLine))
+        painter.drawRect(text_rect)
+        painter.restore()
+
+    @staticmethod
+    def _draw_crop_chrome(painter, crop_rect, grid_alpha=80):
+        painter.setPen(QPen(QColor(255, 255, 255, grid_alpha), 1))
+        for i in range(1, 3):
+            x = crop_rect.left() + crop_rect.width() * i // 3
+            painter.drawLine(x, crop_rect.top(), x, crop_rect.bottom())
+            y = crop_rect.top() + crop_rect.height() * i // 3
+            painter.drawLine(crop_rect.left(), y, crop_rect.right(), y)
+
+        painter.setPen(QPen(QColor(204, 153, 68), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(crop_rect)
+
+        handle = CROP_HANDLE_SIZE
+        painter.setBrush(QBrush(QColor(204, 153, 68)))
+        painter.setPen(QPen(Qt.white, 1))
+        corners = [crop_rect.topLeft(), crop_rect.topRight(),
+                   crop_rect.bottomLeft(), crop_rect.bottomRight()]
+        edges = [QPoint(crop_rect.center().x(), crop_rect.top()),
+                 QPoint(crop_rect.center().x(), crop_rect.bottom()),
+                 QPoint(crop_rect.left(), crop_rect.center().y()),
+                 QPoint(crop_rect.right(), crop_rect.center().y())]
+        for pt in corners + edges:
+            painter.drawRect(pt.x() - handle // 2, pt.y() - handle // 2, handle, handle)
+        painter.setBrush(Qt.NoBrush)
+
+    def _get_crop_handle_at(self, pos):
+        """返回 pos 处的裁剪手柄名称"""
+        if not self.crop_rect:
+            return None
+        r = self.crop_rect
+        hs = CROP_HANDLE_SIZE
+        corners = {
+            'tl': r.topLeft(), 'tr': r.topRight(),
+            'bl': r.bottomLeft(), 'br': r.bottomRight()
+        }
+        for name, pt in corners.items():
+            if abs(pos.x() - pt.x()) <= hs and abs(pos.y() - pt.y()) <= hs:
+                return name
+        edges = {
+            't': QPoint(r.center().x(), r.top()),
+            'b': QPoint(r.center().x(), r.bottom()),
+            'l': QPoint(r.left(), r.center().y()),
+            'r': QPoint(r.right(), r.center().y()),
+        }
+        for name, pt in edges.items():
+            if abs(pos.x() - pt.x()) <= hs and abs(pos.y() - pt.y()) <= hs:
+                return name
+        if r.contains(pos):
+            return 'move'
+        return None
+
+    def _compute_updated_crop_rect(self, pos, bounds):
+        """根据拖动手柄与比例约束计算新裁剪框（约束在 bounds 内）。"""
+        start = self.crop_drag_start_rect
+        h = self.crop_drag_handle
+        if start is None or not h:
+            return None
+        new_rect = QRect(start)
+
+        if h == 'move':
+            new_rect = start.translated(pos - self.crop_drag_start_pos)
+        else:
+            if 'l' in h:
+                new_rect.setLeft(max(bounds.left(), min(start.right() - CROP_MIN_SIZE, pos.x())))
+            if 'r' in h:
+                new_rect.setRight(min(bounds.right(), max(start.left() + CROP_MIN_SIZE, pos.x())))
+            if 't' in h:
+                new_rect.setTop(max(bounds.top(), min(start.bottom() - CROP_MIN_SIZE, pos.y())))
+            if 'b' in h:
+                new_rect.setBottom(min(bounds.bottom(), max(start.top() + CROP_MIN_SIZE, pos.y())))
+
+            if self.crop_ratio:
+                rw, rh = self.crop_ratio
+                target_ratio = rw / rh
+                if h in ('tl', 'tr', 'bl', 'br'):
+                    if h == 'br':
+                        ax, ay = start.left(), start.top()
+                        new_w = max(CROP_MIN_SIZE, pos.x() - ax)
+                        new_h = int(new_w / target_ratio)
+                        new_rect = QRect(ax, ay, new_w, new_h)
+                    elif h == 'tl':
+                        ax, ay = start.right(), start.bottom()
+                        new_w = max(CROP_MIN_SIZE, ax - pos.x())
+                        new_h = int(new_w / target_ratio)
+                        new_rect = QRect(ax - new_w, ay - new_h, new_w, new_h)
+                    elif h == 'tr':
+                        ax, ay = start.left(), start.bottom()
+                        new_w = max(CROP_MIN_SIZE, pos.x() - ax)
+                        new_h = int(new_w / target_ratio)
+                        new_rect = QRect(ax, ay - new_h, new_w, new_h)
+                    elif h == 'bl':
+                        ax, ay = start.right(), start.top()
+                        new_w = max(CROP_MIN_SIZE, ax - pos.x())
+                        new_h = int(new_w / target_ratio)
+                        new_rect = QRect(ax - new_w, ay, new_w, new_h)
+                elif h in ('t', 'b'):
+                    cx = start.center().x()
+                    new_h = max(CROP_MIN_SIZE, pos.y() - start.top()) if h == 'b' else max(CROP_MIN_SIZE, start.bottom() - pos.y())
+                    new_w = int(new_h * target_ratio)
+                    new_x = cx - new_w // 2
+                    new_y = start.bottom() - new_h if h == 't' else start.top()
+                    new_rect = QRect(new_x, new_y, new_w, new_h)
+                elif h in ('l', 'r'):
+                    cy = start.center().y()
+                    new_w = max(CROP_MIN_SIZE, pos.x() - start.left()) if h == 'r' else max(CROP_MIN_SIZE, start.right() - pos.x())
+                    new_h = int(new_w / target_ratio)
+                    new_x = start.right() - new_w if h == 'l' else start.left()
+                    new_y = cy - new_h // 2
+                    new_rect = QRect(new_x, new_y, new_w, new_h)
+
+        new_rect = new_rect.intersected(bounds)
+        if new_rect.width() >= CROP_MIN_SIZE and new_rect.height() >= CROP_MIN_SIZE:
+            return new_rect
+        return None
+
+    def _find_editable_text_edit_index(self, pos):
+        for i in range(len(self.edits) - 1, -1, -1):
+            if (self.edits[i].get('type') == 'TEXT'
+                    and int(self.edits[i].get('rotation', 0) or 0) % 360 == 0
+                    and is_annotation_hit(self.edits[i], pos)):
+                return i
+        return None
+
+    def _open_existing_text_edit(self, idx, start_in_text_mode=True, click_global_pos=None):
+        edit = self.edits.pop(idx)
+        self.save_state()
+        ob = getattr(self, 'options_bar', None)
+        if ob is not None:
+            ob.sync_text_options_from_edit(edit)
+        tr = getattr(self, 'toolbar_ref', None)
+        if tr is not None and hasattr(tr, '_sync_color_button_from_active_tool'):
+            tr._sync_color_button_from_active_tool()
+        edit_rect = get_text_annotation_rect(edit).toAlignedRect()
+        self.inline_editor.start_editing(edit_rect, existing_edit=edit, start_in_text_mode=start_in_text_mode)
+        if start_in_text_mode:
+            self.inline_editor.set_editing_text(True, click_global_pos=click_global_pos)
+            self.drag_mode = None
+        else:
+            self.drag_mode = 'text_move'
+            self._text_move_start_global = click_global_pos
+            self._text_move_start_frame = QRect(self.inline_editor.get_text_rect())
+            self._text_move_dragged = False
+        self.update()
+
+    def _commit_inline_text_edit(self):
+        if not getattr(self, 'inline_editor', None) or not self.inline_editor.isVisible():
+            return False
+        text = self.inline_editor.text_edit.toPlainText()
+        had_existing = self.inline_editor.active_edit_ref is not None
+        committed = bool(text.strip())
+        if committed:
+            if not had_existing:
+                self.save_state()
+            rect = self.inline_editor.get_text_rect()
+            ob = getattr(self, 'options_bar', None)
+            opts = ob.get_text_options() if ob is not None else {}
+            font = self.inline_editor.text_edit.font()
+            self.edits.append({
+                'type': 'TEXT',
+                'pos': rect.topLeft(),
+                'rect': rect,
+                'text': text,
+                'color': QColor(opts.get('color', self.inline_editor.current_color)),
+                'font': QFont(font),
+                'fontFamily': opts.get('fontFamily', font.family()),
+                'fontSize': opts.get('fontSize', font.pointSize() if font.pointSize() > 0 else 14),
+                'bold': opts.get('bold', font.bold()),
+                'italic': opts.get('italic', font.italic()),
+                'bgEnabled': opts.get('bgEnabled', self.inline_editor.bg_enabled),
+                'bgColor': QColor(opts.get('bgColor', self.inline_editor.bg_color)),
+                'user_width': self.inline_editor.user_width,
+                'user_height': self.inline_editor.user_height,
+            })
+        self.inline_editor.active_edit_ref = None
+        self.inline_editor.hide()
+        if self.isVisible():
+            self.setFocus()
+        return committed
+
+    def _handle_text_tool_press(self, pos, global_pos, was_editing, had_text):
+        clicked_idx = self._find_editable_text_edit_index(pos)
+        if clicked_idx is not None:
+            self._open_existing_text_edit(clicked_idx, start_in_text_mode=False, click_global_pos=global_pos)
+            return 'text_move'
+        self.drag_mode = 'text_draw'
+        self.text_start = pos
+        self.text_rect = QRect(pos, pos)
+        self._text_just_committed = bool(was_editing and had_text)
+        return 'text_draw'
+
+    def _handle_text_tool_release(self, global_pos):
+        if self.drag_mode == 'text_move':
+            self.drag_mode = None
+            if getattr(self, '_text_move_dragged', False):
+                self.inline_editor.set_editing_text(False)
+            else:
+                self.inline_editor.set_editing_text(True, click_global_pos=global_pos)
+            return 'text_move'
+        if self.drag_mode == 'text_draw':
+            rect = self.text_rect
+            self.text_rect = None
+            if rect is not None and rect.width() >= 18 and rect.height() >= 14:
+                self.inline_editor.start_editing(rect)
+            elif not getattr(self, '_text_just_committed', False):
+                self.inline_editor.start_editing(self.text_start)
+            self._text_just_committed = False
+            self.update()
+            return 'text_draw'
+        return None
+
+    def _erase_annotation_at(self, pos, saved_attr='eraser_state_saved'):
+        for i in range(len(self.edits) - 1, -1, -1):
+            if is_annotation_hit(self.edits[i], pos):
+                if not getattr(self, saved_attr, False):
+                    self.save_state()
+                    setattr(self, saved_attr, True)
+                return self.edits.pop(i)
+        return None
+
+    def _begin_annotation_edit(self, tool, pos, default_color, default_thickness=3, options_bar=None, step_num=1):
+        ob = options_bar
+        if tool == 'STEP':
+            self.save_state()
+            opts = ob.get_step_options() if (ob is not None and hasattr(ob, 'get_step_options')) else {}
+            used_num = opts.get('num', step_num)
+            radius = opts.get('radius', max(11, 8 + default_thickness * 2))
+            color = QColor(opts.get('color', default_color))
+            self.edits.append({
+                'type': 'STEP',
+                'pos': pos,
+                'center': pos,
+                'num': used_num,
+                'number': used_num,
+                'color': color,
+                'thickness': max(1, (radius - 8) // 2),
+                'radius': radius,
+                'temp': False,
+            })
+            return ('step', used_num + 1)
+
+        if tool in ('RECT_ELLIPSE', 'RECTANGLE', 'ELLIPSE'):
+            self.save_state()
+            self.edit_start = pos
+            if tool == 'RECT_ELLIPSE' and ob is not None and hasattr(ob, 'get_rect_ellipse_options'):
+                opts = ob.get_rect_ellipse_options()
+            elif tool in ('RECTANGLE', 'ELLIPSE') and ob is not None and hasattr(ob, 'get_rect_options'):
+                opts = ob.get_rect_options() if tool == 'RECTANGLE' else ob.get_ellipse_options()
+            else:
+                opts = None
+            if opts is not None:
+                self.edits.append({
+                    'type': 'RECT_ELLIPSE',
+                    'kind': opts.get('kind', 'ellipse' if tool == 'ELLIPSE' else 'rect'),
+                    'p1': pos,
+                    'p2': pos,
+                    'strokeColor': QColor(opts.get('strokeColor', default_color)),
+                    'strokeWidth': opts.get('strokeWidth', default_thickness),
+                    'fillMode': opts.get('fillMode', 'none'),
+                    'fillColor': QColor(opts.get('fillColor', default_color)),
+                    'cornerRadius': opts.get('cornerRadius', 0),
+                    'temp': True,
+                })
+            else:
+                self.edits.append({
+                    'type': tool,
+                    'rect': QRect(pos, pos),
+                    'color': QColor(default_color),
+                    'thickness': default_thickness,
+                    'temp': True,
+                })
+            return 'drawing'
+
+        if tool == 'ARROW':
+            self.save_state()
+            self.edit_start = pos
+            opts = ob.get_arrow_options() if (ob is not None and hasattr(ob, 'get_arrow_options')) else {}
+            self.edits.append({
+                'type': 'ARROW',
+                'start': pos,
+                'end': pos,
+                'arrowMode': opts.get('arrowMode', 'end'),
+                'width': opts.get('width', default_thickness),
+                'color': QColor(opts.get('color', default_color)),
+                'temp': True,
+            })
+            return 'drawing'
+
+        if tool == 'LINE':
+            self.save_state()
+            self.edit_start = pos
+            opts = ob.get_line_options() if (ob is not None and hasattr(ob, 'get_line_options')) else {}
+            self.edits.append({
+                'type': 'LINE',
+                'rect': QRect(pos, pos),
+                'start': pos,
+                'end': pos,
+                'color': QColor(opts.get('color', default_color)),
+                'thickness': opts.get('thickness', default_thickness),
+                'lineStyle': opts.get('lineStyle', 'solid'),
+                'arrow': opts.get('arrow', getattr(self, 'arrow_enabled', False)),
+                'temp': True,
+            })
+            return 'drawing'
+
+        if tool == 'PEN':
+            self.save_state()
+            self.edit_start = pos
+            opts = ob.get_pen_options() if (ob is not None and hasattr(ob, 'get_pen_options')) else {}
+            self.edits.append({
+                'type': 'PEN',
+                'penStyle': opts.get('penStyle', 'polyline'),
+                'start': pos,
+                'end': pos,
+                'points': [pos],
+                'width': opts.get('width', default_thickness),
+                'color': QColor(opts.get('color', default_color)),
+                'temp': True,
+            })
+            return 'drawing'
+
+        if tool in ('MARKER', 'HIGHLIGHTER'):
+            self.save_state()
+            if ob is not None and hasattr(ob, 'get_marker_options'):
+                opts = ob.get_marker_options()
+                self.edits.append({
+                    'type': 'MARKER',
+                    'points': [pos],
+                    'color': QColor(opts.get('color', QColor(255, 230, 0))),
+                    'width': opts.get('width', 16),
+                    'opacity': opts.get('opacity', 45),
+                    'tipStyle': opts.get('tipStyle', 'round'),
+                    'temp': True,
+                })
+            else:
+                self.edits.append({
+                    'type': 'HIGHLIGHTER',
+                    'points': [pos],
+                    'color': QColor(default_color),
+                    'thickness': max(12, default_thickness * 3),
+                    'temp': True,
+                })
+            return 'drawing'
+
+        if tool in ('MOSAIC_BLUR', 'BLUR'):
+            self.save_state()
+            if ob is not None and hasattr(ob, 'get_mosaic_options'):
+                opts = ob.get_mosaic_options()
+                self.edits.append({
+                    'type': 'MOSAIC_BLUR',
+                    'points': [pos],
+                    'mode': opts.get('mode', 'mosaic'),
+                    'smooth': opts.get('smooth', False),
+                    'blockSize': opts.get('blockSize', 10),
+                    'brushWidth': opts.get('brushWidth', 22),
+                    'temp': True,
+                })
+            else:
+                self.edits.append({
+                    'type': 'BLUR_STROKE',
+                    'points': [pos],
+                    'thickness': default_thickness,
+                    'temp': True,
+                })
+            return 'drawing'
+
+        return None
+
+    def _update_active_temp_edit(self, pos, shift_held):
+        if not self.edits or not self.edits[-1].get('temp'):
+            return False
+        item = self.edits[-1]
+        t = item.get('type')
+        if t == 'RECT_ELLIPSE':
+            item['p2'] = self._constrain_square_point(self.edit_start, pos) if shift_held else pos
+        elif t in ('ARROW', 'LINE'):
+            p2 = self._snap_angle_45(self.edit_start, pos) if shift_held else pos
+            item['end'] = p2
+            if t == 'LINE':
+                item['rect'] = QRect(self.edit_start, p2).normalized()
+        elif t == 'PEN':
+            if item.get('penStyle') == 'line':
+                p2 = self._snap_angle_45(self.edit_start, pos) if shift_held else pos
+                item['end'] = p2
+                item['points'] = [self.edit_start, p2]
+            else:
+                item['points'].append(pos)
+        elif t in ('MOSAIC_BLUR', 'MARKER', 'BLUR_STROKE', 'HIGHLIGHTER'):
+            item['points'].append(pos)
+        elif t == 'ELLIPSE':
+            p2 = self._constrain_square_point(self.edit_start, pos) if shift_held else pos
+            item['rect'] = QRect(self.edit_start, p2).normalized()
+        else:
+            item['rect'] = QRect(self.edit_start, pos).normalized()
+            item['end'] = pos
+        return True
+
+    def _finish_active_temp_edit(self):
+        if not self.edits or not self.edits[-1].get('temp'):
+            return None, False
+        item = self.edits[-1]
+        t = item.get('type')
+        discard = False
+        if t == 'RECT_ELLIPSE':
+            discard = (item.get('p2', QPoint()) - item.get('p1', QPoint())).manhattanLength() < 2
+        elif t in ('ARROW', 'LINE'):
+            discard = (item.get('end', QPoint()) - item.get('start', QPoint())).manhattanLength() < 2
+        elif t == 'PEN':
+            discard = len(item.get('points', [])) <= 1
+        elif t in ('MARKER', 'MOSAIC_BLUR', 'BLUR_STROKE', 'HIGHLIGHTER'):
+            discard = len(item.get('points', [])) < 1
+
+        if discard:
+            self.edits.pop()
+            if self.undo_stack:
+                self.undo_stack.pop()
+            return None, True
+        item['temp'] = False
+        return item, False
+
+    def _apply_editing_tool_cursor(self, tool, pos=None, options_bar=None, default_thickness=3, allow_text_hit=True):
+        if self.crop_mode:
+            if pos is not None and not getattr(self, 'crop_drag_handle', None):
+                handle = self._get_crop_handle_at(pos)
+                cursors = {
+                    'tl': Qt.SizeFDiagCursor, 'br': Qt.SizeFDiagCursor,
+                    'tr': Qt.SizeBDiagCursor, 'bl': Qt.SizeBDiagCursor,
+                    't': Qt.SizeVerCursor, 'b': Qt.SizeVerCursor,
+                    'l': Qt.SizeHorCursor, 'r': Qt.SizeHorCursor,
+                    'move': Qt.SizeAllCursor,
+                }
+                self.setCursor(cursors.get(handle, Qt.ArrowCursor))
+            elif pos is None:
+                self.setCursor(Qt.SizeAllCursor)
+            return True
+
+        ob = options_bar
+        if tool in ('ERASER', 'ERASE'):
+            self.setCursor(create_eraser_cursor())
+            return True
+        if tool == 'ROTATE':
+            self.setCursor(Qt.ArrowCursor)
+            return True
+        if tool == 'TEXT':
+            hit_text = bool(allow_text_hit and pos is not None and self._find_editable_text_edit_index(pos) is not None)
+            self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
+            return True
+        if tool in ('MOSAIC_BLUR', 'BLUR'):
+            bw = ob.get_mosaic_options().get('brushWidth', 22) if ob else default_thickness * 8
+            self.setCursor(create_brush_cursor(max(4, bw // 2)))
+            return True
+        if tool in ('MARKER', 'HIGHLIGHTER'):
+            mw = ob.get_marker_options().get('width', 16) if ob else 16
+            self.setCursor(create_brush_cursor(max(4, mw // 2)))
+            return True
+        if tool == 'STEP':
+            self.setCursor(Qt.PointingHandCursor)
+            return True
+        if tool in ('RECT_ELLIPSE', 'RECTANGLE', 'ELLIPSE', 'LINE', 'ARROW', 'PEN', 'OCR'):
+            self.setCursor(Qt.CrossCursor)
+            return True
+        return False
+
+
+class EditableImageLabel(_CanvasEditingMixin, QLabel):
     def __init__(self, pixmap, toolbar_ref):
         super().__init__()
         self.setFocusPolicy(Qt.StrongFocus)
@@ -11420,25 +12055,6 @@ class EditableImageLabel(QLabel):
                 tr._sync_undo_redo_buttons()
             if sync_step and hasattr(tr, 'sync_step_num_from_edits'):
                 tr.sync_step_num_from_edits()
-
-    @staticmethod
-    def _constrain_square_point(p1, p2):
-        dx = p2.x() - p1.x()
-        dy = p2.y() - p1.y()
-        side = max(abs(dx), abs(dy))
-        sx = 1 if dx >= 0 else -1
-        sy = 1 if dy >= 0 else -1
-        return QPoint(p1.x() + sx * side, p1.y() + sy * side)
-
-    @staticmethod
-    def _snap_angle_45(p1, p2):
-        dx = p2.x() - p1.x()
-        dy = p2.y() - p1.y()
-        angle = math.degrees(math.atan2(dy, dx))
-        snapped = round(angle / 45.0) * 45.0
-        rad = math.radians(snapped)
-        dist = math.hypot(dx, dy)
-        return QPoint(int(round(p1.x() + dist * math.cos(rad))), int(round(p1.y() + dist * math.sin(rad))))
 
     def has_pending_rotation_preview(self):
         return self._rotation_preview_snapshot is not None
@@ -11636,53 +12252,18 @@ class EditableImageLabel(QLabel):
         return True
 
     def erase_annotation(self, pos):
-        for i in range(len(self.edits)-1, -1, -1):
-            if is_annotation_hit(self.edits[i], pos):
-                if not getattr(self, '_eraser_state_saved', False):
-                    self.save_state()
-                    self._eraser_state_saved = True
-                self.edits.pop(i)
-                self._notify_editor_state_changed()
-                return True
+        if self._erase_annotation_at(pos, saved_attr='_eraser_state_saved') is not None:
+            self._notify_editor_state_changed()
+            return True
         return False
 
     def update_cursor_for_tool(self, pos=None):
-        if self.crop_mode:
-            if pos is not None:
-                handle = self._get_crop_handle_at(pos)
-                cursors = {
-                    'tl': Qt.SizeFDiagCursor, 'br': Qt.SizeFDiagCursor,
-                    'tr': Qt.SizeBDiagCursor, 'bl': Qt.SizeBDiagCursor,
-                    't': Qt.SizeVerCursor, 'b': Qt.SizeVerCursor,
-                    'l': Qt.SizeHorCursor, 'r': Qt.SizeHorCursor,
-                    'move': Qt.SizeAllCursor,
-                }
-                self.setCursor(cursors.get(handle, Qt.ArrowCursor))
-            else:
-                self.setCursor(Qt.SizeAllCursor)
-            return
-
         tool = getattr(self.toolbar_ref, 'current_tool', None)
-        ob = self.options_bar
-        if tool == 'ERASE':
-            self.setCursor(create_eraser_cursor())
-        elif tool == 'TEXT':
-            hit_text = pos is not None and any(
-                e.get('type') == 'TEXT' and int(e.get('rotation', 0)) % 360 == 0 and is_annotation_hit(e, pos)
-                for e in self.edits
-            )
-            self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
-        elif tool == 'BLUR':
-            bw = ob.get_mosaic_options().get('brushWidth', 22) if ob else getattr(self.toolbar_ref, 'current_thickness', 3) * 8
-            self.setCursor(create_brush_cursor(max(4, bw // 2)))
-        elif tool == 'HIGHLIGHTER':
-            mw = ob.get_marker_options().get('width', 16) if ob else 16
-            self.setCursor(create_brush_cursor(max(4, mw // 2)))
-        elif tool == 'STEP':
-            self.setCursor(Qt.PointingHandCursor)
-        elif tool in ['RECTANGLE', 'ELLIPSE', 'LINE', 'ARROW', 'PEN', 'OCR']:
-            self.setCursor(Qt.CrossCursor)
-        else:
+        if not self._apply_editing_tool_cursor(
+            tool, pos=pos, options_bar=self.options_bar,
+            default_thickness=getattr(self.toolbar_ref, 'current_thickness', 3),
+            allow_text_hit=True,
+        ):
             self.setCursor(Qt.ArrowCursor)
 
     def paintEvent(self, event):
@@ -11692,14 +12273,8 @@ class EditableImageLabel(QLabel):
             if self._rotation_preview_pixmap is None:
                 draw_all_edits(painter, self.edits, self.base_pixmap, QPoint(0, 0))
             
-            if self.toolbar_ref.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None) and self.text_rect.width() > 3 and self.text_rect.height() > 3:
-                painter.save()
-                painter.fillRect(self.text_rect, QColor(255, 255, 255, 35))
-                painter.setPen(QPen(QColor(255, 255, 255, 210), 2, Qt.DashLine))
-                painter.drawRect(self.text_rect)
-                painter.setPen(QPen(QColor(200, 144, 48), 1.4, Qt.DashLine))
-                painter.drawRect(self.text_rect)
-                painter.restore()
+            if self.toolbar_ref.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw':
+                self._draw_text_draw_preview(painter, getattr(self, 'text_rect', None))
 
             if self.crop_mode and self.crop_rect:
                 # 暗化裁剪框外区域
@@ -11712,32 +12287,7 @@ class EditableImageLabel(QLabel):
                 painter.setClipRect(self.crop_rect)
                 draw_all_edits(painter, self.edits, self.base_pixmap, QPoint(0, 0))
                 painter.setClipping(False)
-
-                # 三分线
-                painter.setPen(QPen(QColor(255, 255, 255, 80), 1))
-                for i in range(1, 3):
-                    x = self.crop_rect.left() + self.crop_rect.width() * i // 3
-                    painter.drawLine(x, self.crop_rect.top(), x, self.crop_rect.bottom())
-                    y = self.crop_rect.top() + self.crop_rect.height() * i // 3
-                    painter.drawLine(self.crop_rect.left(), y, self.crop_rect.right(), y)
-
-                # 裁剪框边线
-                painter.setPen(QPen(QColor(204, 153, 68), 2))
-                painter.drawRect(self.crop_rect)
-
-                # 8 个手柄
-                handle = CROP_HANDLE_SIZE
-                painter.setBrush(QBrush(QColor(204, 153, 68)))
-                painter.setPen(QPen(Qt.white, 1))
-                corners = [self.crop_rect.topLeft(), self.crop_rect.topRight(),
-                           self.crop_rect.bottomLeft(), self.crop_rect.bottomRight()]
-                edges = [QPoint(self.crop_rect.center().x(), self.crop_rect.top()),
-                         QPoint(self.crop_rect.center().x(), self.crop_rect.bottom()),
-                         QPoint(self.crop_rect.left(), self.crop_rect.center().y()),
-                         QPoint(self.crop_rect.right(), self.crop_rect.center().y())]
-                for pt in corners + edges:
-                    painter.drawRect(pt.x() - handle // 2, pt.y() - handle // 2, handle, handle)
-                painter.setBrush(Qt.NoBrush)
+                self._draw_crop_chrome(painter, self.crop_rect, grid_alpha=80)
 
             if self.toolbar_ref.current_tool == 'OCR' and getattr(self, 'ocr_rect', None):
                 painter.setPen(QPen(Qt.green, 2, Qt.DashLine))
@@ -11749,34 +12299,7 @@ class EditableImageLabel(QLabel):
     def commit_text_edit(self):
         if not getattr(self, 'inline_editor', None) or not self.inline_editor.isVisible():
             return
-        text = self.inline_editor.text_edit.toPlainText()
-        had_existing = self.inline_editor.active_edit_ref is not None
-        if text.strip():
-            if not had_existing:
-                self.save_state()
-            rect = self.inline_editor.get_text_rect()
-            opts = self.options_bar.get_text_options() if self.options_bar else {}
-            font = self.inline_editor.text_edit.font()
-            self.edits.append({
-                'type': 'TEXT',
-                'pos': rect.topLeft(),
-                'rect': rect,
-                'text': text,
-                'color': QColor(opts.get('color', self.inline_editor.current_color)),
-                'font': QFont(font),
-                'fontFamily': opts.get('fontFamily', font.family()),
-                'fontSize': opts.get('fontSize', font.pointSize() if font.pointSize() > 0 else 14),
-                'bold': opts.get('bold', font.bold()),
-                'italic': opts.get('italic', font.italic()),
-                'bgEnabled': opts.get('bgEnabled', self.inline_editor.bg_enabled),
-                'bgColor': QColor(opts.get('bgColor', self.inline_editor.bg_color)),
-                'user_width': self.inline_editor.user_width,
-                'user_height': self.inline_editor.user_height,
-            })
-        self.inline_editor.active_edit_ref = None
-        self.inline_editor.hide()
-        if self.isVisible():
-            self.setFocus()
+        self._commit_inline_text_edit()
         self._notify_editor_state_changed()
         self.update()
 
@@ -11832,25 +12355,12 @@ class EditableImageLabel(QLabel):
             if self.crop_mode and self.crop_rect and self.crop_rect.contains(pos):
                 self.toolbar_ref.apply_crop()
                 return
-            for i in range(len(self.edits) - 1, -1, -1):
-                if (self.edits[i].get('type') == 'TEXT'
-                        and int(self.edits[i].get('rotation', 0)) % 360 == 0
-                        and is_annotation_hit(self.edits[i], pos)):
-                    self.commit_text_edit()
-                    if self.toolbar_ref.current_tool != 'TEXT':
-                        self.toolbar_ref.set_tool('TEXT', getattr(self.toolbar_ref, 'btn_text', None))
-                    edit = self.edits.pop(i)
-                    self.save_state()
-                    if self.options_bar is not None:
-                        self.options_bar.sync_text_options_from_edit(edit)
-                    if hasattr(self.toolbar_ref, '_sync_color_button_from_active_tool'):
-                        self.toolbar_ref._sync_color_button_from_active_tool()
-                    edit_rect = get_text_annotation_rect(edit).toAlignedRect()
-                    self.inline_editor.start_editing(edit_rect, existing_edit=edit, start_in_text_mode=True)
-                    self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
-                    self.drag_mode = None
-                    self.update()
-                    break
+            idx = self._find_editable_text_edit_index(pos)
+            if idx is not None:
+                self.commit_text_edit()
+                if self.toolbar_ref.current_tool != 'TEXT':
+                    self.toolbar_ref.set_tool('TEXT', getattr(self.toolbar_ref, 'btn_text', None))
+                self._open_existing_text_edit(idx, start_in_text_mode=True, click_global_pos=event.globalPos())
         except Exception as e:
             logging.error("EditableImageLabel mouseDoubleClickEvent 出错: %s", e, exc_info=True)
 
@@ -11901,156 +12411,26 @@ class EditableImageLabel(QLabel):
                 self.ocr_start = pos
                 self.ocr_rect = QRect(pos, pos)
             elif tool == 'TEXT':
-                clicked_idx = None
-                for i in range(len(self.edits) - 1, -1, -1):
-                    if (self.edits[i].get('type') == 'TEXT'
-                            and int(self.edits[i].get('rotation', 0)) % 360 == 0
-                            and is_annotation_hit(self.edits[i], pos)):
-                        clicked_idx = i
-                        break
-
-                if clicked_idx is not None:
-                    clicked_edit = self.edits.pop(clicked_idx)
-                    self.save_state()
+                mode = self._handle_text_tool_press(pos, event.globalPos(), was_editing, had_text)
+                self.is_drawing = (mode == 'text_draw')
+            else:
+                res = self._begin_annotation_edit(
+                    tool, pos,
+                    default_color=self.toolbar_ref.current_color,
+                    default_thickness=getattr(self.toolbar_ref, 'current_thickness', 3),
+                    options_bar=ob,
+                    step_num=getattr(self.toolbar_ref, 'current_step_num', 1),
+                )
+                if isinstance(res, tuple) and res[0] == 'step':
+                    next_num = res[1]
+                    self.toolbar_ref.current_step_num = next_num
                     if ob is not None:
-                        ob.sync_text_options_from_edit(clicked_edit)
-                    if hasattr(self.toolbar_ref, '_sync_color_button_from_active_tool'):
-                        self.toolbar_ref._sync_color_button_from_active_tool()
-                    edit_rect = get_text_annotation_rect(clicked_edit).toAlignedRect()
-                    self.inline_editor.start_editing(edit_rect, existing_edit=clicked_edit, start_in_text_mode=False)
-                    self.is_drawing = False
-                    self.drag_mode = 'text_move'
-                    self._text_move_start_global = event.globalPos()
-                    self._text_move_start_frame = QRect(self.inline_editor.get_text_rect())
-                    self._text_move_dragged = False
+                        ob.set_step_num(next_num)
+                    self._notify_editor_state_changed()
                     self.update()
-                else:
+                elif res == 'drawing':
                     self.is_drawing = True
-                    self.drag_mode = 'text_draw'
-                    self.text_start = pos
-                    self.text_rect = QRect(pos, pos)
-                    self._text_just_committed = (was_editing and had_text)
-
-            elif tool == 'BLUR':
-                self.save_state()
-                self.is_drawing = True
-                self.drag_mode = None
-                opts = ob.get_mosaic_options() if ob else {}
-                self.edits.append({
-                    'type': 'MOSAIC_BLUR',
-                    'points': [pos],
-                    'mode': opts.get('mode', 'mosaic'),
-                    'smooth': opts.get('smooth', False),
-                    'blockSize': opts.get('blockSize', 10),
-                    'brushWidth': opts.get('brushWidth', 22),
-                    'temp': True
-                })
-            elif tool == 'STEP':
-                self.save_state()
-                opts = ob.get_step_options() if ob else {}
-                step_num = opts.get('num', getattr(self.toolbar_ref, 'current_step_num', 1))
-                radius = opts.get('radius', 14)
-                color = opts.get('color', self.toolbar_ref.current_color)
-                self.edits.append({
-                    'type': 'STEP',
-                    'pos': pos,
-                    'center': pos,
-                    'num': step_num,
-                    'number': step_num,
-                    'color': QColor(color),
-                    'thickness': max(1, (radius - 8) // 2),
-                    'radius': radius,
-                    'temp': False
-                })
-                next_num = step_num + 1
-                self.toolbar_ref.current_step_num = next_num
-                if ob is not None:
-                    ob.set_step_num(next_num)
-                self._notify_editor_state_changed()
-                self.update()
-            elif tool in ('RECTANGLE', 'ELLIPSE'):
-                self.save_state()
-                self.is_drawing = True
-                self.drag_mode = None
-                self.edit_start = pos
-                if ob is not None:
-                    opts = ob.get_rect_options() if tool == 'RECTANGLE' else ob.get_ellipse_options()
-                else:
-                    opts = {'kind': 'ellipse' if tool == 'ELLIPSE' else 'rect', 'strokeColor': self.toolbar_ref.current_color}
-                self.edits.append({
-                    'type': 'RECT_ELLIPSE',
-                    'kind': opts.get('kind', 'ellipse' if tool == 'ELLIPSE' else 'rect'),
-                    'p1': pos,
-                    'p2': pos,
-                    'strokeColor': QColor(opts.get('strokeColor', self.toolbar_ref.current_color)),
-                    'strokeWidth': opts.get('strokeWidth', getattr(self.toolbar_ref, 'current_thickness', 3)),
-                    'fillMode': opts.get('fillMode', 'none'),
-                    'fillColor': QColor(opts.get('fillColor', self.toolbar_ref.current_color)),
-                    'cornerRadius': opts.get('cornerRadius', 0),
-                    'temp': True
-                })
-            elif tool == 'ARROW':
-                self.save_state()
-                self.is_drawing = True
-                self.drag_mode = None
-                self.edit_start = pos
-                opts = ob.get_arrow_options() if ob else {}
-                self.edits.append({
-                    'type': 'ARROW',
-                    'start': pos,
-                    'end': pos,
-                    'arrowMode': opts.get('arrowMode', 'end'),
-                    'width': opts.get('width', getattr(self.toolbar_ref, 'current_thickness', 3)),
-                    'color': QColor(opts.get('color', self.toolbar_ref.current_color)),
-                    'temp': True
-                })
-            elif tool == 'LINE':
-                self.save_state()
-                self.is_drawing = True
-                self.drag_mode = None
-                self.edit_start = pos
-                opts = ob.get_line_options() if ob else {}
-                self.edits.append({
-                    'type': 'LINE',
-                    'rect': QRect(pos, pos),
-                    'start': pos,
-                    'end': pos,
-                    'color': QColor(opts.get('color', self.toolbar_ref.current_color)),
-                    'thickness': opts.get('thickness', getattr(self.toolbar_ref, 'current_thickness', 3)),
-                    'lineStyle': opts.get('lineStyle', 'solid'),
-                    'arrow': False,
-                    'temp': True
-                })
-            elif tool == 'PEN':
-                self.save_state()
-                self.is_drawing = True
-                self.drag_mode = None
-                self.edit_start = pos
-                opts = ob.get_pen_options() if ob else {}
-                self.edits.append({
-                    'type': 'PEN',
-                    'penStyle': opts.get('penStyle', 'polyline'),
-                    'start': pos,
-                    'end': pos,
-                    'points': [pos],
-                    'width': opts.get('width', getattr(self.toolbar_ref, 'current_thickness', 3)),
-                    'color': QColor(opts.get('color', self.toolbar_ref.current_color)),
-                    'temp': True
-                })
-            elif tool == 'HIGHLIGHTER':
-                self.save_state()
-                self.is_drawing = True
-                self.drag_mode = None
-                opts = ob.get_marker_options() if ob else {}
-                self.edits.append({
-                    'type': 'MARKER',
-                    'points': [pos],
-                    'color': QColor(opts.get('color', QColor(255, 230, 0))),
-                    'width': opts.get('width', 16),
-                    'opacity': opts.get('opacity', 45),
-                    'tipStyle': opts.get('tipStyle', 'round'),
-                    'temp': True
-                })
+                    self.drag_mode = None
         except Exception as e:
             logging.error("EditableImageLabel mousePressEvent 出错: %s", e, exc_info=True)
 
@@ -12089,42 +12469,8 @@ class EditableImageLabel(QLabel):
                 elif tool == 'TEXT' and self.drag_mode == 'text_draw':
                     self.text_rect = QRect(self.text_start, pos).normalized().intersected(self.rect())
                     self.update()
-                elif self.edits and self.edits[-1].get('temp'):
-                    item = self.edits[-1]
-                    t = item.get('type')
-                    shift_held = bool(event.modifiers() & Qt.ShiftModifier)
-                    if t == 'RECT_ELLIPSE':
-                        p2 = self._constrain_square_point(self.edit_start, pos) if shift_held else pos
-                        item['p2'] = p2
-                        self.update()
-                    elif t in ('ARROW', 'LINE'):
-                        p2 = self._snap_angle_45(self.edit_start, pos) if shift_held else pos
-                        item['end'] = p2
-                        if t == 'LINE':
-                            item['rect'] = QRect(self.edit_start, p2).normalized()
-                        self.update()
-                    elif t == 'PEN':
-                        if item.get('penStyle') == 'line':
-                            p2 = self._snap_angle_45(self.edit_start, pos) if shift_held else pos
-                            item['end'] = p2
-                            item['points'] = [self.edit_start, p2]
-                        else:
-                            item['points'].append(pos)
-                        self.update()
-                    elif t in ('MOSAIC_BLUR', 'MARKER', 'BLUR_STROKE', 'HIGHLIGHTER'):
-                        item['points'].append(pos)
-                        self.update()
-                    elif t == 'ELLIPSE':
-                        rect = QRect(self.edit_start, pos).normalized()
-                        if shift_held:
-                            side = max(rect.width(), rect.height())
-                            rect.setSize(QSize(side, side))
-                        item['rect'] = rect
-                        self.update()
-                    else:
-                        item['rect'] = QRect(self.edit_start, pos).normalized()
-                        item['end'] = pos
-                        self.update()
+                elif self._update_active_temp_edit(pos, bool(event.modifiers() & Qt.ShiftModifier)):
+                    self.update()
         except Exception as e:
             logging.error("EditableImageLabel mouseMoveEvent 出错: %s", e, exc_info=True)
 
@@ -12140,11 +12486,7 @@ class EditableImageLabel(QLabel):
                 return
 
             if self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_move':
-                self.drag_mode = None
-                if self._text_move_dragged:
-                    self.inline_editor.set_editing_text(False)
-                else:
-                    self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
+                self._handle_text_tool_release(event.globalPos())
                 return
 
             if self.is_drawing:
@@ -12157,38 +12499,10 @@ class EditableImageLabel(QLabel):
                     self.update()
 
                 elif self.toolbar_ref.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
-                    rect = self.text_rect
-                    self.text_rect = None
-                    if rect is not None and rect.width() >= 18 and rect.height() >= 14:
-                        self.inline_editor.start_editing(rect)
-                    elif not getattr(self, '_text_just_committed', False):
-                        self.inline_editor.start_editing(self.text_start)
-                    self._text_just_committed = False
-                    self.update()
+                    self._handle_text_tool_release(event.globalPos())
 
                 if self.edits and self.edits[-1].get('temp'):
-                    item = self.edits[-1]
-                    t = item.get('type')
-                    discard = False
-                    if t == 'RECT_ELLIPSE':
-                        if (item.get('p2', QPoint()) - item.get('p1', QPoint())).manhattanLength() < 2:
-                            discard = True
-                    elif t in ('ARROW', 'LINE'):
-                        if (item.get('end', QPoint()) - item.get('start', QPoint())).manhattanLength() < 2:
-                            discard = True
-                    elif t == 'PEN':
-                        if len(item.get('points', [])) <= 1:
-                            discard = True
-                    elif t in ('MARKER', 'MOSAIC_BLUR', 'BLUR_STROKE', 'HIGHLIGHTER'):
-                        if len(item.get('points', [])) < 1:
-                            discard = True
-
-                    if discard:
-                        self.edits.pop()
-                        if self.undo_stack:
-                            self.undo_stack.pop()
-                    else:
-                        item['temp'] = False
+                    self._finish_active_temp_edit()
                     self._notify_editor_state_changed()
                     self.update()
                 self.is_drawing = False
@@ -12261,91 +12575,10 @@ class EditableImageLabel(QLabel):
                     self.toolbar_ref.crop_toolbar.update_size(self.crop_rect.width(), self.crop_rect.height())
                 self.update()
 
-    def _get_crop_handle_at(self, pos):
-        """返回 pos 处的裁剪手柄名称"""
-        if not self.crop_rect:
-            return None
-        r = self.crop_rect
-        hs = CROP_HANDLE_SIZE
-        corners = {
-            'tl': r.topLeft(), 'tr': r.topRight(),
-            'bl': r.bottomLeft(), 'br': r.bottomRight()
-        }
-        for name, pt in corners.items():
-            if abs(pos.x() - pt.x()) <= hs and abs(pos.y() - pt.y()) <= hs:
-                return name
-        edges = {
-            't': QPoint(r.center().x(), r.top()),
-            'b': QPoint(r.center().x(), r.bottom()),
-            'l': QPoint(r.left(), r.center().y()),
-            'r': QPoint(r.right(), r.center().y()),
-        }
-        for name, pt in edges.items():
-            if abs(pos.x() - pt.x()) <= hs and abs(pos.y() - pt.y()) <= hs:
-                return name
-        if r.contains(pos):
-            return 'move'
-        return None
-
     def _update_crop_rect(self, pos):
         """根据拖动手柄更新裁剪框"""
-        start = self.crop_drag_start_rect
-        h = self.crop_drag_handle
-        pm = self.base_pixmap
-        new_rect = QRect(start)
-
-        if h == 'move':
-            delta = pos - self.crop_drag_start_pos
-            new_rect = start.translated(delta)
-        else:
-            if 'l' in h: new_rect.setLeft(min(start.right() - CROP_MIN_SIZE, pos.x()))
-            if 'r' in h: new_rect.setRight(max(start.left() + CROP_MIN_SIZE, pos.x()))
-            if 't' in h: new_rect.setTop(min(start.bottom() - CROP_MIN_SIZE, pos.y()))
-            if 'b' in h: new_rect.setBottom(max(start.top() + CROP_MIN_SIZE, pos.y()))
-
-            if self.crop_ratio:
-                rw, rh = self.crop_ratio
-                target_ratio = rw / rh
-                if h in ('tl', 'tr', 'bl', 'br'):
-                    if h == 'br':
-                        ax, ay = start.left(), start.top()
-                        new_w = max(CROP_MIN_SIZE, pos.x() - ax)
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax, ay, new_w, new_h)
-                    elif h == 'tl':
-                        ax, ay = start.right(), start.bottom()
-                        new_w = max(CROP_MIN_SIZE, ax - pos.x())
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax - new_w, ay - new_h, new_w, new_h)
-                    elif h == 'tr':
-                        ax, ay = start.left(), start.bottom()
-                        new_w = max(CROP_MIN_SIZE, pos.x() - ax)
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax, ay - new_h, new_w, new_h)
-                    elif h == 'bl':
-                        ax, ay = start.right(), start.top()
-                        new_w = max(CROP_MIN_SIZE, ax - pos.x())
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax - new_w, ay, new_w, new_h)
-                elif h in ('t', 'b'):
-                    cx = start.center().x()
-                    if h == 'b': new_h = max(CROP_MIN_SIZE, pos.y() - start.top())
-                    else: new_h = max(CROP_MIN_SIZE, start.bottom() - pos.y())
-                    new_w = int(new_h * target_ratio)
-                    new_x = cx - new_w // 2
-                    new_y = start.bottom() - new_h if h == 't' else start.top()
-                    new_rect = QRect(new_x, new_y, new_w, new_h)
-                elif h in ('l', 'r'):
-                    cy = start.center().y()
-                    if h == 'r': new_w = max(CROP_MIN_SIZE, pos.x() - start.left())
-                    else: new_w = max(CROP_MIN_SIZE, start.right() - pos.x())
-                    new_h = int(new_w / target_ratio)
-                    new_x = start.right() - new_w if h == 'l' else start.left()
-                    new_y = cy - new_h // 2
-                    new_rect = QRect(new_x, new_y, new_w, new_h)
-
-        new_rect = new_rect.intersected(pm.rect())
-        if new_rect.width() >= CROP_MIN_SIZE and new_rect.height() >= CROP_MIN_SIZE:
+        new_rect = self._compute_updated_crop_rect(pos, self.base_pixmap.rect())
+        if new_rect is not None:
             self.crop_rect = new_rect
             if hasattr(self.toolbar_ref, 'crop_toolbar') and self.toolbar_ref.crop_toolbar:
                 self.toolbar_ref.crop_toolbar.update_size(self.crop_rect.width(), self.crop_rect.height())
@@ -12543,8 +12776,14 @@ class EditorCropControlsWidget(QWidget):
             btn.setChecked(r == ratio)
 
 
-class EditorToolOptionsBar(QWidget):
+class EditorToolOptionsBar(_ToolOptionsPanelsMixin, QWidget):
     """图片编辑与预览窗口的统一二级菜单栏（Codex 风格，覆盖所有编辑与预览工具）。"""
+    _opt_theme = "codex"
+    _opt_panel_stretch = True
+    _opt_divider_qss = "background: #E4E4E7; border: none; margin: 0 2px;"
+    _opt_rotate_theme = "codex"
+    _opt_text_bold_w = 28
+
     options_changed = pyqtSignal()
     eraser_undo_clicked = pyqtSignal()
     eraser_clear_clicked = pyqtSignal()
@@ -12645,139 +12884,19 @@ class EditorToolOptionsBar(QWidget):
         self._init_rect_panel()
         self._init_ellipse_panel()
         self._init_line_panel()
-        self._init_arrow_panel()
-        self._init_pen_panel()
-        self._init_marker_panel()
+        self._init_arrow_panel(tool_name='ARROW', none_label="无箭头 ━", show_hint=True)
+        self._init_pen_panel(tool_name='PEN', poly_label="自由曲线 〰", hint_text="💡 自由涂鸦或切换“直线”绘制单条直线")
+        self._init_marker_panel(tool_name='HIGHLIGHTER')
         self._init_step_panel()
-        self._init_text_panel()
-        self._init_mosaic_blur_panel()
+        self._init_text_panel(tool_name='TEXT')
+        self._init_mosaic_blur_panel(tool_name='BLUR')
         self._init_eraser_panel()
         self._init_crop_panel()
         self._init_rotate_panel()
         self._init_ocr_panel()
 
-    def _add_divider(self, layout):
-        sep = QFrame(self)
-        sep.setFixedSize(1, 16)
-        sep.setStyleSheet("background: #E4E4E7; border: none; margin: 0 2px;")
-        layout.addWidget(sep)
-
-    def _make_seg_btn(self, text, checked=False, checkable=True, tip="", fixed_w=None):
-        btn = QPushButton(text, self)
-        btn.setObjectName("subSegBtn")
-        btn.setCheckable(checkable)
-        btn.setChecked(checked if checkable else False)
-        btn.setFocusPolicy(Qt.NoFocus)
-        btn.setAutoDefault(False)
-        btn.setDefault(False)
-        btn.setFixedHeight(24)
-        if fixed_w is not None:
-            btn.setFixedWidth(fixed_w)
-        btn.setCursor(Qt.PointingHandCursor)
-        if tip:
-            btn.setToolTip(tip)
-        return btn
-
-    def _make_spin(self, min_v, max_v, val, width=46, suffix=""):
-        sb = QSpinBox(self)
-        sb.setRange(min_v, max_v)
-        sb.setValue(val)
-        sb.setFixedWidth(width)
-        if suffix:
-            sb.setSuffix(suffix)
-        sb.valueChanged.connect(self.options_changed.emit)
-        return sb
-
-    def _make_palette(self, default_color="#EF4444", presets=None):
-        pal = ColorPaletteWidget(
-            self, default_color=default_color, presets=presets,
-            swatch_size=15, spacing=3, theme="codex"
-        )
-        pal.color_changed.connect(lambda _: self.options_changed.emit())
-        return pal
-
-    def _make_hint(self, text):
-        lbl = QLabel(text, self)
-        lbl.setObjectName("subHintLabel")
-        return lbl
-
-    def _register_panel(self, tool_name, panel):
-        idx = self.stack.addWidget(panel)
-        self.tool_indices[tool_name] = idx
-
-    def _build_shape_panel(self, tool_name, with_radius=False):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        btn_none = self._make_seg_btn("无填充", checked=True)
-        btn_stroke = self._make_seg_btn("带框填充")
-        btn_solid = self._make_seg_btn("实心填充")
-        l.addWidget(btn_none)
-        l.addWidget(btn_stroke)
-        l.addWidget(btn_solid)
-
-        self._add_divider(l)
-
-        lbl_w = QLabel("宽度:", panel)
-        l.addWidget(lbl_w)
-        spin_w = self._make_spin(1, 24, 3, width=44)
-        l.addWidget(spin_w)
-
-        spin_r = None
-        if with_radius:
-            l.addWidget(QLabel("圆角:", panel))
-            spin_r = self._make_spin(0, 30, 0, width=44)
-            l.addWidget(spin_r)
-
-        self._add_divider(l)
-
-        lbl_stroke = QLabel("描边:", panel)
-        stroke_pal = self._make_palette(default_color="#FF3B30")
-        l.addWidget(lbl_stroke)
-        l.addWidget(stroke_pal)
-
-        lbl_fill = QLabel("填充:", panel)
-        fill_pal = self._make_palette(default_color="#FF3B30")
-        l.addWidget(lbl_fill)
-        l.addWidget(fill_pal)
-        lbl_fill.hide()
-        fill_pal.hide()
-
-        if not with_radius:
-            l.addWidget(self._make_hint("💡 Shift 画正圆"))
-        l.addStretch(1)
-
-        def _set_fill(mode):
-            btn_none.setChecked(mode == 'none')
-            btn_stroke.setChecked(mode == 'stroke_fill')
-            btn_solid.setChecked(mode == 'fill')
-            has_fill = (mode != 'none')
-            has_stroke = (mode != 'fill')
-            lbl_stroke.setVisible(has_stroke)
-            stroke_pal.setVisible(has_stroke)
-            lbl_w.setEnabled(has_stroke)
-            spin_w.setEnabled(has_stroke)
-            lbl_fill.setVisible(has_fill)
-            fill_pal.setVisible(has_fill)
-            self.options_changed.emit()
-
-        btn_none.clicked.connect(lambda: _set_fill('none'))
-        btn_stroke.clicked.connect(lambda: _set_fill('stroke_fill'))
-        btn_solid.clicked.connect(lambda: _set_fill('fill'))
-
-        self._register_panel(tool_name, panel)
-        return {
-            'btn_none': btn_none, 'btn_stroke': btn_stroke, 'btn_solid': btn_solid,
-            'spin_w': spin_w, 'spin_r': spin_r,
-            'stroke_pal': stroke_pal, 'fill_pal': fill_pal,
-            'set_fill': _set_fill,
-        }
-
-    # 1. 矩形面板
     def _init_rect_panel(self):
-        refs = self._build_shape_panel('RECTANGLE', with_radius=True)
+        refs = self._build_shape_panel('RECTANGLE', with_kind_toggle=False, with_radius=True)
         self.spin_rect_width = refs['spin_w']
         self.spin_rect_radius = refs['spin_r']
         self.rect_stroke_palette = refs['stroke_pal']
@@ -12785,46 +12904,26 @@ class EditorToolOptionsBar(QWidget):
         self._rect_refs = refs
 
     def get_rect_options(self):
-        r = self._rect_refs
-        fill_mode = 'fill' if r['btn_solid'].isChecked() else ('stroke_fill' if r['btn_stroke'].isChecked() else 'none')
-        return {
-            'kind': 'rect',
-            'fillMode': fill_mode,
-            'strokeWidth': self.spin_rect_width.value(),
-            'cornerRadius': self.spin_rect_radius.value(),
-            'strokeColor': self.rect_stroke_palette.current_color,
-            'fillColor': self.rect_fill_palette.current_color,
-        }
+        return self._read_shape_options(self._rect_refs, default_kind='rect')
 
-    # 2. 椭圆面板
     def _init_ellipse_panel(self):
-        refs = self._build_shape_panel('ELLIPSE', with_radius=False)
+        refs = self._build_shape_panel('ELLIPSE', with_kind_toggle=False, with_radius=False, hint_text="💡 Shift 画正圆")
         self.spin_ellipse_width = refs['spin_w']
         self.ellipse_stroke_palette = refs['stroke_pal']
         self.ellipse_fill_palette = refs['fill_pal']
         self._ellipse_refs = refs
 
     def get_ellipse_options(self):
-        r = self._ellipse_refs
-        fill_mode = 'fill' if r['btn_solid'].isChecked() else ('stroke_fill' if r['btn_stroke'].isChecked() else 'none')
-        return {
-            'kind': 'ellipse',
-            'fillMode': fill_mode,
-            'strokeWidth': self.spin_ellipse_width.value(),
-            'cornerRadius': 0,
-            'strokeColor': self.ellipse_stroke_palette.current_color,
-            'fillColor': self.ellipse_fill_palette.current_color,
-        }
+        return self._read_shape_options(self._ellipse_refs, default_kind='ellipse')
 
-    # 3. 直线面板
     def _init_line_panel(self):
         panel = QWidget(self)
         l = QHBoxLayout(panel)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(5)
 
-        self.btn_line_solid = self._make_seg_btn("实线 ━", checked=True)
-        self.btn_line_dashed = self._make_seg_btn("虚线 ┄")
+        self.btn_line_solid = self._make_opt_btn("实线 ━", checked=True)
+        self.btn_line_dashed = self._make_opt_btn("虚线 ┄")
         self.btn_line_solid.clicked.connect(lambda: self._set_line_style('solid'))
         self.btn_line_dashed.clicked.connect(lambda: self._set_line_style('dashed'))
         l.addWidget(self.btn_line_solid)
@@ -12833,18 +12932,17 @@ class EditorToolOptionsBar(QWidget):
         self._add_divider(l)
 
         l.addWidget(QLabel("宽度:", panel))
-        self.spin_line_width = self._make_spin(1, 24, 3, width=44)
+        self.spin_line_width = self._make_opt_spin(1, 24, 3, width=44)
         l.addWidget(self.spin_line_width)
 
         self._add_divider(l)
 
         l.addWidget(QLabel("颜色:", panel))
-        self.line_palette = self._make_palette(default_color="#FF3B30")
+        self.line_palette = self._make_opt_palette(default_color="#FF3B30")
         l.addWidget(self.line_palette)
 
-        l.addWidget(self._make_hint("💡 按住 Shift 对齐 45°"))
-        l.addStretch(1)
-        self._register_panel('LINE', panel)
+        l.addWidget(self._make_opt_hint("💡 按住 Shift 对齐 45°"))
+        self._register_panel('LINE', panel, l)
 
     def _set_line_style(self, style):
         self.btn_line_solid.setChecked(style == 'solid')
@@ -12858,153 +12956,6 @@ class EditorToolOptionsBar(QWidget):
             'color': self.line_palette.current_color,
         }
 
-    # 4. 箭头面板
-    def _init_arrow_panel(self):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_arr_end = self._make_seg_btn("结尾 ➔", checked=True)
-        self.btn_arr_start = self._make_seg_btn("开始 ⬅")
-        self.btn_arr_both = self._make_seg_btn("双向 ⬌")
-        self.btn_arr_none = self._make_seg_btn("无箭头 ━")
-        self.btn_arr_end.clicked.connect(lambda: self._set_arr_mode('end'))
-        self.btn_arr_start.clicked.connect(lambda: self._set_arr_mode('start'))
-        self.btn_arr_both.clicked.connect(lambda: self._set_arr_mode('both'))
-        self.btn_arr_none.clicked.connect(lambda: self._set_arr_mode('none'))
-        l.addWidget(self.btn_arr_end)
-        l.addWidget(self.btn_arr_start)
-        l.addWidget(self.btn_arr_both)
-        l.addWidget(self.btn_arr_none)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:", panel))
-        self.spin_arrow_width = self._make_spin(1, 24, 3, width=44)
-        l.addWidget(self.spin_arrow_width)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("颜色:", panel))
-        self.arrow_palette = self._make_palette(default_color="#FF3B30")
-        l.addWidget(self.arrow_palette)
-
-        l.addWidget(self._make_hint("💡 Shift 对齐 45°"))
-        l.addStretch(1)
-        self._register_panel('ARROW', panel)
-
-    def _set_arr_mode(self, mode):
-        self.btn_arr_end.setChecked(mode == 'end')
-        self.btn_arr_start.setChecked(mode == 'start')
-        self.btn_arr_both.setChecked(mode == 'both')
-        self.btn_arr_none.setChecked(mode == 'none')
-        self.options_changed.emit()
-
-    def get_arrow_options(self):
-        mode = 'end'
-        if self.btn_arr_start.isChecked():
-            mode = 'start'
-        elif self.btn_arr_both.isChecked():
-            mode = 'both'
-        elif self.btn_arr_none.isChecked():
-            mode = 'none'
-        return {
-            'arrowMode': mode,
-            'width': self.spin_arrow_width.value(),
-            'color': self.arrow_palette.current_color,
-        }
-
-    # 5. 画笔面板
-    def _init_pen_panel(self):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_pen_poly = self._make_seg_btn("自由曲线 〰", checked=True)
-        self.btn_pen_line = self._make_seg_btn("直线 ╱")
-        self.btn_pen_poly.clicked.connect(lambda: self._set_pen_style('polyline'))
-        self.btn_pen_line.clicked.connect(lambda: self._set_pen_style('line'))
-        l.addWidget(self.btn_pen_poly)
-        l.addWidget(self.btn_pen_line)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:", panel))
-        self.spin_pen_width = self._make_spin(1, 24, 3, width=44)
-        l.addWidget(self.spin_pen_width)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("颜色:", panel))
-        self.pen_palette = self._make_palette(default_color="#FF3B30")
-        l.addWidget(self.pen_palette)
-
-        l.addWidget(self._make_hint("💡 自由涂鸦或切换“直线”绘制单条直线"))
-        l.addStretch(1)
-        self._register_panel('PEN', panel)
-
-    def _set_pen_style(self, style):
-        self.btn_pen_poly.setChecked(style == 'polyline')
-        self.btn_pen_line.setChecked(style == 'line')
-        self.options_changed.emit()
-
-    def get_pen_options(self):
-        return {
-            'penStyle': 'line' if self.btn_pen_line.isChecked() else 'polyline',
-            'width': self.spin_pen_width.value(),
-            'color': self.pen_palette.current_color,
-        }
-
-    # 6. 荧光笔 / 记号笔面板
-    def _init_marker_panel(self):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        l.addWidget(QLabel("颜色:", panel))
-        marker_presets = ["#FFE600", "#39FF14", "#FF1493", "#00E5FF", "#FF8C00", "#A855F7", "#FF3B30", "#000000"]
-        self.marker_palette = self._make_palette(default_color="#FFE600", presets=marker_presets)
-        l.addWidget(self.marker_palette)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("宽度:", panel))
-        self.spin_marker_width = self._make_spin(6, 50, 16, width=46)
-        l.addWidget(self.spin_marker_width)
-
-        l.addWidget(QLabel("不透明度:", panel))
-        self.spin_marker_opacity = self._make_spin(15, 90, 45, width=54, suffix="%")
-        l.addWidget(self.spin_marker_opacity)
-
-        self._add_divider(l)
-
-        self.btn_tip_round = self._make_seg_btn("圆头 ◐", checked=True)
-        self.btn_tip_flat = self._make_seg_btn("平头 ◼")
-        self.btn_tip_round.clicked.connect(lambda: self._set_tip_style('round'))
-        self.btn_tip_flat.clicked.connect(lambda: self._set_tip_style('flat'))
-        l.addWidget(self.btn_tip_round)
-        l.addWidget(self.btn_tip_flat)
-
-        l.addStretch(1)
-        self._register_panel('HIGHLIGHTER', panel)
-
-    def _set_tip_style(self, style):
-        self.btn_tip_round.setChecked(style == 'round')
-        self.btn_tip_flat.setChecked(style == 'flat')
-        self.options_changed.emit()
-
-    def get_marker_options(self):
-        return {
-            'color': self.marker_palette.current_color,
-            'width': self.spin_marker_width.value(),
-            'opacity': self.spin_marker_opacity.value(),
-            'tipStyle': 'flat' if self.btn_tip_flat.isChecked() else 'round',
-        }
-
-    # 7. 序号标注面板
     def _init_step_panel(self):
         panel = QWidget(self)
         l = QHBoxLayout(panel)
@@ -13012,28 +12963,27 @@ class EditorToolOptionsBar(QWidget):
         l.setSpacing(5)
 
         l.addWidget(QLabel("下一序号:", panel))
-        self.spin_step_num = self._make_spin(1, 999, 1, width=50)
+        self.spin_step_num = self._make_opt_spin(1, 999, 1, width=50)
         l.addWidget(self.spin_step_num)
 
-        self.btn_step_reset = self._make_seg_btn("重置为 1", checkable=False, tip="将下一个序号重置为 1")
+        self.btn_step_reset = self._make_opt_btn("重置为 1", checkable=False, tip="将下一个序号重置为 1")
         self.btn_step_reset.clicked.connect(self._reset_step_num)
         l.addWidget(self.btn_step_reset)
 
         self._add_divider(l)
 
         l.addWidget(QLabel("尺寸:", panel))
-        self.spin_step_radius = self._make_spin(10, 36, 14, width=46)
+        self.spin_step_radius = self._make_opt_spin(10, 36, 14, width=46)
         l.addWidget(self.spin_step_radius)
 
         self._add_divider(l)
 
         l.addWidget(QLabel("颜色:", panel))
-        self.step_palette = self._make_palette(default_color="#FF3B30")
+        self.step_palette = self._make_opt_palette(default_color="#FF3B30")
         l.addWidget(self.step_palette)
 
-        l.addWidget(self._make_hint("💡 点击画布放置递增序号"))
-        l.addStretch(1)
-        self._register_panel('STEP', panel)
+        l.addWidget(self._make_opt_hint("💡 点击画布放置递增序号"))
+        self._register_panel('STEP', panel, l)
 
     def _reset_step_num(self):
         self.set_step_num(1)
@@ -13054,146 +13004,13 @@ class EditorToolOptionsBar(QWidget):
             'color': self.step_palette.current_color,
         }
 
-    # 8. 文本面板
-    def _init_text_panel(self):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.combo_text_font = CodexComboBox(self)
-        self.combo_text_font.setFocusPolicy(Qt.NoFocus)
-        self.combo_text_font.addItems(["Microsoft YaHei", "Segoe UI", "Arial", "SimHei", "Consolas"])
-        self.combo_text_font.currentTextChanged.connect(self.options_changed.emit)
-        l.addWidget(self.combo_text_font)
-
-        l.addWidget(QLabel("字号:", panel))
-        self.spin_text_size = self._make_spin(8, 72, 14, width=46)
-        l.addWidget(self.spin_text_size)
-
-        self._add_divider(l)
-
-        self.btn_text_bold = self._make_seg_btn("B", fixed_w=28, tip="粗体")
-        self.btn_text_bold.setStyleSheet("font-weight: bold;")
-        self.btn_text_bold.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_text_bold)
-
-        self.btn_text_italic = self._make_seg_btn("I", fixed_w=28, tip="斜体")
-        self.btn_text_italic.setStyleSheet("font-style: italic;")
-        self.btn_text_italic.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_text_italic)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("颜色:", panel))
-        self.text_palette = self._make_palette(default_color="#FF3B30")
-        l.addWidget(self.text_palette)
-
-        self._add_divider(l)
-
-        self.btn_text_bg = self._make_seg_btn("背景框", tip="开启/关闭文字圆角背景框")
-        self.btn_text_bg.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_text_bg)
-
-        l.addStretch(1)
-        self._register_panel('TEXT', panel)
-
-    def get_text_options(self):
-        return {
-            'fontFamily': self.combo_text_font.currentText(),
-            'fontSize': self.spin_text_size.value(),
-            'bold': self.btn_text_bold.isChecked(),
-            'italic': self.btn_text_italic.isChecked(),
-            'color': self.text_palette.current_color,
-            'bgEnabled': self.btn_text_bg.isChecked(),
-            'bgColor': QColor(255, 255, 255, 230),
-        }
-
-    def sync_text_options_from_edit(self, edit):
-        if not edit:
-            return
-        font = _extract_edit_font(edit)
-        family = edit.get('fontFamily') or font.family()
-        size = int(edit.get('fontSize') or (font.pointSize() if font.pointSize() > 0 else 14))
-        bold = bool(edit.get('bold', font.bold()))
-        italic = bool(edit.get('italic', font.italic()))
-        color = edit.get('color', self.text_palette.current_color)
-        bg_enabled = bool(edit.get('bgEnabled', False))
-
-        widgets = [
-            self.combo_text_font, self.spin_text_size,
-            self.btn_text_bold, self.btn_text_italic, self.btn_text_bg,
-        ]
-        prev_states = [w.blockSignals(True) for w in widgets]
-        try:
-            idx = self.combo_text_font.findText(family, Qt.MatchFixedString)
-            if idx >= 0:
-                self.combo_text_font.setCurrentIndex(idx)
-            self.spin_text_size.setValue(max(self.spin_text_size.minimum(), min(self.spin_text_size.maximum(), size)))
-            self.btn_text_bold.setChecked(bold)
-            self.btn_text_italic.setChecked(italic)
-            self.btn_text_bg.setChecked(bg_enabled)
-            if isinstance(color, QColor) and color.isValid():
-                self.text_palette.set_color(color, emit=False)
-        finally:
-            for w, prev in zip(widgets, prev_states):
-                w.blockSignals(prev)
-
-    # 9. 马赛克 / 模糊面板
-    def _init_mosaic_blur_panel(self):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(5)
-
-        self.btn_mb_mosaic = self._make_seg_btn("马赛克 ▨", checked=True, tip="切换马赛克 / 高斯模糊")
-        self.btn_mb_blur = self._make_seg_btn("高斯模糊 💧", tip="切换马赛克 / 高斯模糊")
-        self.btn_mb_mosaic.clicked.connect(lambda: self._set_mb_mode('mosaic'))
-        self.btn_mb_blur.clicked.connect(lambda: self._set_mb_mode('blur'))
-        l.addWidget(self.btn_mb_mosaic)
-        l.addWidget(self.btn_mb_blur)
-
-        self._add_divider(l)
-
-        self.btn_mb_smooth = self._make_seg_btn("像素平滑 ≋", tip="开启柔化像素边缘，关闭为硬边方块")
-        self.btn_mb_smooth.clicked.connect(self.options_changed.emit)
-        l.addWidget(self.btn_mb_smooth)
-
-        self._add_divider(l)
-
-        l.addWidget(QLabel("粒度:", panel))
-        self.spin_mb_block = self._make_spin(4, 32, 10, width=46)
-        l.addWidget(self.spin_mb_block)
-
-        l.addWidget(QLabel("笔尖:", panel))
-        self.spin_mb_brush = self._make_spin(8, 60, 22, width=46)
-        l.addWidget(self.spin_mb_brush)
-
-        l.addStretch(1)
-        self._register_panel('BLUR', panel)
-
-    def _set_mb_mode(self, mode):
-        self.btn_mb_mosaic.setChecked(mode == 'mosaic')
-        self.btn_mb_blur.setChecked(mode == 'blur')
-        self.btn_mb_smooth.setEnabled(mode == 'mosaic')
-        self.options_changed.emit()
-
-    def get_mosaic_options(self):
-        return {
-            'mode': 'blur' if self.btn_mb_blur.isChecked() else 'mosaic',
-            'smooth': self.btn_mb_smooth.isChecked(),
-            'blockSize': self.spin_mb_block.value(),
-            'brushWidth': self.spin_mb_brush.value(),
-        }
-
-    # 10. 橡皮擦面板
     def _init_eraser_panel(self):
         panel = QWidget(self)
         l = QHBoxLayout(panel)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(6)
 
-        l.addWidget(self._make_hint("🧹 点击或按住拖动经过已有标注即可整项擦除（单次拖动记为一步撤销）"))
+        l.addWidget(self._make_opt_hint("🧹 点击或按住拖动经过已有标注即可整项擦除（单次拖动记为一步撤销）"))
         l.addStretch(1)
 
         self.btn_eraser_undo = QPushButton("撤销上一步", panel)
@@ -13216,39 +13033,24 @@ class EditorToolOptionsBar(QWidget):
         self.btn_eraser_clear.clicked.connect(self.eraser_clear_clicked.emit)
         l.addWidget(self.btn_eraser_clear)
 
-        self._register_panel('ERASE', panel)
+        self.tool_indices['ERASE'] = self.stack.addWidget(panel)
 
-    # 11. 裁剪面板
     def _init_crop_panel(self):
         panel = QWidget(self)
         l = QHBoxLayout(panel)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(0)
-
         self.crop_bar = EditorCropControlsWidget(panel)
         l.addWidget(self.crop_bar)
-        self._register_panel('CROP', panel)
+        self.tool_indices['CROP'] = self.stack.addWidget(panel)
 
-    # 12. 旋转 / 翻转面板
-    def _init_rotate_panel(self):
-        panel = QWidget(self)
-        l = QHBoxLayout(panel)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(0)
-
-        self.rotate_controls = RotateControlsWidget(theme="codex", parent=panel)
-        l.addWidget(self.rotate_controls)
-        l.addStretch(1)
-        self._register_panel('ROTATE', panel)
-
-    # 13. 识别与翻译面板
     def _init_ocr_panel(self):
         panel = QWidget(self)
         l = QHBoxLayout(panel)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(6)
 
-        l.addWidget(self._make_hint("🔤 在画布上拖选区域进行局部识别，或直接处理整图："))
+        l.addWidget(self._make_opt_hint("🔤 在画布上拖选区域进行局部识别，或直接处理整图："))
         l.addStretch(1)
 
         self.btn_ocr_full = QPushButton("识别当前整图", panel)
@@ -13271,7 +13073,7 @@ class EditorToolOptionsBar(QWidget):
         self.btn_ocr_translate.clicked.connect(self.ocr_translate_clicked.emit)
         l.addWidget(self.btn_ocr_translate)
 
-        self._register_panel('OCR', panel)
+        self.tool_indices['OCR'] = self.stack.addWidget(panel)
 
     def _palette_for_tool(self, tool_name):
         if tool_name == 'RECTANGLE':
@@ -13316,14 +13118,6 @@ class EditorToolOptionsBar(QWidget):
         self.btn_ocr_full.setEnabled(not ocr_busy)
         self.btn_ocr_translate.setEnabled(not ocr_busy)
         self.btn_ocr_full.setText("识别中…" if ocr_busy else "识别当前整图")
-
-    def set_tool(self, tool_name):
-        self.current_tool_name = tool_name
-        if tool_name in self.tool_indices:
-            self.stack.setCurrentIndex(self.tool_indices[tool_name])
-            self.show()
-        else:
-            self.hide()
 
 
 class ImageEditorDialog(QDialog):
@@ -13619,10 +13413,8 @@ class ImageEditorDialog(QDialog):
         return exec_dialog_nonmodal(self)
 
     def _unregister_editor(self):
-        try:
+        if self in ImageEditorDialog._active_editors:
             ImageEditorDialog._active_editors.remove(self)
-        except ValueError:
-            pass
 
     def done(self, result):
         self._editor_closed = True
@@ -14224,7 +14016,7 @@ def clean_orphan_temp_files():
 # ==========================================
 # CAPTURE HISTORY PERSISTENCE & UI
 # ==========================================
-HISTORY_DIR = os.path.join(BASE_DIR, "capture_history")
+HISTORY_DIR = os.path.join(DATA_DIR, "capture_history")
 HISTORY_INDEX_FILE = os.path.join(HISTORY_DIR, "history_index.json")
 
 class CaptureHistoryManager:
@@ -14293,8 +14085,8 @@ class CaptureHistoryManager:
                         os.remove(old['filepath'])
                     if os.path.exists(old.get('thumb_path', '')):
                         os.remove(old['thumb_path'])
-                except Exception:
-                    pass
+                except OSError as e:
+                    logging.debug("清理旧历史截图文件失败: %s", e)
 
             self._save_index()
             return item
@@ -15891,6 +15683,34 @@ class SettingsDialog(QDialog):
         self.resize(790, 560)
         self.setMinimumSize(680, 440)
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self._apply_codex_qss()
+
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._build_sidebar())
+
+        main_pane = QWidget()
+        main_pane.setObjectName("codexMainPane")
+        pane_lay = QVBoxLayout(main_pane)
+        pane_lay.setContentsMargins(0, 0, 0, 0)
+        pane_lay.setSpacing(0)
+        pane_lay.addWidget(self._build_header())
+
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("codexPages")
+        self.pages.setStyleSheet("QStackedWidget#codexPages { background: #FFFFFF; border: none; }")
+        self.pages.addWidget(self._build_hotkeys_page())
+        self.pages.addWidget(self._build_general_page())
+        self.pages.addWidget(self._build_ai_page())
+        self.pages.addWidget(self._build_update_page())
+        pane_lay.addWidget(self.pages, 1)
+
+        pane_lay.addWidget(self._build_footer())
+        root_layout.addWidget(main_pane, 1)
+        self._load_current_values()
+
+    def _apply_codex_qss(self):
         self.setStyleSheet("""
             QDialog {
                 background: #FFFFFF;
@@ -16088,13 +15908,7 @@ class SettingsDialog(QDialog):
             }
         """)
 
-        root_layout = QHBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-
-        # ==========================================
-        # 左侧导航栏 (Codex Sidebar)
-        # ==========================================
+    def _build_sidebar(self):
         sidebar = QWidget()
         sidebar.setObjectName("codexSidebar")
         sidebar.setFixedWidth(202)
@@ -16102,7 +15916,6 @@ class SettingsDialog(QDialog):
         side_lay.setContentsMargins(12, 16, 12, 14)
         side_lay.setSpacing(6)
 
-        # 品牌标识区
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(6, 0, 6, 10)
         brand_row.setSpacing(9)
@@ -16129,7 +15942,6 @@ class SettingsDialog(QDialog):
         brand_row.addStretch()
         side_lay.addLayout(brand_row)
 
-        # 导航菜单项
         self._nav_specs = [
             ("shortcuts", "快捷键", "快捷键", "点击右侧按键槽后直接按下按键或组合键完成录制，按 Delete 或 × 清除", True),
             ("general", "通用与保存", "通用与保存", "管理开机启动、默认存储路径、导出格式与工作区交互偏好", False),
@@ -16156,8 +15968,8 @@ class SettingsDialog(QDialog):
 
         side_lay.addStretch(1)
 
-        # 侧栏底部极简配置提示
         side_foot = QLabel("配置实时写入本地\ncapture_settings.json")
+        side_foot.setToolTip(SETTINGS_FILE)
         side_foot.setStyleSheet("""
             color: #8E8EA0;
             font-size: 11px;
@@ -16166,18 +15978,9 @@ class SettingsDialog(QDialog):
             background: transparent;
         """)
         side_lay.addWidget(side_foot)
-        root_layout.addWidget(sidebar)
+        return sidebar
 
-        # ==========================================
-        # 右侧主内容区 (Header + Stacked Pages + Footer)
-        # ==========================================
-        main_pane = QWidget()
-        main_pane.setObjectName("codexMainPane")
-        pane_lay = QVBoxLayout(main_pane)
-        pane_lay.setContentsMargins(0, 0, 0, 0)
-        pane_lay.setSpacing(0)
-
-        # 顶部固定标题栏
+    def _build_header(self):
         header = QWidget()
         header.setObjectName("codexHeader")
         hdr_lay = QHBoxLayout(header)
@@ -16202,73 +16005,51 @@ class SettingsDialog(QDialog):
         self.btn_reset_hk.setCursor(Qt.PointingHandCursor)
         self.btn_reset_hk.clicked.connect(self._reset_default_hotkeys)
         hdr_lay.addWidget(self.btn_reset_hk, 0, Qt.AlignVCenter)
+        return header
 
-        pane_lay.addWidget(header)
+    def _add_section_label(self, parent_layout, title):
+        lbl = QLabel(title)
+        lbl.setObjectName("codexSectionLabel")
+        parent_layout.addWidget(lbl)
 
-        # 分页容器
-        self.pages = QStackedWidget()
-        self.pages.setObjectName("codexPages")
-        self.pages.setStyleSheet("QStackedWidget#codexPages { background: #FFFFFF; border: none; }")
-        pane_lay.addWidget(self.pages, 1)
-
-        # ---------- 页面 0：全局快捷键 ----------
+    def _build_hotkeys_page(self):
         p0_scroll, p0_lay = self._make_scroll_page()
 
-        lbl_sec_core = QLabel("核心截图与录制")
-        lbl_sec_core.setObjectName("codexSectionLabel")
-        p0_lay.addWidget(lbl_sec_core)
-
+        self._add_section_label(p0_lay, "核心截图与录制")
         card_hk_core = CodexCard()
         self.input_hk_snip = HotkeyRecorderWidget("默认 F1")
         card_hk_core.add_row("屏幕截图", "框选屏幕区域进行标注、复制、保存或贴图", self.input_hk_snip)
-
         self.input_hk_ocr = HotkeyRecorderWidget("默认 F2")
         card_hk_core.add_row("识图与翻译", "选取屏幕文字区域进行 OCR 提取与智能翻译", self.input_hk_ocr)
-
         self.input_hk_pin = HotkeyRecorderWidget("默认 F3")
         card_hk_core.add_row("贴图置顶", "将剪贴板内容或所选区域作为悬浮贴图置顶", self.input_hk_pin)
-
         self.input_hk_rec = HotkeyRecorderWidget("默认 F4")
         card_hk_core.add_row("屏幕录制", "录制选定区域为 MP4 高清视频或 GIF 动图", self.input_hk_rec)
         p0_lay.addWidget(card_hk_core)
 
-        lbl_sec_tools = QLabel("效率工具与窗口")
-        lbl_sec_tools.setObjectName("codexSectionLabel")
-        p0_lay.addWidget(lbl_sec_tools)
-
+        self._add_section_label(p0_lay, "效率工具与窗口")
         card_hk_tools = CodexCard()
         self.input_hk_drawer = HotkeyRecorderWidget("默认 Ctrl+1")
         card_hk_tools.add_row("贴图储藏柜总开关", "彻底开启或禁用右侧磁吸贴图收纳抽屉", self.input_hk_drawer)
-
         self.input_hk_toggle_pins = HotkeyRecorderWidget("默认 Ctrl+Alt+H")
         card_hk_tools.add_row("隐藏/恢复全部贴图", "临时一键隐藏桌面贴图与抽屉，再次按下全部恢复原位", self.input_hk_toggle_pins)
-
         self.input_hk_paste_pin = HotkeyRecorderWidget("默认 Ctrl+Alt+V")
         card_hk_tools.add_row("剪贴板图片直接贴图", "直接把剪贴板最新复制的图片或图片文件置顶贴图", self.input_hk_paste_pin)
-
         self.input_hk_restore_click_through = HotkeyRecorderWidget("默认 Ctrl+Alt+T")
         card_hk_tools.add_row("解除贴图鼠标穿透", "一键恢复所有开启鼠标穿透的桌面贴图，防止无法点击关闭", self.input_hk_restore_click_through)
-
         self.input_hk_pin_border = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("切换贴图边框", "一键开启或关闭全部桌面贴图的轮廓边框", self.input_hk_pin_border)
-
         self.input_hk_win_pin = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("窗口置顶 (DeskPin)", "将当前鼠标所在应用窗口固定在最前端", self.input_hk_win_pin)
-
         self.input_hk_scroll = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("滚动长截图", "自动向下滚动拼接超长网页或文档内容", self.input_hk_scroll)
-
         self.input_hk_history = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("截图历史记录", "快速浏览、重新编辑、复制或另存历史截图", self.input_hk_history)
-
         self.input_hk_settings = HotkeyRecorderWidget("点击录制")
         card_hk_tools.add_row("打开系统设置", "从后台随时快速唤出设置面板", self.input_hk_settings)
         p0_lay.addWidget(card_hk_tools)
 
-        lbl_sec_toolbar = QLabel("截图底部工具栏工具（仅截图编辑时生效，默认不绑定）")
-        lbl_sec_toolbar.setObjectName("codexSectionLabel")
-        p0_lay.addWidget(lbl_sec_toolbar)
-
+        self._add_section_label(p0_lay, "截图底部工具栏工具（仅截图编辑时生效，默认不绑定）")
         card_hk_toolbar = CodexCard()
         self.toolbar_hk_inputs = {}
         for cfg_key, _action_id, _kind, label, desc in TOOLBAR_TOOL_HOTKEY_SPECS:
@@ -16281,15 +16062,12 @@ class SettingsDialog(QDialog):
             _hk_widget.recordingStateChanged.connect(self._on_hotkey_recording_state_changed)
 
         p0_lay.addStretch(1)
-        self.pages.addWidget(p0_scroll)
+        return p0_scroll
 
-        # ---------- 页面 1：通用与保存 ----------
+    def _build_general_page(self):
         p1_scroll, p1_lay = self._make_scroll_page()
 
-        lbl_sec_out = QLabel("保存与导出")
-        lbl_sec_out.setObjectName("codexSectionLabel")
-        p1_lay.addWidget(lbl_sec_out)
-
+        self._add_section_label(p1_lay, "保存与导出")
         card_save = CodexCard()
         dir_wrap = QWidget()
         dir_wrap.setObjectName("codexDirWrap")
@@ -16338,103 +16116,73 @@ class SettingsDialog(QDialog):
         card_save.add_row("有损压缩画质", "应用于 JPEG / WebP 格式输出质量（70% - 100%）", qual_wrap)
         p1_lay.addWidget(card_save)
 
-        lbl_sec_ux = QLabel("启动与工作区交互")
-        lbl_sec_ux.setObjectName("codexSectionLabel")
-        p1_lay.addWidget(lbl_sec_ux)
-
+        self._add_section_label(p1_lay, "启动与工作区交互")
         card_ux = CodexCard()
         self.cb_auto_start = CodexSwitch()
         card_ux.add_row("开机自启动", "随 Windows 系统登录自动在后台静默启动（仅写入当前用户启动项）", self.cb_auto_start)
-
         self.cb_show_mode_hints = CodexSwitch()
         card_ux.add_row("快捷操作指引条", "识图或录屏模式显示顶部提示条（支持智能避让与拖拽隐藏）", self.cb_show_mode_hints)
-
         self.cb_drawer_hover = CodexSwitch()
         card_ux.add_row("开启贴图储藏柜", "在屏幕边缘启用磁吸贴图抽屉，可随时按快捷键彻底开关", self.cb_drawer_hover)
-
         self.cb_pin_border = CodexSwitch()
         card_ux.add_row("显示贴图边框", "为所有桌面贴图绘制清晰轮廓边框，便于与背景窗口区分", self.cb_pin_border)
         p1_lay.addWidget(card_ux)
         p1_lay.addStretch(1)
-        self.pages.addWidget(p1_scroll)
+        return p1_scroll
 
-        # ---------- 页面 2：AI 与翻译 ----------
+    @staticmethod
+    def _make_secret_key_input(placeholder):
+        wrap = QWidget()
+        wrap.setFixedWidth(275)
+        box = QHBoxLayout(wrap)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+        edit = QLineEdit()
+        edit.setEchoMode(QLineEdit.Password)
+        edit.setPlaceholderText(placeholder)
+        box.addWidget(edit, 1)
+        btn = QPushButton()
+        btn.setObjectName("codexIconBtn")
+        btn.setFixedSize(30, 30)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setIcon(_create_codex_icon("eye", "#52525B", 16))
+
+        def _toggle():
+            is_pwd = edit.echoMode() == QLineEdit.Password
+            edit.setEchoMode(QLineEdit.Normal if is_pwd else QLineEdit.Password)
+            btn.setIcon(_create_codex_icon("eye_off" if is_pwd else "eye", "#0D0D0D" if is_pwd else "#52525B", 16))
+
+        btn.clicked.connect(_toggle)
+        box.addWidget(btn)
+        return wrap, edit
+
+    def _build_ai_page(self):
         p2_scroll, p2_lay = self._make_scroll_page()
 
-        lbl_sec_zhipu = QLabel("智谱 GLM-OCR 文字识别")
-        lbl_sec_zhipu.setObjectName("codexSectionLabel")
-        p2_lay.addWidget(lbl_sec_zhipu)
-
+        self._add_section_label(p2_lay, "智谱 GLM-OCR 文字识别")
         card_ocr = CodexCard()
         self.cb_ai_ocr = CodexSwitch()
         card_ocr.add_row("启用 AI 多模态识图", "开启后优先使用智谱大模型识别复杂排版、公式与代码片段", self.cb_ai_ocr)
-
         self.cb_ocr_sea_langs = CodexSwitch()
         card_ocr.add_row("启用东南亚语言扩展 (泰语/菲律宾语)", "默认仅使用中英引擎防误识；需离线识别泰文或菲律宾文时再开启", self.cb_ocr_sea_langs)
-
-        key_ocr_wrap = QWidget()
-        key_ocr_wrap.setFixedWidth(275)
-        key_box_ocr = QHBoxLayout(key_ocr_wrap)
-        key_box_ocr.setContentsMargins(0, 0, 0, 0)
-        key_box_ocr.setSpacing(6)
-        self.input_zhipu_key = QLineEdit()
-        self.input_zhipu_key.setEchoMode(QLineEdit.Password)
-        self.input_zhipu_key.setPlaceholderText("输入智谱 API Key (bigmodel.cn)")
-        key_box_ocr.addWidget(self.input_zhipu_key, 1)
-        btn_toggle_zhipu = QPushButton()
-        btn_toggle_zhipu.setObjectName("codexIconBtn")
-        btn_toggle_zhipu.setFixedSize(30, 30)
-        btn_toggle_zhipu.setCursor(Qt.PointingHandCursor)
-        btn_toggle_zhipu.setIcon(_create_codex_icon("eye", "#52525B", 16))
-        def _toggle_zhipu():
-            is_pwd = self.input_zhipu_key.echoMode() == QLineEdit.Password
-            self.input_zhipu_key.setEchoMode(QLineEdit.Normal if is_pwd else QLineEdit.Password)
-            btn_toggle_zhipu.setIcon(_create_codex_icon("eye_off" if is_pwd else "eye", "#0D0D0D" if is_pwd else "#52525B", 16))
-        btn_toggle_zhipu.clicked.connect(_toggle_zhipu)
-        key_box_ocr.addWidget(btn_toggle_zhipu)
-        card_ocr.add_row("智谱 API Key", "用于鉴权访问 GLM-OCR 接口（仅保存在本地）", key_ocr_wrap)
-
+        key_ocr_wrap, self.input_zhipu_key = self._make_secret_key_input("输入智谱 API Key (bigmodel.cn)")
+        card_ocr.add_row("智谱 API Key", "用于鉴权访问 GLM-OCR 接口（本地 DPAPI 加密保存）", key_ocr_wrap)
         self.input_ocr_model = QLineEdit()
         self.input_ocr_model.setFixedWidth(240)
         self.input_ocr_model.setPlaceholderText("默认 glm-ocr")
         card_ocr.add_row("识图模型名称", "填写模型标识，留空则默认使用 glm-ocr", self.input_ocr_model)
         p2_lay.addWidget(card_ocr)
 
-        lbl_sec_volc = QLabel("火山方舟豆包大模型翻译")
-        lbl_sec_volc.setObjectName("codexSectionLabel")
-        p2_lay.addWidget(lbl_sec_volc)
-
+        self._add_section_label(p2_lay, "火山方舟豆包大模型翻译")
         card_trans = CodexCard()
         self.cb_ai_trans = CodexSwitch()
         card_trans.add_row("启用 AI 智能翻译", "利用豆包大模型结合语境精准翻译截屏文字与图片文本", self.cb_ai_trans)
-
-        key_trans_wrap = QWidget()
-        key_trans_wrap.setFixedWidth(275)
-        key_box_trans = QHBoxLayout(key_trans_wrap)
-        key_box_trans.setContentsMargins(0, 0, 0, 0)
-        key_box_trans.setSpacing(6)
-        self.input_volc_key = QLineEdit()
-        self.input_volc_key.setEchoMode(QLineEdit.Password)
-        self.input_volc_key.setPlaceholderText("输入火山方舟 ARK_API_KEY")
-        key_box_trans.addWidget(self.input_volc_key, 1)
-        btn_toggle_volc = QPushButton()
-        btn_toggle_volc.setObjectName("codexIconBtn")
-        btn_toggle_volc.setFixedSize(30, 30)
-        btn_toggle_volc.setCursor(Qt.PointingHandCursor)
-        btn_toggle_volc.setIcon(_create_codex_icon("eye", "#52525B", 16))
-        def _toggle_volc():
-            is_pwd = self.input_volc_key.echoMode() == QLineEdit.Password
-            self.input_volc_key.setEchoMode(QLineEdit.Normal if is_pwd else QLineEdit.Password)
-            btn_toggle_volc.setIcon(_create_codex_icon("eye_off" if is_pwd else "eye", "#0D0D0D" if is_pwd else "#52525B", 16))
-        btn_toggle_volc.clicked.connect(_toggle_volc)
-        key_box_trans.addWidget(btn_toggle_volc)
-        card_trans.add_row("火山方舟 API Key", "ARK_API_KEY 密钥凭证（仅保存在本地）", key_trans_wrap)
-
+        key_trans_wrap, self.input_volc_key = self._make_secret_key_input("输入火山方舟 ARK_API_KEY")
+        card_trans.add_row("火山方舟 API Key", "ARK_API_KEY 密钥凭证（本地 DPAPI 加密保存）", key_trans_wrap)
         self.input_volc_model = QLineEdit()
         self.input_volc_model.setFixedWidth(240)
         self.input_volc_model.setPlaceholderText("例如 ep-20260629102203-cfllm")
         card_trans.add_row("推理接入点 ID", "火山引擎方舟控制台创建的应用 Endpoint ID", self.input_volc_model)
-
         self.combo_trans_display = CodexComboBox()
         self.combo_trans_display.setFixedWidth(220)
         self.combo_trans_display.addItem("双栏对照（原图 / 译文）", "dialog")
@@ -16442,15 +16190,12 @@ class SettingsDialog(QDialog):
         card_trans.add_row("翻译结果视图", "一键识图翻译完成后的默认结果展示模式", self.combo_trans_display)
         p2_lay.addWidget(card_trans)
         p2_lay.addStretch(1)
-        self.pages.addWidget(p2_scroll)
+        return p2_scroll
 
-        # ---------- 页面 3：软件更新 ----------
+    def _build_update_page(self):
         p3_scroll, p3_lay = self._make_scroll_page()
 
-        lbl_sec_up = QLabel("版本与更新通道")
-        lbl_sec_up.setObjectName("codexSectionLabel")
-        p3_lay.addWidget(lbl_sec_up)
-
+        self._add_section_label(p3_lay, "版本与更新通道")
         card_up = CodexCard()
         ver_pill = QLabel(f"v{APP_VERSION}")
         ver_pill.setObjectName("codexVerPill")
@@ -16493,11 +16238,9 @@ class SettingsDialog(QDialog):
         card_up.add_row("手动检查更新", "发现新版后支持直接查看发行说明并一键下载自动替换重启", up_btns_wrap)
         p3_lay.addWidget(card_up)
         p3_lay.addStretch(1)
-        self.pages.addWidget(p3_scroll)
+        return p3_scroll
 
-        # ==========================================
-        # 底部固定操作栏
-        # ==========================================
+    def _build_footer(self):
         footer = QWidget()
         footer.setObjectName("codexFooter")
         foot_lay = QHBoxLayout(footer)
@@ -16524,11 +16267,7 @@ class SettingsDialog(QDialog):
         btn_save.setCursor(Qt.PointingHandCursor)
         btn_save.clicked.connect(self.save_and_apply)
         foot_lay.addWidget(btn_save)
-
-        pane_lay.addWidget(footer)
-        root_layout.addWidget(main_pane, 1)
-
-        self._load_current_values()
+        return footer
 
     def _make_scroll_page(self):
         scroll = QScrollArea()
@@ -16779,6 +16518,8 @@ class SettingsDialog(QDialog):
             main_app._reload_toolbar_shortcuts(new_settings)
         if self.hotkey_mgr:
             self.hotkey_mgr.reload_hotkeys()
+        if main_app is not None and getattr(main_app, "_tray_icon", None) is not None:
+            main_app._tray_icon._refresh_menu_labels()
         QMessageBox.information(self, "设置已保存", "偏好设置已成功保存并立即生效！")
         self.accept()
 
@@ -16963,8 +16704,8 @@ class ScreenRecorderThread(QThread):
             screen = QApplication.screenAt(QPoint(lx + lw // 2, ly + lh // 2)) or QApplication.primaryScreen()
             if screen is not None:
                 dpr = float(screen.devicePixelRatio() or 1.0)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("获取录屏屏幕 DPR 失败，使用默认 1.0: %s", e)
         pw = max(16, int(round(lw * dpr)))
         ph = max(16, int(round(lh * dpr)))
         return px1, py1, pw, ph
@@ -17115,8 +16856,8 @@ class RecordBorderFrame(QWidget):
         # 该 API 指示系统 DWM 在任何屏幕截取/录制时将本窗口完全透明化剔除，屏幕可见但绝不录入视频
         try:
             ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("设置录屏边框 DisplayAffinity 失败: %s", e)
 
     def set_recording(self, recording):
         self.is_recording = recording
@@ -17351,8 +17092,8 @@ class RecordingToolbar(FrostedBarWidget):
         # 先设置 WDA_EXCLUDEFROMCAPTURE，使毛玻璃采样与视频录制均不拍入控制栏本身
         try:
             ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("设置录屏工具条 DisplayAffinity 失败: %s", e)
 
         self.show()
         self.update_frosted_bg()
@@ -17841,8 +17582,8 @@ class RecordingExportDialog(QDialog):
             if hasattr(self, 'temp_gif_path') and self.temp_gif_path and os.path.exists(self.temp_gif_path):
                 try:
                     os.remove(self.temp_gif_path)
-                except Exception:
-                    pass
+                except OSError as e:
+                    logging.debug("清理临时 GIF 文件失败: %s", e)
         except Exception as e:
             logging.error("RecordingExportDialog closeEvent 异常: %s", e)
         super().closeEvent(event)
@@ -17964,8 +17705,8 @@ class GlobalHotkeyManager(QObject):
         self._esc_registered = False
         try:
             keyboard.unhook_all()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("卸载全局键盘钩子失败: %s", e)
 
     def install(self, app):
         """安装 Qt 全局原生事件过滤器并注册基础热键"""
@@ -18259,8 +18000,8 @@ class GlobalHotkeyManager(QObject):
         self._registered_native_ids.clear()
         try:
             keyboard.unhook_all()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("卸载全局键盘钩子失败: %s", e)
 
     def wait(self, msecs=2000):
         # 兼容 QThread.wait 接口
@@ -18270,7 +18011,7 @@ class GlobalHotkeyManager(QObject):
 HotkeyListener = GlobalHotkeyManager
 
 
-class ScreenshotTool(QWidget):
+class ScreenshotTool(_CanvasEditingMixin, QWidget):
     def __init__(self, hotkey_listener=None, parent_tool=None):
         super().__init__()
         ensure_high_dpi_and_fonts()
@@ -18430,8 +18171,8 @@ class ScreenshotTool(QWidget):
             depth += 1
         try:
             depth += len(ImageEditorDialog.get_open_editors())
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("统计打开编辑器层数异常: %s", e)
         return depth
 
     def _ensure_secondary_capture(self):
@@ -18474,14 +18215,16 @@ class ScreenshotTool(QWidget):
         return self.set_pin_border_enabled(not bool(getattr(self, "pin_border_enabled", False)), show_toast=True)
 
     def toggle_drawer(self):
-        """Ctrl+1 快捷键：彻底开启或关闭贴图储藏柜功能"""
+        """快捷键：彻底开启或关闭贴图储藏柜功能"""
         if self.parent_tool is not None:
             return self.root_tool.toggle_drawer()
         if hasattr(self, 'pin_drawer') and self.pin_drawer:
             enabled = self.pin_drawer.toggle()
             save_settings({"drawer_hover_enabled": enabled})
             try:
-                msg = "🗄️ 贴图抽屉功能已开启" if enabled else "🚫 贴图抽屉功能已关闭 (按 Ctrl+1 开启)"
+                hk_drawer = (load_settings().get("hotkey_drawer", "Ctrl+1") or "").strip()
+                hint = f" (按 {hk_drawer} 开启)" if hk_drawer else ""
+                msg = "🗄️ 贴图抽屉功能已开启" if enabled else f"🚫 贴图抽屉功能已关闭{hint}"
                 self._drawer_toast = PinToast(msg, pinned=enabled)
                 self._drawer_toast.show()
             except Exception:
@@ -18862,15 +18605,11 @@ class ScreenshotTool(QWidget):
         self.commit_rotation_preview()
 
     def erase_annotation_under_mouse(self, pos):
-        for i in range(len(self.edits) - 1, -1, -1):
-            if is_annotation_hit(self.edits[i], pos):
-                if not getattr(self, 'eraser_state_saved', False):
-                    self.save_state()
-                    self.eraser_state_saved = True
-                removed = self.edits.pop(i)
-                if removed.get('type') in ('TEXT', 'MOSAIC_BLUR', 'BLUR_STROKE'):
-                    self._erased_content_edit = True
-                return True
+        removed = self._erase_annotation_at(pos, saved_attr='eraser_state_saved')
+        if removed is not None:
+            if removed.get('type') in ('TEXT', 'MOSAIC_BLUR', 'BLUR_STROKE'):
+                self._erased_content_edit = True
+            return True
         return False
 
     def erase_annotation(self, pos):
@@ -19063,8 +18802,8 @@ class ScreenshotTool(QWidget):
             )
             self._layer_limit_toast.show()
             self._layer_limit_toast.raise_()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("显示层数上限提示失败: %s", e)
 
     def activate_capture(self, ocr_intent=False, recording_intent=False):
         import time as _time
@@ -19522,10 +19261,8 @@ class ScreenshotTool(QWidget):
         self._leave_modal_layer()
 
     def _forget_overlay(self, overlay):
-        try:
+        if overlay in self._retired_overlays:
             self._retired_overlays.remove(overlay)
-        except ValueError:
-            pass
 
     def _on_translation_window_destroyed(self, *_args):
         self._active_translation_window = None
@@ -20289,11 +20026,11 @@ class ScreenshotTool(QWidget):
             if self.recording_thread and self.recording_thread.isRunning():
                 try:
                     self.recording_thread.recording_finished.disconnect()
-                except Exception:
+                except (TypeError, RuntimeError):
                     pass
                 try:
                     self.recording_thread.error_occurred.disconnect()
-                except Exception:
+                except (TypeError, RuntimeError):
                     pass
                 self.recording_thread.stop()
                 self.recording_thread.wait(2000)
@@ -20370,43 +20107,15 @@ class ScreenshotTool(QWidget):
 
     def update_cursor_for_tool(self, pos=None):
         """统一管理工具光标，杜绝光标状态卡在边缘拉伸等异常状态"""
-        if self.crop_mode:
-            if pos is not None and not self.crop_drag_handle:
-                handle = self._get_crop_handle_at(pos)
-                cursors = {
-                    'tl': Qt.SizeFDiagCursor, 'br': Qt.SizeFDiagCursor,
-                    'tr': Qt.SizeBDiagCursor, 'bl': Qt.SizeBDiagCursor,
-                    't': Qt.SizeVerCursor, 'b': Qt.SizeVerCursor,
-                    'l': Qt.SizeHorCursor, 'r': Qt.SizeHorCursor,
-                    'move': Qt.SizeAllCursor,
-                }
-                self.setCursor(cursors.get(handle, Qt.ArrowCursor))
+        if self._apply_editing_tool_cursor(
+            self.current_tool,
+            pos=pos,
+            options_bar=getattr(self, 'options_bar', None),
+            default_thickness=getattr(self, 'current_thickness', 3),
+            allow_text_hit=(self.state == "EDITING"),
+        ):
             return
-
-        if self.current_tool in ['ERASER', 'ERASE']:
-            self.setCursor(create_eraser_cursor())
-        elif self.current_tool == 'ROTATE':
-            self.setCursor(Qt.ArrowCursor)
-        elif self.current_tool == 'TEXT':
-            hit_text = (
-                pos is not None
-                and self.state == "EDITING"
-                and any(e.get('type') == 'TEXT' and int(e.get('rotation', 0) or 0) % 360 == 0 and is_annotation_hit(e, pos) for e in self.edits)
-            )
-            self.setCursor(Qt.SizeAllCursor if hit_text else Qt.IBeamCursor)
-        elif self.current_tool in ['MOSAIC_BLUR', 'BLUR']:
-            opts = self.options_bar.get_mosaic_options() if hasattr(self, 'options_bar') else {}
-            r = opts.get('brushWidth', self.current_thickness * 4)
-            self.setCursor(create_brush_cursor(r))
-        elif self.current_tool in ['MARKER', 'HIGHLIGHTER']:
-            opts = self.options_bar.get_marker_options() if hasattr(self, 'options_bar') else {}
-            r = opts.get('width', 16)
-            self.setCursor(create_brush_cursor(r))
-        elif self.current_tool in ['RECT_ELLIPSE', 'RECTANGLE', 'ELLIPSE', 'ARROW', 'LINE', 'PEN', 'OCR']:
-            self.setCursor(Qt.CrossCursor)
-        elif self.current_tool == 'STEP':
-            self.setCursor(Qt.PointingHandCursor)
-        elif self.current_tool is None:
+        if self.current_tool is None:
             if pos is not None and self.state == "EDITING":
                 edge = self.get_resize_edge(pos, allow_move=True)
                 if edge in ['topleft', 'bottomright']:
@@ -20529,37 +20238,10 @@ class ScreenshotTool(QWidget):
     def commit_text_edit(self):
         if not hasattr(self, 'inline_editor') or not self.inline_editor.isVisible():
             return
-        text = self.inline_editor.text_edit.toPlainText()
-        had_existing = self.inline_editor.active_edit_ref is not None
-        if text.strip():
-            if not had_existing:
-                self.save_state()
-            rect = self.inline_editor.get_text_rect()
-            opts = self.options_bar.get_text_options() if hasattr(self, 'options_bar') else {}
-            font = self.inline_editor.text_edit.font()
-            self.edits.append({
-                'type': 'TEXT',
-                'pos': rect.topLeft(),
-                'rect': rect,
-                'text': text,
-                'color': QColor(opts.get('color', self.inline_editor.current_color)),
-                'font': QFont(font),
-                'fontFamily': opts.get('fontFamily', font.family()),
-                'fontSize': opts.get('fontSize', font.pointSize() if font.pointSize() > 0 else 14),
-                'bold': opts.get('bold', font.bold()),
-                'italic': opts.get('italic', font.italic()),
-                'bgEnabled': opts.get('bgEnabled', self.inline_editor.bg_enabled),
-                'bgColor': QColor(opts.get('bgColor', self.inline_editor.bg_color)),
-                'user_width': self.inline_editor.user_width,
-                'user_height': self.inline_editor.user_height,
-            })
+        if self._commit_inline_text_edit():
             if self.isVisible() and self.state == "EDITING":
                 self._invalidate_text_doc()
                 self._schedule_auto_text_ocr()
-        self.inline_editor.active_edit_ref = None
-        self.inline_editor.hide()
-        if self.isVisible():
-            self.setFocus()
         self.update()
 
     def sample_screen_color(self, pos):
@@ -20675,6 +20357,93 @@ class ScreenshotTool(QWidget):
             self.update_cursor_for_tool(event.pos())
             self.update()
 
+    def _handle_editing_keypress(self, event, fw, is_inline_editing, in_spinbox):
+        if not self.crop_mode:
+            if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier and self._text_selected:
+                if self._copy_selected_text():
+                    return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._text_selected:
+                if self._copy_selected_text():
+                    return True
+            if event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier and self._text_doc_ready():
+                self._select_all_text()
+                return True
+            if event.key() == Qt.Key_Escape and self._text_selected:
+                self._clear_text_selection()
+                return True
+
+        allow_toolbar_hk = not (is_inline_editing and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)))
+        if allow_toolbar_hk and self._toolbar_shortcut_map:
+            hk_pressed = key_event_to_hotkey_str(event)
+            if hk_pressed and hk_pressed in self._toolbar_shortcut_map:
+                if not event.isAutoRepeat():
+                    action_id, kind = self._toolbar_shortcut_map[hk_pressed]
+                    self._trigger_toolbar_hotkey_action(action_id, kind)
+                return True
+
+        if self.crop_mode:
+            return False
+
+        if in_spinbox and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            fw.clearFocus()
+            if hasattr(self, 'inline_editor') and self.inline_editor.isVisible():
+                if self.inline_editor.editing_text:
+                    self.inline_editor.text_edit.setFocus()
+                else:
+                    self.inline_editor.setFocus()
+            else:
+                self.setFocus()
+            return True
+
+        if (not self.selection_rect.isNull()
+                and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier))
+                and not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible())):
+            step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
+            dx, dy = {
+                Qt.Key_Left: (-step, 0),
+                Qt.Key_Right: (step, 0),
+                Qt.Key_Up: (0, -step),
+                Qt.Key_Down: (0, step),
+            }.get(event.key(), (0, 0))
+            if dx or dy:
+                r = QRect(self.selection_rect)
+                nx = max(0, min(max(0, self.width() - r.width()), r.x() + dx))
+                ny = max(0, min(max(0, self.height() - r.height()), r.y() + dy))
+                if nx != r.x() or ny != r.y():
+                    moved_by = QPoint(nx - r.x(), ny - r.y())
+                    r.moveTo(nx, ny)
+                    self.selection_rect = r
+                    self._reset_text_selection_state()
+                    if self._rotation_locked_edges():
+                        translate_edits(self.edits, moved_by)
+                    else:
+                        self._invalidate_text_doc()
+                        self._schedule_auto_text_ocr()
+                    self.update_toolbar_positions()
+                    self.update()
+                return True
+        return False
+
+    def _handle_intent_keypress(self, event):
+        for flag_attr, runner in (
+            ('ocr_intent', lambda rect: self.start_quick_ocr_session(
+                rect, self.original_screen.copy(rect) if (hasattr(self, 'original_screen') and self.original_screen) else None
+            )),
+            ('recording_intent', lambda rect: getattr(self, "root_tool", self).start_recording_session(rect)),
+        ):
+            if getattr(self, flag_attr, False):
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+                    setattr(self, flag_attr, False)
+                    rect = self.selection_rect if (not self.selection_rect.isNull() and self.selection_rect.width() > 10) else QApplication.primaryScreen().geometry()
+                    self.hide_app(keep_history=False)
+                    runner(rect)
+                    return True
+                if event.key() == Qt.Key_Escape:
+                    setattr(self, flag_attr, False)
+                    self.hide_app(keep_history=False)
+                    return True
+        return False
+
     def keyPressEvent(self, event):
         # 取字 / 译文层打开时，键盘事件统一交给该层处理（Esc 只退出该层，不关闭整个截图）
         active_layer = self._text_select_layer or self._translation_overlay
@@ -20696,112 +20465,22 @@ class ScreenshotTool(QWidget):
         )
         in_spinbox = isinstance(fw, QAbstractSpinBox) or (fw is not None and isinstance(fw.parent(), QAbstractSpinBox))
 
-        if self.state == "EDITING":
-            if not self.crop_mode:
-                if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier and self._text_selected:
-                    if self._copy_selected_text():
-                        return
-                if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._text_selected:
-                    if self._copy_selected_text():
-                        return
-                if event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier and self._text_doc_ready():
-                    self._select_all_text()
-                    return
-                if event.key() == Qt.Key_Escape and self._text_selected:
-                    self._clear_text_selection()
-                    return
-
-            # 截图底部工具栏工具绑定快捷键（默认不绑定；仅在截图编辑时生效）
-            allow_toolbar_hk = not (is_inline_editing and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)))
-            if allow_toolbar_hk and self._toolbar_shortcut_map:
-                hk_pressed = key_event_to_hotkey_str(event)
-                if hk_pressed and hk_pressed in self._toolbar_shortcut_map:
-                    if not event.isAutoRepeat():
-                        action_id, kind = self._toolbar_shortcut_map[hk_pressed]
-                        self._trigger_toolbar_hotkey_action(action_id, kind)
-                    return
-
-            if not self.crop_mode:
-                if in_spinbox and event.key() in (Qt.Key_Return, Qt.Key_Enter):
-                    fw.clearFocus()
-                    if hasattr(self, 'inline_editor') and self.inline_editor.isVisible():
-                        if self.inline_editor.editing_text:
-                            self.inline_editor.text_edit.setFocus()
-                        else:
-                            self.inline_editor.setFocus()
-                    else:
-                        self.setFocus()
-                    return
-                if (not self.selection_rect.isNull()
-                        and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier))
-                        and not (hasattr(self, 'inline_editor') and self.inline_editor.isVisible())):
-                    step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
-                    dx, dy = 0, 0
-                    if event.key() == Qt.Key_Left:
-                        dx = -step
-                    elif event.key() == Qt.Key_Right:
-                        dx = step
-                    elif event.key() == Qt.Key_Up:
-                        dy = -step
-                    elif event.key() == Qt.Key_Down:
-                        dy = step
-                    if dx or dy:
-                        r = QRect(self.selection_rect)
-                        nx = max(0, min(max(0, self.width() - r.width()), r.x() + dx))
-                        ny = max(0, min(max(0, self.height() - r.height()), r.y() + dy))
-                        if nx != r.x() or ny != r.y():
-                            moved_by = QPoint(nx - r.x(), ny - r.y())
-                            r.moveTo(nx, ny)
-                            self.selection_rect = r
-                            self._reset_text_selection_state()
-                            if self._rotation_locked_edges():
-                                # 旋转后的内容随选区一起平移，标注同步跟随，无需重新识别
-                                translate_edits(self.edits, moved_by)
-                            else:
-                                self._invalidate_text_doc()
-                                self._schedule_auto_text_ocr()
-                            self.update_toolbar_positions()
-                            self.update()
-                        return
-
-        if getattr(self, 'ocr_intent', False):
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
-                self.ocr_intent = False
-                rect = self.selection_rect if (not self.selection_rect.isNull() and self.selection_rect.width() > 10) else QApplication.primaryScreen().geometry()
-                sub_pixmap = self.original_screen.copy(rect) if (hasattr(self, 'original_screen') and self.original_screen) else None
-                self.hide_app(keep_history=False)
-                self.start_quick_ocr_session(rect, sub_pixmap)
-                return
-            elif event.key() == Qt.Key_Escape:
-                self.ocr_intent = False
-                self.hide_app(keep_history=False)
-                return
-
-        if getattr(self, 'recording_intent', False):
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
-                self.recording_intent = False
-                rect = self.selection_rect if (not self.selection_rect.isNull() and self.selection_rect.width() > 10) else QApplication.primaryScreen().geometry()
-                self.hide_app(keep_history=False)
-                getattr(self, "root_tool", self).start_recording_session(rect)
-                return
-            elif event.key() == Qt.Key_Escape:
-                self.recording_intent = False
-                self.hide_app(keep_history=False)
-                return
+        if self.state == "EDITING" and self._handle_editing_keypress(event, fw, is_inline_editing, in_spinbox):
+            return
+        if self._handle_intent_keypress(event):
+            return
 
         if event.key() == Qt.Key_F2 and normalize_hotkey_str(load_settings().get("hotkey_ocr", "F2")) == "F2":
             self.activate_ocr()
             return
-
         if event.key() == Qt.Key_Space and (self.scroll_thread or getattr(self, 'scroll_waiting', False)):
             self.toggle_auto_scroll_capture()
             return
-        # 裁剪模式：Enter 应用，ESC 取消
         if self.crop_mode:
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self.apply_crop()
                 return
-            elif event.key() == Qt.Key_Escape:
+            if event.key() == Qt.Key_Escape:
                 self.cancel_crop()
                 return
         if self.state == "SELECTING":
@@ -20825,23 +20504,19 @@ class ScreenshotTool(QWidget):
                     self.toggle_color_format()
                     return
         if event.modifiers() & Qt.ControlModifier:
-            if event.key() == Qt.Key_C:
-                if self.state == "EDITING":
-                    self.copy_image()
-            elif event.key() == Qt.Key_S:
-                if self.state == "EDITING" and not self.crop_mode:
-                    self.save_image()
-            elif event.key() == Qt.Key_Z:
-                if self.state == "EDITING":
-                    self.undo()
-            elif event.key() == Qt.Key_Y:
-                if self.state == "EDITING":
-                    self.redo()
+            if event.key() == Qt.Key_C and self.state == "EDITING":
+                self.copy_image()
+            elif event.key() == Qt.Key_S and self.state == "EDITING" and not self.crop_mode:
+                self.save_image()
+            elif event.key() == Qt.Key_Z and self.state == "EDITING":
+                self.undo()
+            elif event.key() == Qt.Key_Y and self.state == "EDITING":
+                self.redo()
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & (Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)):
             if self.state == "EDITING" and not self.crop_mode and not is_inline_editing and not self._text_selected and not in_spinbox:
                 self.copy_image()
                 return
-        elif event.key() == Qt.Key_Escape: 
+        elif event.key() == Qt.Key_Escape:
             if self.has_pending_rotation_preview():
                 self.cancel_rotation_preview()
                 return
@@ -20849,7 +20524,7 @@ class ScreenshotTool(QWidget):
                 self.set_tool(None)
                 self.show_toolbar()
                 return
-            elif self.crop_mode:
+            if self.crop_mode:
                 self.cancel_crop()
                 self.show_toolbar()
                 return
@@ -21038,14 +20713,8 @@ class ScreenshotTool(QWidget):
                     painter.setClipRect(self.selection_rect)
                     self._draw_edits_on_canvas(painter)
 
-                    if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw' and getattr(self, 'text_rect', None) and self.text_rect.width() > 3 and self.text_rect.height() > 3:
-                        painter.save()
-                        painter.fillRect(self.text_rect, QColor(255, 255, 255, 35))
-                        painter.setPen(QPen(QColor(255, 255, 255, 210), 2, Qt.DashLine))
-                        painter.drawRect(self.text_rect)
-                        painter.setPen(QPen(QColor(200, 144, 48), 1.4, Qt.DashLine))
-                        painter.drawRect(self.text_rect)
-                        painter.restore()
+                    if self.current_tool == 'TEXT' and getattr(self, 'drag_mode', None) == 'text_draw':
+                        self._draw_text_draw_preview(painter, getattr(self, 'text_rect', None))
 
                     painter.setClipping(False)
                     if not self.crop_mode:
@@ -21062,32 +20731,7 @@ class ScreenshotTool(QWidget):
                             painter.drawPixmap(self.selection_rect.topLeft(), rot_disp)
                         self._draw_edits_on_canvas(painter)
                         painter.setClipping(False)
-
-                        # 三分线
-                        painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
-                        for i in range(1, 3):
-                            x = self.crop_rect.left() + self.crop_rect.width() * i // 3
-                            painter.drawLine(x, self.crop_rect.top(), x, self.crop_rect.bottom())
-                            y = self.crop_rect.top() + self.crop_rect.height() * i // 3
-                            painter.drawLine(self.crop_rect.left(), y, self.crop_rect.right(), y)
-
-                        # 裁剪框边线与 8 个手柄
-                        painter.setPen(QPen(QColor(204, 153, 68), 2))
-                        painter.setBrush(Qt.NoBrush)
-                        painter.drawRect(self.crop_rect)
-
-                        handle = CROP_HANDLE_SIZE
-                        painter.setBrush(QBrush(QColor(204, 153, 68)))
-                        painter.setPen(QPen(Qt.white, 1))
-                        corners = [self.crop_rect.topLeft(), self.crop_rect.topRight(),
-                                   self.crop_rect.bottomLeft(), self.crop_rect.bottomRight()]
-                        edges = [QPoint(self.crop_rect.center().x(), self.crop_rect.top()),
-                                 QPoint(self.crop_rect.center().x(), self.crop_rect.bottom()),
-                                 QPoint(self.crop_rect.left(), self.crop_rect.center().y()),
-                                 QPoint(self.crop_rect.right(), self.crop_rect.center().y())]
-                        for pt in corners + edges:
-                            painter.drawRect(pt.x() - handle // 2, pt.y() - handle // 2, handle, handle)
-                        painter.setBrush(Qt.NoBrush)
+                        self._draw_crop_chrome(painter, self.crop_rect, grid_alpha=120)
 
                     if self.current_tool == 'OCR' and getattr(self, 'ocr_rect', None):
                         painter.setPen(QPen(Qt.green, 2, Qt.DashLine))
@@ -21111,23 +20755,13 @@ class ScreenshotTool(QWidget):
 
         # 双击已添加的 TEXT 标注图元：自动切入文字工具并就地编辑
         if self.state == "EDITING" and not self.crop_mode:
-            for i in range(len(self.edits) - 1, -1, -1):
-                if (self.edits[i].get('type') == 'TEXT'
-                        and int(self.edits[i].get('rotation', 0)) % 360 == 0
-                        and is_annotation_hit(self.edits[i], pos)):
-                    self.commit_text_edit()
-                    if self.current_tool != 'TEXT':
-                        self.set_tool('TEXT')
-                    edit = self.edits.pop(i)
-                    self.save_state()
-                    if hasattr(self, 'options_bar') and self.options_bar:
-                        self.options_bar.sync_text_options_from_edit(edit)
-                    edit_rect = get_text_annotation_rect(edit).toAlignedRect()
-                    self.inline_editor.start_editing(edit_rect, existing_edit=edit, start_in_text_mode=True)
-                    self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
-                    self.drag_mode = None
-                    self.update()
-                    return
+            idx = self._find_editable_text_edit_index(pos)
+            if idx is not None:
+                self.commit_text_edit()
+                if self.current_tool != 'TEXT':
+                    self.set_tool('TEXT')
+                self._open_existing_text_edit(idx, start_in_text_mode=True, click_global_pos=event.globalPos())
+                return
 
         # 双击文字：复制整行（单击只清选区，不复制）
         if (self.state == "EDITING" and not self.crop_mode
@@ -21268,149 +20902,24 @@ class ScreenshotTool(QWidget):
             elif self.current_tool == 'OCR':
                 self.drag_mode = 'ocr'; self.ocr_start = pos; self.ocr_rect = QRect(pos, pos)
             elif self.current_tool == 'TEXT':
-                clicked_idx = None
-                for i in range(len(self.edits) - 1, -1, -1):
-                    if (self.edits[i].get('type') == 'TEXT'
-                            and int(self.edits[i].get('rotation', 0)) % 360 == 0
-                            and is_annotation_hit(self.edits[i], pos)):
-                        clicked_idx = i
-                        break
-                if clicked_idx is not None:
-                    clicked_edit = self.edits.pop(clicked_idx)
-                    self.save_state()
-                    if hasattr(self, 'options_bar') and self.options_bar:
-                        self.options_bar.sync_text_options_from_edit(clicked_edit)
-                    edit_rect = get_text_annotation_rect(clicked_edit).toAlignedRect()
-                    self.inline_editor.start_editing(edit_rect, existing_edit=clicked_edit, start_in_text_mode=False)
-                    self.drag_mode = 'text_move'
-                    self._text_move_start_global = event.globalPos()
-                    self._text_move_start_frame = QRect(self.inline_editor.get_text_rect())
-                    self._text_move_dragged = False
+                self._handle_text_tool_press(pos, event.globalPos(), was_editing, had_text)
+                return
+            elif self.current_tool in (
+                'RECT_ELLIPSE', 'ARROW', 'PEN', 'MARKER', 'MOSAIC_BLUR',
+                'STEP', 'ELLIPSE', 'HIGHLIGHTER', 'BLUR', 'RECTANGLE', 'LINE'
+            ):
+                res = self._begin_annotation_edit(
+                    self.current_tool, pos,
+                    default_color=self.current_color,
+                    default_thickness=getattr(self, 'current_thickness', 3),
+                    options_bar=getattr(self, 'options_bar', None),
+                    step_num=getattr(self, 'current_step_num', 1),
+                )
+                if isinstance(res, tuple) and res[0] == 'step':
+                    self.current_step_num = res[1]
                     self.update()
+                    self.show_toolbar()
                     return
-                self.drag_mode = 'text_draw'
-                self.text_start = pos
-                self.text_rect = QRect(pos, pos)
-                self._text_just_committed = (was_editing and had_text)
-                return
-            elif self.current_tool == 'RECT_ELLIPSE':
-                self.save_state()
-                self.edit_start = pos
-                opts = self.options_bar.get_rect_ellipse_options()
-                self.edits.append({
-                    'type': 'RECT_ELLIPSE',
-                    'kind': opts.get('kind', 'rect'),
-                    'p1': pos,
-                    'p2': pos,
-                    'strokeColor': opts.get('strokeColor', self.current_color),
-                    'strokeWidth': opts.get('strokeWidth', 3),
-                    'fillMode': opts.get('fillMode', 'none'),
-                    'fillColor': opts.get('fillColor', self.current_color),
-                    'cornerRadius': opts.get('cornerRadius', 0),
-                    'temp': True
-                })
-            elif self.current_tool == 'ARROW':
-                self.save_state()
-                self.edit_start = pos
-                opts = self.options_bar.get_arrow_options()
-                self.edits.append({
-                    'type': 'ARROW',
-                    'start': pos,
-                    'end': pos,
-                    'arrowMode': opts.get('arrowMode', 'end'),
-                    'width': opts.get('width', 3),
-                    'color': opts.get('color', self.current_color),
-                    'temp': True
-                })
-            elif self.current_tool == 'PEN':
-                self.save_state()
-                self.edit_start = pos
-                opts = self.options_bar.get_pen_options()
-                style = opts.get('penStyle', 'polyline')
-                self.edits.append({
-                    'type': 'PEN',
-                    'penStyle': style,
-                    'start': pos,
-                    'end': pos,
-                    'points': [pos],
-                    'width': opts.get('width', 3),
-                    'color': opts.get('color', self.current_color),
-                    'temp': True
-                })
-            elif self.current_tool == 'MARKER':
-                self.save_state()
-                opts = self.options_bar.get_marker_options()
-                self.edits.append({
-                    'type': 'MARKER',
-                    'points': [pos],
-                    'color': opts.get('color', QColor(255, 230, 0)),
-                    'width': opts.get('width', 16),
-                    'opacity': opts.get('opacity', 45),
-                    'tipStyle': opts.get('tipStyle', 'round'),
-                    'temp': True
-                })
-            elif self.current_tool == 'MOSAIC_BLUR':
-                self.save_state()
-                opts = self.options_bar.get_mosaic_options()
-                self.edits.append({
-                    'type': 'MOSAIC_BLUR',
-                    'points': [pos],
-                    'mode': opts.get('mode', 'mosaic'),
-                    'smooth': opts.get('smooth', False),
-                    'blockSize': opts.get('blockSize', 10),
-                    'brushWidth': opts.get('brushWidth', 22),
-                    'temp': True
-                })
-            elif self.current_tool == 'STEP':
-                self.save_state()
-                step_val = getattr(self, 'current_step_num', 1)
-                thick = getattr(self, 'current_thickness', 3)
-                self.edits.append({
-                    'type': 'STEP',
-                    'pos': pos,
-                    'center': pos,
-                    'num': step_val,
-                    'number': step_val,
-                    'color': self.current_color,
-                    'thickness': thick,
-                    'radius': max(11, 8 + thick * 2),
-                    'temp': False
-                })
-                self.current_step_num = step_val + 1
-                self.update()
-                self.show_toolbar()
-                return
-            elif self.current_tool == 'ELLIPSE':
-                self.save_state()
-                self.edit_start = pos
-                self.edits.append({
-                    'type': 'ELLIPSE',
-                    'rect': QRect(pos, pos),
-                    'color': self.current_color,
-                    'thickness': self.current_thickness,
-                    'temp': True
-                })
-            elif self.current_tool == 'HIGHLIGHTER':
-                self.save_state()
-                self.edits.append({
-                    'type': 'HIGHLIGHTER',
-                    'points': [pos],
-                    'color': self.current_color,
-                    'thickness': max(12, self.current_thickness * 3),
-                    'temp': True
-                })
-            elif self.current_tool == 'BLUR':
-                self.save_state()
-                self.edits.append({
-                    'type': 'BLUR_STROKE',
-                    'points': [pos],
-                    'thickness': self.current_thickness,
-                    'temp': True
-                })
-            elif self.current_tool in ['RECTANGLE', 'LINE']:
-                self.save_state()
-                self.edit_start = pos
-                self.edits.append({'type': self.current_tool, 'rect': QRect(pos, pos), 'start': pos, 'end': pos, 'color': self.current_color, 'arrow': getattr(self, 'arrow_enabled', False), 'temp': True, 'thickness': self.current_thickness})
             
             elif self.current_tool is None:
                 edge = self.get_resize_edge(pos, allow_move=False)
@@ -21541,67 +21050,10 @@ class ScreenshotTool(QWidget):
                 self.text_rect = QRect(self.text_start, pos).normalized().intersected(self.selection_rect)
                 self.update()
 
-            elif self.current_tool == 'RECT_ELLIPSE' and len(self.edits) > 0 and self.edits[-1].get('temp'):
-                p1 = self.edit_start
-                p2 = pos
-                if QApplication.keyboardModifiers() & Qt.ShiftModifier:
-                    dx = p2.x() - p1.x()
-                    dy = p2.y() - p1.y()
-                    side = max(abs(dx), abs(dy))
-                    sx = 1 if dx >= 0 else -1
-                    sy = 1 if dy >= 0 else -1
-                    p2 = QPoint(p1.x() + sx * side, p1.y() + sy * side)
-                self.edits[-1]['p2'] = p2
-                self.update()
-
-            elif self.current_tool == 'ARROW' and len(self.edits) > 0 and self.edits[-1].get('temp'):
-                p1 = self.edit_start
-                p2 = pos
-                if QApplication.keyboardModifiers() & Qt.ShiftModifier:
-                    dx = p2.x() - p1.x()
-                    dy = p2.y() - p1.y()
-                    angle = math.degrees(math.atan2(dy, dx))
-                    snapped_angle = round(angle / 45.0) * 45.0
-                    rad = math.radians(snapped_angle)
-                    dist = math.hypot(dx, dy)
-                    p2 = QPoint(int(p1.x() + dist * math.cos(rad)), int(p1.y() + dist * math.sin(rad)))
-                self.edits[-1]['end'] = p2
-                self.update()
-
-            elif self.current_tool == 'PEN' and len(self.edits) > 0 and self.edits[-1].get('temp'):
-                item = self.edits[-1]
-                if item.get('penStyle') == 'line':
-                    p1 = self.edit_start
-                    p2 = pos
-                    if QApplication.keyboardModifiers() & Qt.ShiftModifier:
-                        dx = p2.x() - p1.x()
-                        dy = p2.y() - p1.y()
-                        angle = math.degrees(math.atan2(dy, dx))
-                        snapped_angle = round(angle / 45.0) * 45.0
-                        rad = math.radians(snapped_angle)
-                        dist = math.hypot(dx, dy)
-                        p2 = QPoint(int(p1.x() + dist * math.cos(rad)), int(p1.y() + dist * math.sin(rad)))
-                    item['end'] = p2
-                    item['points'] = [p1, p2]
-                else:
-                    item['points'].append(pos)
-                self.update()
-
-            elif self.current_tool in ['MARKER', 'MOSAIC_BLUR', 'BLUR', 'HIGHLIGHTER'] and len(self.edits) > 0 and self.edits[-1].get('temp'):
-                self.edits[-1]['points'].append(pos)
-                self.update()
-
-            elif self.current_tool == 'ELLIPSE' and len(self.edits) > 0 and self.edits[-1].get('temp'):
-                r = QRect(self.edit_start, pos).normalized()
-                if QApplication.keyboardModifiers() & Qt.ShiftModifier:
-                    side = min(r.width(), r.height())
-                    r = QRect(r.topLeft(), QSize(side, side))
-                self.edits[-1]['rect'] = r
-                self.update()
-
-            elif self.current_tool in ['RECTANGLE', 'LINE'] and len(self.edits) > 0 and self.edits[-1].get('temp'):
-                self.edits[-1]['rect'] = QRect(self.edit_start, pos).normalized()
-                self.edits[-1]['end'] = pos
+            elif (self.current_tool in (
+                    'RECT_ELLIPSE', 'ARROW', 'PEN', 'MARKER', 'MOSAIC_BLUR',
+                    'BLUR', 'HIGHLIGHTER', 'ELLIPSE', 'RECTANGLE', 'LINE'
+                ) and self._update_active_temp_edit(pos, bool((event.modifiers() | QApplication.keyboardModifiers()) & Qt.ShiftModifier))):
                 self.update()
 
             elif self.drag_mode and self.drag_mode not in ['ocr', 'text_draw', 'text_move']:
@@ -21696,60 +21148,20 @@ class ScreenshotTool(QWidget):
                     self.show_toolbar()
                     return
 
-                if self.current_tool in ['RECT_ELLIPSE', 'ARROW', 'PEN']:
-                    if len(self.edits) > 0 and self.edits[-1].get('temp'):
-                        item = self.edits[-1]
-                        discard = False
-                        if self.current_tool == 'RECT_ELLIPSE':
-                            p1 = item.get('p1', QPoint())
-                            p2 = item.get('p2', QPoint())
-                            if (p2 - p1).manhattanLength() < 2:
-                                discard = True
-                        elif self.current_tool == 'ARROW':
-                            s = item.get('start', QPoint())
-                            e = item.get('end', QPoint())
-                            if (e - s).manhattanLength() < 2:
-                                discard = True
-                        elif self.current_tool == 'PEN':
-                            pts = item.get('points', [])
-                            if len(pts) <= 1:
-                                discard = True
-
-                        if discard:
-                            self.edits.pop()
-                            if self.undo_stack:
-                                self.undo_stack.pop()
-                                self.update_undo_redo_states()
-                        else:
-                            item['temp'] = False
-                    self.show_toolbar()
-                    self.update()
-                    return
-
-                elif self.current_tool in ['MARKER', 'MOSAIC_BLUR', 'BLUR', 'HIGHLIGHTER']:
-                    if len(self.edits) > 0 and self.edits[-1].get('temp'):
-                        item = self.edits[-1]
-                        if len(item.get('points', [])) < 1:
-                            self.edits.pop()
-                            if self.undo_stack:
-                                self.undo_stack.pop()
-                                self.update_undo_redo_states()
-                        else:
-                            item['temp'] = False
-                            if item.get('type') in ('MOSAIC_BLUR', 'BLUR_STROKE'):
-                                self._invalidate_text_doc()
-                                self._schedule_auto_text_ocr()
+                if self.current_tool in ['RECT_ELLIPSE', 'ARROW', 'PEN', 'MARKER', 'MOSAIC_BLUR', 'BLUR', 'HIGHLIGHTER']:
+                    item, discarded = self._finish_active_temp_edit()
+                    if discarded:
+                        self.update_undo_redo_states()
+                    elif item is not None and item.get('type') in ('MOSAIC_BLUR', 'BLUR_STROKE'):
+                        self._invalidate_text_doc()
+                        self._schedule_auto_text_ocr()
                     self.show_toolbar()
                     self.update()
                     return
 
                 elif self.drag_mode:
                     if self.current_tool == 'TEXT' and self.drag_mode == 'text_move':
-                        self.drag_mode = None
-                        if getattr(self, '_text_move_dragged', False):
-                            self.inline_editor.set_editing_text(False)
-                        else:
-                            self.inline_editor.set_editing_text(True, click_global_pos=event.globalPos())
+                        self._handle_text_tool_release(event.globalPos())
                         self.show_toolbar()
                         return
 
@@ -21766,13 +21178,7 @@ class ScreenshotTool(QWidget):
                         self.update()
 
                     elif self.current_tool == 'TEXT' and self.drag_mode == 'text_draw':
-                        rect = self.text_rect
-                        self.text_rect = None
-                        if rect is not None and rect.width() >= 18 and rect.height() >= 14:
-                            self.inline_editor.start_editing(rect)
-                        elif not getattr(self, '_text_just_committed', False):
-                            self.inline_editor.start_editing(self.text_start)
-                        self._text_just_committed = False
+                        self._handle_text_tool_release(event.globalPos())
 
                     if self.drag_mode in ('move', 'left', 'right', 'top', 'bottom',
                                           'topleft', 'topright', 'bottomleft', 'bottomright'):
@@ -21915,101 +21321,10 @@ class ScreenshotTool(QWidget):
         y = max(10, min(y, screen_rect.height() - tb_h - 10))
         self.crop_toolbar.move(x, y)
 
-    def _get_crop_handle_at(self, pos):
-        """返回 pos 处的裁剪手柄名称"""
-        if not self.crop_rect:
-            return None
-        r = self.crop_rect
-        hs = CROP_HANDLE_SIZE
-        corners = {
-            'tl': r.topLeft(), 'tr': r.topRight(),
-            'bl': r.bottomLeft(), 'br': r.bottomRight()
-        }
-        for name, pt in corners.items():
-            if abs(pos.x() - pt.x()) <= hs and abs(pos.y() - pt.y()) <= hs:
-                return name
-        edges = {
-            't': QPoint(r.center().x(), r.top()),
-            'b': QPoint(r.center().x(), r.bottom()),
-            'l': QPoint(r.left(), r.center().y()),
-            'r': QPoint(r.right(), r.center().y()),
-        }
-        for name, pt in edges.items():
-            if abs(pos.x() - pt.x()) <= hs and abs(pos.y() - pt.y()) <= hs:
-                return name
-        if r.contains(pos):
-            return 'move'
-        return None
-
     def _update_crop_rect(self, pos):
         """根据拖动手柄更新裁剪框（约束在 selection_rect 内）"""
-        start = self.crop_drag_start_rect
-        h = self.crop_drag_handle
-        bounds = self.selection_rect
-        new_rect = QRect(start)
-
-        if h == 'move':
-            delta = pos - self.crop_drag_start_pos
-            new_rect = start.translated(delta)
-        else:
-            if 'l' in h:
-                new_rect.setLeft(max(bounds.left(), min(start.right() - CROP_MIN_SIZE, pos.x())))
-            if 'r' in h:
-                new_rect.setRight(min(bounds.right(), max(start.left() + CROP_MIN_SIZE, pos.x())))
-            if 't' in h:
-                new_rect.setTop(max(bounds.top(), min(start.bottom() - CROP_MIN_SIZE, pos.y())))
-            if 'b' in h:
-                new_rect.setBottom(min(bounds.bottom(), max(start.top() + CROP_MIN_SIZE, pos.y())))
-
-            if self.crop_ratio:
-                rw, rh = self.crop_ratio
-                target_ratio = rw / rh
-
-                if h in ('tl', 'tr', 'bl', 'br'):
-                    if h == 'br':
-                        ax, ay = start.left(), start.top()
-                        new_w = max(CROP_MIN_SIZE, pos.x() - ax)
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax, ay, new_w, new_h)
-                    elif h == 'tl':
-                        ax, ay = start.right(), start.bottom()
-                        new_w = max(CROP_MIN_SIZE, ax - pos.x())
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax - new_w, ay - new_h, new_w, new_h)
-                    elif h == 'tr':
-                        ax, ay = start.left(), start.bottom()
-                        new_w = max(CROP_MIN_SIZE, pos.x() - ax)
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax, ay - new_h, new_w, new_h)
-                    elif h == 'bl':
-                        ax, ay = start.right(), start.top()
-                        new_w = max(CROP_MIN_SIZE, ax - pos.x())
-                        new_h = int(new_w / target_ratio)
-                        new_rect = QRect(ax - new_w, ay, new_w, new_h)
-                elif h in ('t', 'b'):
-                    cx = start.center().x()
-                    if h == 'b':
-                        new_h = max(CROP_MIN_SIZE, pos.y() - start.top())
-                    else:
-                        new_h = max(CROP_MIN_SIZE, start.bottom() - pos.y())
-                    new_w = int(new_h * target_ratio)
-                    new_x = cx - new_w // 2
-                    new_y = start.bottom() - new_h if h == 't' else start.top()
-                    new_rect = QRect(new_x, new_y, new_w, new_h)
-                elif h in ('l', 'r'):
-                    cy = start.center().y()
-                    if h == 'r':
-                        new_w = max(CROP_MIN_SIZE, pos.x() - start.left())
-                    else:
-                        new_w = max(CROP_MIN_SIZE, start.right() - pos.x())
-                    new_h = int(new_w / target_ratio)
-                    new_x = start.right() - new_w if h == 'l' else start.left()
-                    new_y = cy - new_h // 2
-                    new_rect = QRect(new_x, new_y, new_w, new_h)
-
-        # 约束在 selection_rect 内
-        new_rect = new_rect.intersected(bounds)
-        if new_rect.width() >= CROP_MIN_SIZE and new_rect.height() >= CROP_MIN_SIZE:
+        new_rect = self._compute_updated_crop_rect(pos, self.selection_rect)
+        if new_rect is not None:
             self.crop_rect = new_rect
 
     def get_final_static_image(self):
@@ -22177,8 +21492,8 @@ class ScreenshotTool(QWidget):
             try:
                 if pw.isVisible():
                     alive_pinned.append(pw)
-            except (RuntimeError, Exception):
-                pass
+            except RuntimeError as e:
+                logging.debug("检查贴图窗口可见性时对象已释放: %s", e)
         self.pinned_windows = alive_pinned
 
         # 2. 从栈顶（队尾）逆序扫描，寻找最近关闭的贴图或尚未贴出的历史项
@@ -22190,7 +21505,7 @@ class ScreenshotTool(QWidget):
             if pw is not None:
                 try:
                     is_still_alive = pw.isVisible()
-                except (RuntimeError, Exception):
+                except RuntimeError:
                     is_still_alive = False
 
             if not item.get('is_pinned', False) or not is_still_alive:
@@ -22316,8 +21631,8 @@ class ScreenshotTool(QWidget):
             if retired.isRunning():
                 try:
                     retired.wait(1000)
-                except Exception:
-                    pass
+                except RuntimeError as e:
+                    logging.debug("等待已淘汰更新线程退出异常: %s", e)
         progress = self._update_progress
         worker = getattr(progress, "worker", None)
         if worker is not None and worker.isRunning():
@@ -22380,10 +21695,8 @@ class ScreenshotTool(QWidget):
             QMessageBox.warning(None, "检查更新超时", "连接 GitHub 超时，请检查网络后重试。")
 
     def _retire_update_thread(self, thread):
-        try:
+        if thread in self._retired_update_threads:
             self._retired_update_threads.remove(thread)
-        except ValueError:
-            pass
         thread.deleteLater()
 
     def _on_update_thread_finished(self):
@@ -22509,7 +21822,8 @@ class ScreenshotTool(QWidget):
         if hasattr(self, '_scroll_hint') and self._scroll_hint:
             try:
                 self._scroll_hint.close()
-            except: pass
+            except RuntimeError as e:
+                logging.debug("关闭旧滚动提示条失败: %s", e)
 
         hint = QLabel("Space 开始/停止滚动   ·   ESC 取消")
         hint.setWindowFlags(Qt.ToolTip | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
@@ -22667,23 +21981,28 @@ class AppTrayIcon(QSystemTrayIcon):
         snip_action = QAction("✂ 开始截图", menu)
         snip_action.triggered.connect(self.main_app.activate_capture)
         menu.addAction(snip_action)
+        self._snip_action = snip_action
         ocr_action = QAction("🔤 识图翻译", menu)
         ocr_action.triggered.connect(self.main_app.activate_ocr)
         menu.addAction(ocr_action)
+        self._ocr_action = ocr_action
         rec_action = QAction("🎥 屏幕录制", menu)
         rec_action.triggered.connect(self.main_app.activate_recording)
         menu.addAction(rec_action)
+        self._rec_action = rec_action
         pin_action = QAction("📌 贴图置顶", menu)
         pin_action.triggered.connect(self.main_app.hotkey_pin)
         menu.addAction(pin_action)
+        self._pin_action = pin_action
         paste_pin_action = QAction("📋 剪贴板图片贴图", menu)
         paste_pin_action.triggered.connect(self.main_app.paste_clipboard_as_pin)
         menu.addAction(paste_pin_action)
+        self._paste_pin_action = paste_pin_action
         toggle_pins_action = QAction("👁️ 隐藏/恢复贴图与抽屉", menu)
         toggle_pins_action.triggered.connect(self.main_app.toggle_all_pins_visibility)
         menu.addAction(toggle_pins_action)
         self._toggle_pins_action = toggle_pins_action
-        restore_ct_action = QAction("🖱️ 恢复贴图点击 (取消穿透 · Ctrl+Alt+T)", menu)
+        restore_ct_action = QAction("🖱️ 恢复贴图点击", menu)
         restore_ct_action.triggered.connect(self.main_app.restore_all_click_through)
         menu.addAction(restore_ct_action)
         self._restore_ct_action = restore_ct_action
@@ -22692,20 +22011,24 @@ class AppTrayIcon(QSystemTrayIcon):
         menu.addAction(pin_border_action)
         self._pin_border_action = pin_border_action
         menu.aboutToShow.connect(self._refresh_menu_labels)
-        drawer_action = QAction("🗄️ 贴图抽屉 (Ctrl+1)", menu)
+        drawer_action = QAction("🗄️ 贴图抽屉", menu)
         drawer_action.triggered.connect(self.main_app.toggle_drawer)
         menu.addAction(drawer_action)
+        self._drawer_action = drawer_action
         menu.addSeparator()
         win_pin_action = QAction("📌 窗口置顶 (DeskPin)", menu)
         win_pin_action.triggered.connect(self.main_app.activate_window_pin)
         menu.addAction(win_pin_action)
+        self._win_pin_action = win_pin_action
         scroll_action = QAction("📜 滚动截图 (Scroll)", menu)
         scroll_action.triggered.connect(self.main_app.activate_scroll_capture)
         menu.addAction(scroll_action)
+        self._scroll_action = scroll_action
         menu.addSeparator()
         history_action = QAction("📜 截图历史 (History)", menu)
         history_action.triggered.connect(self.main_app.show_history_dialog)
         menu.addAction(history_action)
+        self._history_action = history_action
         update_action = QAction("🔄 检查更新", menu)
         update_action.triggered.connect(lambda: self.main_app.check_for_updates(manual=True))
         menu.addAction(update_action)
@@ -22716,44 +22039,79 @@ class AppTrayIcon(QSystemTrayIcon):
         settings_action = QAction("⚙ 系统设置 (Settings)", menu)
         settings_action.triggered.connect(self.main_app.show_settings_dialog)
         menu.addAction(settings_action)
+        self._settings_action = settings_action
         menu.addSeparator() 
         quit_action = QAction("❌ 退出程序", menu)
         quit_action.triggered.connect(self.quit_app)
         menu.addAction(quit_action)
         
+        self._refresh_menu_labels()
         self.setContextMenu(menu)
         self.activated.connect(self.on_tray_activated)
 
     def _refresh_menu_labels(self):
         try:
             s = load_settings()
-            hk_boss = s.get("hotkey_toggle_pins", "Ctrl+Alt+H") or "Ctrl+Alt+H"
-            hk_ct = s.get("hotkey_restore_click_through", "Ctrl+Alt+T") or "Ctrl+Alt+T"
+            def _hk(key, default=""):
+                return normalize_hotkey_str(s.get(key, default))
+            def _with_hk(base, hk):
+                return f"{base} ({hk})" if hk else base
+
+            hk_snip = _hk("hotkey_snip", "F1") or "F1"
+            hk_ocr = _hk("hotkey_ocr", "F2") or "F2"
+            hk_pin = _hk("hotkey_pin", "F3") or "F3"
+            hk_rec = _hk("hotkey_record", "F4") or "F4"
+            hk_drawer = _hk("hotkey_drawer", "Ctrl+1")
+            hk_boss = _hk("hotkey_toggle_pins", "")
+            hk_paste_pin = _hk("hotkey_paste_pin", "")
+            hk_ct = _hk("hotkey_restore_click_through", "")
+            hk_border = _hk("hotkey_pin_border", "")
+            hk_win_pin = _hk("hotkey_window_pin", "")
+            hk_scroll = _hk("hotkey_scroll", "")
+            hk_history = _hk("hotkey_history", "")
+            hk_settings = _hk("hotkey_settings", "")
+
+            self.setToolTip(f"Capture v{APP_VERSION} ({hk_snip} 截图 | {hk_ocr} 识图翻译 | {hk_rec} 录屏 | {hk_pin} 贴图)")
+
+            for act, base, hk in (
+                (getattr(self, "_snip_action", None), "✂ 开始截图", hk_snip),
+                (getattr(self, "_ocr_action", None), "🔤 识图翻译", hk_ocr),
+                (getattr(self, "_rec_action", None), "🎥 屏幕录制", hk_rec),
+                (getattr(self, "_pin_action", None), "📌 贴图置顶", hk_pin),
+                (getattr(self, "_paste_pin_action", None), "📋 剪贴板图片贴图", hk_paste_pin),
+                (getattr(self, "_drawer_action", None), "🗄️ 贴图抽屉", hk_drawer),
+                (getattr(self, "_win_pin_action", None), "📌 窗口置顶 (DeskPin)", hk_win_pin),
+                (getattr(self, "_scroll_action", None), "📜 滚动截图 (Scroll)", hk_scroll),
+                (getattr(self, "_history_action", None), "📜 截图历史 (History)", hk_history),
+                (getattr(self, "_settings_action", None), "⚙ 系统设置 (Settings)", hk_settings),
+            ):
+                if act is not None:
+                    act.setText(_with_hk(base, hk))
+
             if getattr(self, "_toggle_pins_action", None) is not None:
                 hidden = bool(getattr(self.main_app, "_pins_boss_hidden", False))
-                self._toggle_pins_action.setText(
-                    f"👁️ 恢复全部贴图与抽屉 ({hk_boss})" if hidden else f"👁️ 隐藏全部贴图与抽屉 ({hk_boss})"
-                )
+                base_boss = "👁️ 恢复全部贴图与抽屉" if hidden else "👁️ 隐藏全部贴图与抽屉"
+                self._toggle_pins_action.setText(_with_hk(base_boss, hk_boss))
             if getattr(self, "_restore_ct_action", None) is not None:
                 ct_count = sum(
                     1 for pw in getattr(self.main_app, "pinned_windows", [])
                     if pw is not None and getattr(pw, "_click_through", False)
                 )
+                suffix = f" · {hk_ct}" if hk_ct else ""
                 if ct_count > 0:
-                    self._restore_ct_action.setText(f"🖱️ 解除鼠标穿透 ({ct_count} 张穿透中 · {hk_ct})")
+                    self._restore_ct_action.setText(f"🖱️ 解除鼠标穿透 ({ct_count} 张穿透中{suffix})")
                 else:
-                    self._restore_ct_action.setText(f"🖱️ 恢复贴图点击 (无穿透 · {hk_ct})")
+                    self._restore_ct_action.setText(f"🖱️ 恢复贴图点击 (无穿透{suffix})")
             if getattr(self, "_pin_border_action", None) is not None:
                 border_on = bool(getattr(self.main_app, "pin_border_enabled", False))
-                hk_border = s.get("hotkey_pin_border", "") or ""
                 state_txt = "已开启" if border_on else "未开启"
                 hk_suffix = f" · {hk_border}" if hk_border else ""
                 self._pin_border_action.setText(f"🖼️ 贴图边框 ({state_txt}{hk_suffix})")
             if getattr(self, "_autostart_action", None) is not None:
                 enabled = is_autostart_enabled()
                 self._autostart_action.setText("✅ 开机自启动 (已开启)" if enabled else "🚀 开机自启动 (未开启)")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("刷新托盘菜单文案失败: %s", e)
 
     def toggle_autostart(self):
         new_state = not is_autostart_enabled()
@@ -22775,8 +22133,8 @@ class AppTrayIcon(QSystemTrayIcon):
     def quit_app(self):
         try:
             clean_orphan_temp_files()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("清理孤儿临时文件失败: %s", e)
         if hasattr(self.main_app, 'pin_drawer') and self.main_app.pin_drawer:
             try:
                 self.main_app.pin_drawer.close()
@@ -22794,8 +22152,8 @@ class AppTrayIcon(QSystemTrayIcon):
             self.hotkey_listener.stop()
         try:
             keyboard.unhook_all()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("卸载全局键盘钩子失败: %s", e)
         QApplication.quit()
 
 
@@ -22852,8 +22210,8 @@ def _signal_running_instance_to_capture():
             finally:
                 try:
                     _kernel32.CloseHandle(h_event)
-                except Exception:
-                    pass
+                except OSError as e:
+                    logging.debug("关闭单实例唤醒事件句柄失败: %s", e)
         if attempt < 3:
             time.sleep(0.03)
     logging.warning("检测到已有实例在运行，但未能打开唤醒事件 %s", SINGLE_INSTANCE_SNIP_EVENT)
@@ -22872,8 +22230,8 @@ if __name__ == '__main__':
         # 设置 Windows 进程 AppUserModelID，确保任务栏独立显示专属图标
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("screencapture.app.1.0")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("设置 AppUserModelID 失败: %s", e)
 
         app = QApplication(sys.argv)
         app.setQuitOnLastWindowClosed(False)
@@ -22902,8 +22260,8 @@ if __name__ == '__main__':
 
         try:
             clean_orphan_temp_files()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("清理孤儿临时文件失败: %s", e)
 
         sync_autostart_path_if_enabled()
 
@@ -22920,6 +22278,7 @@ if __name__ == '__main__':
             single_instance_listener.start()
 
         tray = AppTrayIcon(ex, hotkey_listener=hotkey_mgr)
+        ex._tray_icon = tray
         tray.show()
 
         hotkey_mgr.on_hotkey_pressed.connect(ex.activate_capture)

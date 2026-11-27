@@ -6,6 +6,7 @@ frosted_ui.py - 截图工具栏 & 托盘菜单 macOS 风格亮色冰晶毛玻璃
 - FrostedTrayMenu：用于系统托盘右键菜单的实时屏幕采样冰晶毛玻璃菜单
 """
 
+import logging
 import numpy as np
 import cv2
 from PyQt5.QtWidgets import QWidget, QMenu, QApplication
@@ -220,8 +221,8 @@ class FrostedBarWidget(QWidget):
                 screen_y=gpos.y()
             )
             self.update()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("FrostedBarWidget 刷新毛玻璃背景失败: %s", e)
 
     def moveEvent(self, event):
         super().moveEvent(event)
@@ -317,8 +318,8 @@ class FrostedTrayMenu(QMenu):
             pm = create_frosted_pixmap(width=w, height=h, screen_x=gx, screen_y=gy, tint_ratio=0.40)
             if pm and not pm.isNull():
                 self._frosted_bg = pm
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("FrostedTrayMenu 捕获背景失败: %s", e)
 
     def setVisible(self, visible):
         if visible and not self.isVisible():

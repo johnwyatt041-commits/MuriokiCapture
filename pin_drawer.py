@@ -88,8 +88,8 @@ def _load_pixmap_from_path(path):
         pix = QPixmap(path)
         if not pix.isNull():
             return pix
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("QPixmap 直接加载图片失败 (%s): %s", path, e)
     return None
 
 
@@ -491,7 +491,19 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DRAWER_DIR = os.path.join(BASE_DIR, "capture_drawer")
+def _resolve_drawer_data_dir(base_dir):
+    env_dir = os.environ.get("MURIOKI_DATA_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    try:
+        with tempfile.TemporaryFile(dir=base_dir):
+            return base_dir
+    except OSError:
+        local_root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(local_root, "MuriokiCapture")
+
+DATA_DIR = _resolve_drawer_data_dir(BASE_DIR)
+DRAWER_DIR = os.path.join(DATA_DIR, "capture_drawer")
 INDEX_FILE = os.path.join(DRAWER_DIR, "drawer_index.json")
 
 
@@ -1050,8 +1062,8 @@ class PinDrawerWindow(QWidget):
                         if hwnd and hwnd not in excluded_hwnds:
                             ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
                             excluded_hwnds.append(hwnd)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug("设置抽屉模糊截图剔除标志失败: %s", e)
 
             try:
                 grabbed = screen.grabWindow(0, full_x, full_y, full_w, full_h)
@@ -1059,8 +1071,8 @@ class PinDrawerWindow(QWidget):
                 for hwnd in excluded_hwnds:
                     try:
                         ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug("恢复窗口 DisplayAffinity 失败: %s", e)
 
             if grabbed.isNull():
                 return
@@ -2235,8 +2247,8 @@ class PinDrawerWindow(QWidget):
             if hwnd:
                 try:
                     user32.UnregisterHotKey(hwnd, self._paste_hotkey_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.debug("注销抽屉粘贴热键失败: %s", e)
             self._paste_hotkey_registered = False
 
     def set_boss_hidden(self, hidden: bool):
@@ -2264,8 +2276,8 @@ class PinDrawerWindow(QWidget):
                 if msg.message == 0x0312 and int(msg.wParam) == self._paste_hotkey_id:
                     QTimer.singleShot(0, self.paste_from_clipboard)
                     return True, 0
-            except Exception:
-                pass
+            except Exception as e:
+                logging.debug("PinDrawer nativeEvent 解析失败: %s", e)
         return super().nativeEvent(eventType, message)
 
     def keyPressEvent(self, event):
@@ -2595,85 +2607,49 @@ class PinDrawerWindow(QWidget):
     # ==========================================
     # 极简 macOS 冰晶毛玻璃渲染 (paintEvent)
     # ==========================================
-    def paintEvent(self, event):
-        if not self.drawer_enabled:
-            return
+    def _paint_collapsed_handle(self, painter, w, h):
+        pill_rect = QRectF(4, 24, w - 6, h - 48)
+        pill_path = QPainterPath()
+        pill_path.addRoundedRect(pill_rect, 5, 5)
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        shadow_p = QPainterPath()
+        shadow_p.addRoundedRect(pill_rect.adjusted(-1.5, -1.5, 1.5, 1.5), 6, 6)
+        painter.fillPath(shadow_p, QBrush(QColor(15, 23, 42, 40)))
 
-        w = float(self.width())
-        h = float(self.height())
+        grad = QLinearGradient(0, pill_rect.top(), 0, pill_rect.bottom())
+        grad.setColorAt(0.0, QColor(246, 249, 255, 230))
+        grad.setColorAt(1.0, QColor(225, 232, 246, 228))
+        painter.fillPath(pill_path, QBrush(grad))
+        painter.setPen(QPen(QColor(100, 116, 139, 175), 1.0))
+        painter.drawPath(pill_path)
 
-        # ----------------------------------------------------
-        # 1. 收起状态时的边缘极简磨砂感应条 (无任何直角黑边)
-        # ----------------------------------------------------
-        if self._drawer_width <= self.HANDLE_WIDTH + 6:
-            pill_rect = QRectF(4, 24, w - 6, h - 48)
-            pill_path = QPainterPath()
-            pill_path.addRoundedRect(pill_rect, 5, 5)
+        cx = pill_rect.center().x()
+        painter.setPen(QPen(QColor(182, 134, 58, 242), 2.4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(cx, pill_rect.top() + 18), QPointF(cx, pill_rect.bottom() - 18))
 
-            # 柔和外发光阴影
-            shadow_p = QPainterPath()
-            shadow_p.addRoundedRect(pill_rect.adjusted(-1.5, -1.5, 1.5, 1.5), 6, 6)
-            painter.fillPath(shadow_p, QBrush(QColor(15, 23, 42, 40)))
-
-            # 冰晶亮色半透明胶囊
-            grad = QLinearGradient(0, pill_rect.top(), 0, pill_rect.bottom())
-            grad.setColorAt(0.0, QColor(246, 249, 255, 230))
-            grad.setColorAt(1.0, QColor(225, 232, 246, 228))
-            painter.fillPath(pill_path, QBrush(grad))
-            painter.setPen(QPen(QColor(100, 116, 139, 175), 1.0))
-            painter.drawPath(pill_path)
-
-            # 居中精致香槟金指示条
-            cx = pill_rect.center().x()
-            painter.setPen(QPen(QColor(182, 134, 58, 242), 2.4, Qt.SolidLine, Qt.RoundCap))
-            painter.drawLine(QPointF(cx, pill_rect.top() + 18), QPointF(cx, pill_rect.bottom() - 18))
-            return
-
-        # ----------------------------------------------------
-        # 2. 储藏柜主体：外圈多层柔和圆角阴影 + 真实高斯磨砂毛玻璃
-        # ----------------------------------------------------
-        pad = float(self.SHADOW_PAD)
-        left = pad
-        top = pad
-        right = w
-        bottom = h - pad
-        radius = 18.0
-
-        # 2.1 绘制外圈柔和多层投影 (全部在圆角路径内，四周 100% 透明无直角框)
+    def _paint_drawer_glass(self, painter, left, top, right, bottom, radius):
         for i, alpha in enumerate([4, 7, 11, 16, 22]):
             offset = float(5 - i) * 1.3
             sp = self._build_left_rounded_path(left - offset, top - offset + 1.0, right, bottom + offset + 1.0, radius + offset)
             painter.fillPath(sp, QBrush(QColor(15, 23, 42, alpha)))
 
-        # 2.2 主体圆角剪裁路径
         drawer_path = self._build_left_rounded_path(left, top, right, bottom, radius)
-
         painter.save()
         painter.setClipPath(drawer_path)
-
         painter.fillPath(drawer_path, QBrush(QColor(235, 240, 248, 225)))
 
-        # 绘制采样并高斯模糊后的屏幕背景 (与桌面绝对坐标对齐，滑动时具有真实物理透镜折射感)
         if self._frosted_bg_pixmap and not self._frosted_bg_pixmap.isNull():
             bg_offset_x = self._frosted_bg_screen_x - self.x()
             bg_offset_y = getattr(self, '_frosted_bg_screen_y', self.y()) - self.y()
             painter.drawPixmap(int(bg_offset_x), int(bg_offset_y), self._frosted_bg_pixmap)
 
-        # 叠加中性高级毛玻璃柔光渐变层
         glass_sheen = QLinearGradient(0, top, 0, bottom)
         glass_sheen.setColorAt(0.0, QColor(255, 255, 255, 112))
         glass_sheen.setColorAt(0.5, QColor(250, 249, 247, 52))
         glass_sheen.setColorAt(1.0, QColor(238, 236, 232, 82))
         painter.fillRect(QRectF(left, top, right - left, bottom - top), QBrush(glass_sheen))
-
         painter.restore()
 
-        # 2.3 双层精致玻璃高光边缘：外层微暗轮廓线确保在纯白网页上依然边界分明，内层纯白高光展现玻璃折射
         inner_path = self._build_left_rounded_path(left + 1.0, top + 1.0, right, bottom - 1.0, radius - 1.0)
         painter.setPen(QPen(QColor(255, 255, 255, 210), 1.4))
         painter.drawPath(inner_path)
@@ -2681,30 +2657,13 @@ class PinDrawerWindow(QWidget):
         painter.setPen(QPen(QColor(100, 116, 139, 85), 1.0))
         painter.drawPath(drawer_path)
 
-        # ----------------------------------------------------
-        # 3. 内部截图卡片渲染 (每张图都有专属清晰毛玻璃底框)
-        # ----------------------------------------------------
-        if not self.items and self.external_insert_slot is None:
-            empty_r = QRectF(self.PADDING_LEFT, self.CARD_Y, w - self.PADDING_LEFT - self.PADDING_RIGHT, self.CARD_HEIGHT)
-            empty_path = QPainterPath()
-            empty_path.addRoundedRect(empty_r, 12, 12)
-            painter.fillPath(empty_path, QBrush(QColor(255, 255, 255, 110)))
-            painter.setPen(QPen(QColor(100, 116, 139, 90), 1.2, Qt.DashLine))
-            painter.drawPath(empty_path)
-
-            painter.setFont(_drawer_ui_font(9))
-            painter.setPen(QColor(71, 85, 105))
-            painter.drawText(empty_r, Qt.AlignCenter, "将贴图或图片拖至此处收纳")
-            return
-
-        # 内部卡片视口剪裁（圆角区域内平滑滚动，不溢出抽屉边界）
+    def _paint_cards(self, painter, left, top, right, bottom, radius):
         vp_path = QPainterPath()
         vp_rect = QRectF(left + 2.0, top + 2.0, max(1.0, right - left - 4.0), max(1.0, bottom - top - 4.0))
         vp_path.addRoundedRect(vp_rect, max(4.0, radius - 2.0), max(4.0, radius - 2.0))
         painter.save()
         painter.setClipPath(vp_path)
 
-        # 绘制外部拖入挤压预览占位槽
         if self.external_insert_slot is not None:
             slot_x, slot_y = self._slot_pos(self.external_insert_slot)
             slot_rect = QRectF(slot_x, slot_y, self.CARD_WIDTH, self.CARD_HEIGHT)
@@ -2714,7 +2673,6 @@ class PinDrawerWindow(QWidget):
             painter.setPen(QPen(QColor(182, 134, 58, 220), 1.8, Qt.DashLine))
             painter.drawPath(slot_path)
 
-        # 绘制所有截图卡片（正在拖动的卡片最后绘制，保证始终浮于邻卡之上）
         draw_indices = [
             i for i in range(len(self.items))
             if not (self.is_internal_dragging and self.dragging_internal_index == i)
@@ -2723,97 +2681,114 @@ class PinDrawerWindow(QWidget):
             draw_indices.append(self.dragging_internal_index)
 
         for i in draw_indices:
-            it = self.items[i]
-            card_x = it.current_x
-            card_y = it.current_y
-            is_hover = (self.hovered_card_index == i)
-            is_drag = (self.is_internal_dragging and self.dragging_internal_index == i)
-
-            card_rect = QRectF(card_x, card_y, self.CARD_WIDTH, self.CARD_HEIGHT)
-
-            # 卡片底部微投影
-            card_shadow = QPainterPath()
-            card_shadow.addRoundedRect(card_rect.adjusted(0, 1.5, 0, 2.0), 12, 12)
-            painter.fillPath(card_shadow, QBrush(QColor(15, 23, 42, 22)))
-
-            card_path = QPainterPath()
-            card_path.addRoundedRect(card_rect, 12, 12)
-
-            # 每张截图专属清晰毛玻璃底框
-            card_grad = QLinearGradient(0, card_rect.top(), 0, card_rect.bottom())
-            if is_drag:
-                card_grad.setColorAt(0.0, QColor(252, 247, 236, 236))
-                card_grad.setColorAt(1.0, QColor(244, 232, 206, 220))
-                card_border = QColor(182, 134, 58, 230)
-                border_width = 1.8
-            elif is_hover:
-                card_grad.setColorAt(0.0, QColor(255, 255, 255, 238))
-                card_grad.setColorAt(1.0, QColor(248, 245, 239, 210))
-                card_border = QColor(196, 152, 76, 200)
-                border_width = 1.5
-            else:
-                card_grad.setColorAt(0.0, QColor(255, 255, 255, 195))
-                card_grad.setColorAt(1.0, QColor(241, 245, 252, 155))
-                card_border = QColor(148, 163, 184, 110)
-                border_width = 1.0
-
-            painter.fillPath(card_path, QBrush(card_grad))
-
-            # 卡片内圈纯白玻璃高光线
-            inner_card = QPainterPath()
-            inner_card.addRoundedRect(card_rect.adjusted(1.0, 1.0, -1.0, -1.0), 11, 11)
-            painter.setPen(QPen(QColor(255, 255, 255, 230), 1.0))
-            painter.drawPath(inner_card)
-
-            # 卡片外圈清晰轮廓线
-            painter.setPen(QPen(card_border, border_width))
-            painter.drawPath(card_path)
-
-            # 居中圆角绘制高清缩略图 (附带细微边框让纯白截图也清晰可辨)
-            if it.thumbnail and not it.thumbnail.isNull():
-                tw = it.thumbnail.width()
-                th = it.thumbnail.height()
-                tx = card_x + (self.CARD_WIDTH - tw) / 2.0
-                ty = card_y + (self.CARD_HEIGHT - th) / 2.0
-                img_rect = QRectF(tx, ty, tw, th)
-
-                painter.save()
-                img_clip = QPainterPath()
-                img_clip.addRoundedRect(img_rect, 6, 6)
-                painter.setClipPath(img_clip, Qt.IntersectClip)
-                painter.drawPixmap(int(tx), int(ty), it.thumbnail)
-                painter.restore()
-
-                painter.setPen(QPen(QColor(15, 23, 42, 32), 1.0))
-                painter.drawRoundedRect(img_rect, 6, 6)
-
-            # 悬停时在卡片右上角显示精致删除小圆钮 (✕)
-            if is_hover and not self.is_internal_dragging:
-                del_rect = QRectF(card_x + self.CARD_WIDTH - 20, card_y + 4, 16, 16)
-                del_path = QPainterPath()
-                del_path.addEllipse(del_rect)
-
-                is_del_hover = (self.hovered_delete_btn_index == i)
-                del_bg = QColor(239, 68, 68, 240 if is_del_hover else 185)
-                painter.fillPath(del_path, QBrush(del_bg))
-                painter.setFont(_drawer_ui_font(7, QFont.DemiBold))
-                painter.setPen(QColor(255, 255, 255))
-                painter.drawText(del_rect, Qt.AlignCenter, "✕")
+            self._paint_single_card(painter, i, self.items[i])
 
         painter.restore()
 
-        # 若卡片总数超出屏幕最大可视行数，在右侧边缘绘制精致的纵向滚动条提示
+    def _paint_single_card(self, painter, idx, it):
+        card_x = it.current_x
+        card_y = it.current_y
+        is_hover = (self.hovered_card_index == idx)
+        is_drag = (self.is_internal_dragging and self.dragging_internal_index == idx)
+        card_rect = QRectF(card_x, card_y, self.CARD_WIDTH, self.CARD_HEIGHT)
+
+        card_shadow = QPainterPath()
+        card_shadow.addRoundedRect(card_rect.adjusted(0, 1.5, 0, 2.0), 12, 12)
+        painter.fillPath(card_shadow, QBrush(QColor(15, 23, 42, 22)))
+
+        card_path = QPainterPath()
+        card_path.addRoundedRect(card_rect, 12, 12)
+        card_grad = QLinearGradient(0, card_rect.top(), 0, card_rect.bottom())
+        if is_drag:
+            card_grad.setColorAt(0.0, QColor(252, 247, 236, 236))
+            card_grad.setColorAt(1.0, QColor(244, 232, 206, 220))
+            card_border, border_width = QColor(182, 134, 58, 230), 1.8
+        elif is_hover:
+            card_grad.setColorAt(0.0, QColor(255, 255, 255, 238))
+            card_grad.setColorAt(1.0, QColor(248, 245, 239, 210))
+            card_border, border_width = QColor(196, 152, 76, 200), 1.5
+        else:
+            card_grad.setColorAt(0.0, QColor(255, 255, 255, 195))
+            card_grad.setColorAt(1.0, QColor(241, 245, 252, 155))
+            card_border, border_width = QColor(148, 163, 184, 110), 1.0
+
+        painter.fillPath(card_path, QBrush(card_grad))
+        inner_card = QPainterPath()
+        inner_card.addRoundedRect(card_rect.adjusted(1.0, 1.0, -1.0, -1.0), 11, 11)
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 1.0))
+        painter.drawPath(inner_card)
+        painter.setPen(QPen(card_border, border_width))
+        painter.drawPath(card_path)
+
+        if it.thumbnail and not it.thumbnail.isNull():
+            tw, th = it.thumbnail.width(), it.thumbnail.height()
+            tx = card_x + (self.CARD_WIDTH - tw) / 2.0
+            ty = card_y + (self.CARD_HEIGHT - th) / 2.0
+            img_rect = QRectF(tx, ty, tw, th)
+            painter.save()
+            img_clip = QPainterPath()
+            img_clip.addRoundedRect(img_rect, 6, 6)
+            painter.setClipPath(img_clip, Qt.IntersectClip)
+            painter.drawPixmap(int(tx), int(ty), it.thumbnail)
+            painter.restore()
+            painter.setPen(QPen(QColor(15, 23, 42, 32), 1.0))
+            painter.drawRoundedRect(img_rect, 6, 6)
+
+        if is_hover and not self.is_internal_dragging:
+            del_rect = QRectF(card_x + self.CARD_WIDTH - 20, card_y + 4, 16, 16)
+            del_path = QPainterPath()
+            del_path.addEllipse(del_rect)
+            is_del_hover = (self.hovered_delete_btn_index == idx)
+            painter.fillPath(del_path, QBrush(QColor(239, 68, 68, 240 if is_del_hover else 185)))
+            painter.setFont(_drawer_ui_font(7, QFont.DemiBold))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(del_rect, Qt.AlignCenter, "✕")
+
+    def _paint_scrollbar(self, painter, right):
         _, total_rows, visible_rows, _tw, target_h = self._get_grid_metrics()
-        if total_rows > visible_rows:
-            chrome_v = self.CARD_Y + self.SHADOW_PAD + 10
-            content_h = float(chrome_v + total_rows * self.CARD_HEIGHT + max(0, total_rows - 1) * self.CARD_SPACING)
-            track_top = float(self.CARD_Y)
-            track_h = max(24.0, float(target_h - chrome_v))
-            thumb_h = max(24.0, track_h * (float(target_h) / max(content_h, float(target_h))))
-            scroll_span = max(1.0, content_h - float(target_h))
-            ratio = max(0.0, min(1.0, -self.scroll_y / scroll_span))
-            thumb_y = track_top + (track_h - thumb_h) * ratio
-            thumb_rect = QRectF(right - 7.5, thumb_y, 3.5, thumb_h)
-            thumb_path = QPainterPath()
-            thumb_path.addRoundedRect(thumb_rect, 1.75, 1.75)
-            painter.fillPath(thumb_path, QBrush(QColor(71, 85, 105, 130)))
+        if total_rows <= visible_rows:
+            return
+        chrome_v = self.CARD_Y + self.SHADOW_PAD + 10
+        content_h = float(chrome_v + total_rows * self.CARD_HEIGHT + max(0, total_rows - 1) * self.CARD_SPACING)
+        track_top = float(self.CARD_Y)
+        track_h = max(24.0, float(target_h - chrome_v))
+        thumb_h = max(24.0, track_h * (float(target_h) / max(content_h, float(target_h))))
+        scroll_span = max(1.0, content_h - float(target_h))
+        ratio = max(0.0, min(1.0, -self.scroll_y / scroll_span))
+        thumb_y = track_top + (track_h - thumb_h) * ratio
+        thumb_path = QPainterPath()
+        thumb_path.addRoundedRect(QRectF(right - 7.5, thumb_y, 3.5, thumb_h), 1.75, 1.75)
+        painter.fillPath(thumb_path, QBrush(QColor(71, 85, 105, 130)))
+
+    def paintEvent(self, event):
+        if not self.drawer_enabled:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        if self._drawer_width <= self.HANDLE_WIDTH + 6:
+            self._paint_collapsed_handle(painter, w, h)
+            return
+
+        pad = float(self.SHADOW_PAD)
+        left, top, right, bottom, radius = pad, pad, w, h - pad, 18.0
+        self._paint_drawer_glass(painter, left, top, right, bottom, radius)
+
+        if not self.items and self.external_insert_slot is None:
+            empty_r = QRectF(self.PADDING_LEFT, self.CARD_Y, w - self.PADDING_LEFT - self.PADDING_RIGHT, self.CARD_HEIGHT)
+            empty_path = QPainterPath()
+            empty_path.addRoundedRect(empty_r, 12, 12)
+            painter.fillPath(empty_path, QBrush(QColor(255, 255, 255, 110)))
+            painter.setPen(QPen(QColor(100, 116, 139, 90), 1.2, Qt.DashLine))
+            painter.drawPath(empty_path)
+            painter.setFont(_drawer_ui_font(9))
+            painter.setPen(QColor(71, 85, 105))
+            painter.drawText(empty_r, Qt.AlignCenter, "将贴图或图片拖至此处收纳")
+            return
+
+        self._paint_cards(painter, left, top, right, bottom, radius)
+        self._paint_scrollbar(painter, right)
